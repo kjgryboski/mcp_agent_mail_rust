@@ -83085,7 +83085,6 @@ fn historical_strict_allowlist_commit(
     transaction
         .commit()
         .map_err(|error| CliError::Other(format!("cannot advance strict Git ref: {error}")))?;
-    drop(transaction);
 
     // Re-lock the admitted ref before aligning the real index. If another Git
     // writer advanced HEAD after our first transaction, refuse before touching
