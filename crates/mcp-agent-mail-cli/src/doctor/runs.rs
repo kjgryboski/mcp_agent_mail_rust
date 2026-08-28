@@ -72,7 +72,7 @@ pub fn now_iso_seconds() -> String {
 /// Resolve the `.doctor/` root for a target. Defaults to `<target>/.doctor/`
 /// but honors `AM_DOCTOR_BACKUPS_DIR` if set.
 pub fn doctor_root(target: &Path) -> PathBuf {
-    if let Ok(s) = std::env::var("AM_DOCTOR_BACKUPS_DIR")
+    if let Some(s) = mcp_agent_mail_core::config::process_env_value("AM_DOCTOR_BACKUPS_DIR")
         && !s.is_empty()
     {
         return PathBuf::from(s);
