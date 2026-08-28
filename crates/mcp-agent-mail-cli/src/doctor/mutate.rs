@@ -528,6 +528,77 @@ fn advisory_lock_path(ctx: &MutateContext, protected_path: &Path) -> PathBuf {
     parent.join(format!(".{basename}.doctor-lock"))
 }
 
+/// Recovery is allowed to create parents only beneath its fresh run directory
+/// or the archive's `projects/` root. Build missing components one at a time
+/// and re-stat every component without following symlinks. The recovery
+/// handler already holds the global mailbox activity lock; this closes the
+/// remaining accidental/junction redirection window at the mutation
+/// chokepoint without changing historical fixer behavior.
+fn ensure_archive_recovery_real_parent_chain(
+    ctx: &MutateContext,
+    path: &Path,
+) -> Result<(), MutateError> {
+    if ctx.fixer_id != "archive-recover" {
+        return Ok(());
+    }
+
+    let projects_root = ctx.repo_root.join("projects");
+    let root = if path.starts_with(&ctx.run_dir) {
+        ctx.run_dir.as_path()
+    } else if path.starts_with(&projects_root) {
+        projects_root.as_path()
+    } else {
+        return Err(MutateError::OutOfScope(path.to_path_buf()));
+    };
+    let parent = path.parent().ok_or_else(|| {
+        MutateError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "archive recovery path has no parent directory",
+        ))
+    })?;
+    let relative = parent.strip_prefix(root).map_err(|_| {
+        MutateError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "archive recovery parent escaped its admitted root",
+        ))
+    })?;
+
+    let require_real_directory = |candidate: &Path| -> Result<(), MutateError> {
+        match fs::symlink_metadata(candidate) {
+            Ok(meta) if meta.file_type().is_dir() && !meta.file_type().is_symlink() => Ok(()),
+            Ok(_) => Err(MutateError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "archive recovery parent {} is not a real directory",
+                    candidate.display()
+                ),
+            ))),
+            Err(error) => Err(MutateError::Io(error)),
+        }
+    };
+
+    require_real_directory(root)?;
+    let mut cursor = root.to_path_buf();
+    for component in relative.components() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return Err(MutateError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "archive recovery parent contains an unsafe path component",
+            )));
+        }
+        cursor.push(component.as_os_str());
+        match fs::symlink_metadata(&cursor) {
+            Ok(_) => require_real_directory(&cursor)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&cursor)?;
+                require_real_directory(&cursor)?;
+            }
+            Err(error) => return Err(MutateError::Io(error)),
+        }
+    }
+    Ok(())
+}
+
 fn ensure_existing_regular_db_file(path: &Path, op: &'static str) -> Result<(), MutateError> {
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_file() => Ok(()),
@@ -875,7 +946,10 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
     // source evidence (see `advisory_lock_path`).
     let lock_path = advisory_lock_path(ctx, path);
     let lock_parent = lock_path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(lock_parent)?;
+    ensure_archive_recovery_real_parent_chain(ctx, &lock_path)?;
+    if ctx.fixer_id != "archive-recover" {
+        fs::create_dir_all(lock_parent)?;
+    }
     let lock_file = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -885,6 +959,10 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
     if lock_file.try_lock_exclusive().is_err() {
         return Err(MutateError::LockHeld(path.to_path_buf()));
     }
+
+    // Revalidate/create the actual target parent only after serialization.
+    // This applies to both archive sources/destinations and retained evidence.
+    ensure_archive_recovery_real_parent_chain(ctx, path)?;
 
     // Hold any subsystem locks declared by the fixer for the whole mutation.
     // If any extra lock fails, release the per-path lock before returning.
@@ -918,6 +996,7 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
     // letting PathBuf::join drop the backup prefix. The `rel` value recorded
     // in actions.jsonl preserves the original path semantics for undo.
     let backup_path = backup_path_for(&ctx.run_dir, &ctx.repo_root, path, started_at_ns);
+    ensure_archive_recovery_real_parent_chain(ctx, &backup_path)?;
     let rel = path.strip_prefix(&ctx.repo_root).unwrap_or(path);
     let path_meta_kind = fs::symlink_metadata(path);
     let path_is_dir = matches!(&path_meta_kind, Ok(meta) if meta.file_type().is_dir());
@@ -1015,6 +1094,7 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
     // 7. Execute atomically.
     let exec_result: Result<(), MutateError> = match op.clone() {
         Op::WriteFile { content, mode } => {
+            ensure_archive_recovery_real_parent_chain(ctx, path)?;
             match atomic_write_file(path, &content, mode).map_err(MutateError::Io) {
                 Ok(()) => {
                     after_mode = Some(mode);
@@ -1027,7 +1107,10 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
         Op::Rename { to } => {
             let result = (|| -> Result<(), MutateError> {
                 // Destination scope already checked at step 1.
-                if let Some(parent) = to.parent() {
+                ensure_archive_recovery_real_parent_chain(ctx, &to)?;
+                if ctx.fixer_id != "archive-recover"
+                    && let Some(parent) = to.parent()
+                {
                     fs::create_dir_all(parent).map_err(MutateError::Io)?;
                 }
                 // Also acquire an advisory lock on the destination. The
@@ -1038,7 +1121,10 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
                 // source lock.
                 let to_lock_path = advisory_lock_path(ctx, &to);
                 let to_lock_parent = to_lock_path.parent().unwrap_or_else(|| Path::new("."));
-                fs::create_dir_all(to_lock_parent).map_err(MutateError::Io)?;
+                ensure_archive_recovery_real_parent_chain(ctx, &to_lock_path)?;
+                if ctx.fixer_id != "archive-recover" {
+                    fs::create_dir_all(to_lock_parent).map_err(MutateError::Io)?;
+                }
                 let to_lock_file = OpenOptions::new()
                     .create(true)
                     .read(true)
@@ -1263,6 +1349,9 @@ mod tests {
     fn make_archive_recover_ctx(td: &TempDir, run_id: &str) -> MutateContext {
         let mut ctx = make_ctx(td, run_id);
         ctx.fixer_id = "archive-recover".to_string();
+        let projects = td.path().join("projects");
+        fs::create_dir_all(&projects).unwrap();
+        ctx.capabilities.write_scopes = vec![projects, td.path().join(".doctor")];
         ctx
     }
 
@@ -1824,7 +1913,7 @@ mod tests {
         let td = TempDir::new().unwrap();
         let ctx = make_archive_recover_ctx(&td, "2026-08-28T00-00-00Z__recover");
 
-        let write_target = td.path().join("archive").join("write.md");
+        let write_target = td.path().join("projects/archive").join("write.md");
         mutate(
             &ctx,
             &write_target,
@@ -1835,8 +1924,10 @@ mod tests {
         )
         .unwrap();
 
-        let rename_source = td.path().join("archive").join("source.md");
-        let rename_destination = td.path().join("recovered").join("destination.md");
+        let rename_source = td.path().join("projects/archive").join("source.md");
+        let rename_destination = ctx
+            .run_dir
+            .join("recovery-evidence/losers/projects/archive/destination.md");
         fs::write(&rename_source, b"recovered rename\n").unwrap();
         mutate(
             &ctx,
@@ -1871,8 +1962,8 @@ mod tests {
     fn archive_recover_same_basename_paths_get_distinct_redacted_locks() {
         let td = TempDir::new().unwrap();
         let ctx = make_archive_recover_ctx(&td, "2026-08-28T00-00-01Z__collision");
-        let first = td.path().join("one").join("message.md");
-        let second = td.path().join("two").join("message.md");
+        let first = td.path().join("projects/one").join("message.md");
+        let second = td.path().join("projects/two").join("message.md");
 
         mutate(
             &ctx,
@@ -1901,6 +1992,32 @@ mod tests {
         let first_name = first_lock.file_name().unwrap().to_string_lossy();
         assert!(!first_name.contains("one"));
         assert!(!first_name.contains("message"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_recover_refuses_symlinked_parent_inside_admitted_scope() {
+        use std::os::unix::fs::symlink;
+
+        let td = TempDir::new().unwrap();
+        let ctx = make_archive_recover_ctx(&td, "2026-08-28T00-00-02Z__parent-symlink");
+        let real_parent = td.path().join("projects/real");
+        let linked_parent = td.path().join("projects/linked");
+        fs::create_dir_all(&real_parent).unwrap();
+        symlink(&real_parent, &linked_parent).unwrap();
+        let target = linked_parent.join("message.md");
+
+        let result = mutate(
+            &ctx,
+            &target,
+            Op::WriteFile {
+                content: b"must not be redirected\n".to_vec(),
+                mode: 0o600,
+            },
+        );
+
+        assert!(matches!(result, Err(MutateError::Io(_))));
+        assert!(!real_parent.join("message.md").exists());
     }
 
     #[test]

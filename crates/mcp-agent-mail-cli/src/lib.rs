@@ -79902,7 +79902,30 @@ fn archive_recovery_sha256(bytes: &[u8]) -> String {
 }
 
 fn archive_recovery_file_sha256(path: &Path) -> CliResult<String> {
-    Ok(archive_recovery_sha256(&std::fs::read(path)?))
+    use std::io::Read as _;
+
+    let mut file = doctor::platform::open_regular_file_no_follow(path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(archive_recovery_sha256(&bytes))
+}
+
+/// Read one admitted evidence file through a no-follow handle and bind the
+/// returned bytes to the reviewed digest.  Keeping the hash and read on the
+/// same open file descriptor closes the leaf symlink-swap window between a
+/// metadata/hash check and the later content read.
+fn archive_recovery_read_regular_exact(path: &Path, expected_sha256: &str) -> CliResult<Vec<u8>> {
+    use std::io::Read as _;
+
+    let mut file = doctor::platform::open_regular_file_no_follow(path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    if archive_recovery_sha256(&bytes) != expected_sha256 {
+        return Err(CliError::InvalidArgument(
+            "recovery evidence bytes differ from the reviewed SHA-256".to_string(),
+        ));
+    }
+    Ok(bytes)
 }
 
 #[cfg(unix)]
@@ -80547,8 +80570,11 @@ fn archive_recovery_preflight_apply(
 }
 
 /// Refuse any recovery artifact that the mailbox coalescer could commit or
-/// re-import.  A configured doctor root outside this worktree is intrinsically
-/// safe; an in-worktree root must be ignored according to Git itself.
+/// re-import. A configured doctor root outside this worktree is intrinsically
+/// safe; an in-worktree root must itself be ignored according to Git. Requiring
+/// the root (rather than one synthetic descendant probe) prevents a narrow
+/// ignore rule from admitting the probe while leaving actual run artifacts
+/// visible to Git.
 fn archive_recovery_require_safe_doctor_root(storage_root: &Path) -> CliResult<()> {
     let doctor_root = doctor::runs::doctor_root(storage_root);
     let Ok(repository) = git2::Repository::discover(storage_root) else {
@@ -80557,36 +80583,41 @@ fn archive_recovery_require_safe_doctor_root(storage_root: &Path) -> CliResult<(
     let Some(workdir) = repository.workdir() else {
         return Ok(());
     };
-    let activity_lock = Path::new(".mailbox.activity.lock");
-    let activity_lock_is_tracked = repository
-        .index()
-        .ok()
-        .and_then(|index| index.get_path(activity_lock, 0).map(|_| ()))
-        .is_some();
+    let activity_lock = storage_root.join(".mailbox.activity.lock");
+    let activity_lock = activity_lock.strip_prefix(workdir).map_err(|_| {
+        CliError::InvalidArgument(
+            "archive recovery mailbox activity lock is outside the mailbox Git worktree"
+                .to_string(),
+        )
+    })?;
     let activity_lock_is_ignored = repository
         .status_should_ignore(activity_lock)
         .unwrap_or(false);
-    if !activity_lock_is_tracked && !activity_lock_is_ignored {
+    if !activity_lock_is_ignored {
         return Err(CliError::InvalidArgument(
-            "archive recovery refused: .mailbox.activity.lock must be tracked or Git-ignored before preview/apply"
+            "archive recovery refused: .mailbox.activity.lock must be Git-ignored before preview/apply; a tracked lock would dirty the admitted Git snapshot"
                 .to_string(),
         ));
     }
     if !doctor_root.starts_with(workdir) {
         return Ok(());
     }
-    let probe = doctor_root.join("recovery-evidence/.archive-recover-ignore-probe");
-    let relative = probe.strip_prefix(workdir).map_err(|_| {
-        CliError::InvalidArgument("archive recovery Git ignore probe is invalid".to_string())
+    let relative = doctor_root.strip_prefix(workdir).map_err(|_| {
+        CliError::InvalidArgument("archive recovery doctor root is invalid".to_string())
     })?;
+    if relative.as_os_str().is_empty() {
+        return Err(CliError::InvalidArgument(
+            "archive recovery doctor root cannot be the mailbox Git worktree".to_string(),
+        ));
+    }
     let ignored = repository.status_should_ignore(relative).map_err(|err| {
         CliError::InvalidArgument(format!(
-            "cannot determine whether the doctor recovery subtree is Git-ignored: {err}"
+            "cannot determine whether the doctor recovery root is Git-ignored: {err}"
         ))
     })?;
     if !ignored {
         return Err(CliError::InvalidArgument(
-            "archive recovery apply refused: the resolved doctor recovery subtree is not Git-ignored; configure an external AM_DOCTOR_BACKUPS_DIR or add an ignore rule, then re-run the reviewed preview"
+            "archive recovery refused: the resolved doctor root itself is not Git-ignored; configure an external AM_DOCTOR_BACKUPS_DIR or add a root-level ignore rule, then re-run the reviewed preview"
                 .to_string(),
         ));
     }
@@ -80765,6 +80796,9 @@ fn handle_doctor_archive_recover(
         // Mutating recovery must not race a live mailbox owner. This happens
         // after the first pure preview calculation so preview itself remains
         // lock/run-dir free, and before any doctor run artifacts are created.
+        // Validate the lock and doctor-root ignore contract before acquiring
+        // the lock so a refused apply cannot create a Git-visible lock file.
+        archive_recovery_require_safe_doctor_root(&config.storage_root)?;
         let mailbox_lock =
             acquire_doctor_mailbox_activity_lock_for_storage_root(&config.storage_root, false)?;
         // The lock closes the owner race; recompute under it and bind apply to
@@ -81226,6 +81260,7 @@ fn archive_recovery_undo_pairs(
             ));
         }
         let source = source_root.join(&relative);
+        archive_recovery_require_real_parent_chain(&source_root, &source)?;
         archive_recovery_require_regular_exact(&source, &loser.sha256)?;
         pairs.push((source, destination, loser.sha256.clone(), loser.mode));
     }
@@ -81250,8 +81285,13 @@ fn handle_doctor_archive_recover_undo(
         ));
     }
     let config = Config::from_env();
+    // This preflight is deliberately before lock acquisition: an unsafe
+    // activity-lock path must not create a Git-visible artifact. Recheck while
+    // holding the lock below to close configuration/ignore drift.
+    archive_recovery_require_safe_doctor_root(&config.storage_root)?;
     let _mailbox_lock =
         acquire_doctor_mailbox_activity_lock_for_storage_root(&config.storage_root, dry_run)?;
+    archive_recovery_require_safe_doctor_root(&config.storage_root)?;
     let (_run_dir, intent, terminal) =
         archive_recovery_read_sealed_run(&config.storage_root, &run_id)?;
     let expected_original_paths = intent
@@ -81303,8 +81343,13 @@ fn handle_doctor_archive_recover_undo(
             // Revalidate immediately before the chokepoint. mutate() also
             // records its output hash. The sealed source is copied, never
             // moved, so the admitted recovery receipt remains verifiable.
-            archive_recovery_require_regular_exact(source, expected_sha256)?;
-            let content = std::fs::read(source)?;
+            let source_root = doctor::runs::doctor_root(&config.storage_root)
+                .join("runs")
+                .join(&run_id)
+                .join("recovery-evidence")
+                .join("losers");
+            archive_recovery_require_real_parent_chain(&source_root, source)?;
+            let content = archive_recovery_read_regular_exact(source, expected_sha256)?;
             let result = doctor::mutate::mutate(
                 &ctx,
                 destination,
@@ -81711,6 +81756,23 @@ mod archive_recovery_tests {
         let sha256 = archive_recovery_file_sha256(&regular).expect("regular hash");
         assert!(archive_recovery_require_regular_exact(&regular, &sha256).is_ok());
         assert!(archive_recovery_require_regular_exact(&link, &sha256).is_err());
+
+        let source_root = temp.path().join("source-root");
+        let real_parent = source_root.join("real-parent");
+        let linked_parent = source_root.join("linked-parent");
+        std::fs::create_dir_all(&real_parent).expect("real evidence parent");
+        std::fs::write(real_parent.join("evidence.md"), b"retained\n")
+            .expect("retained evidence fixture");
+        std::os::unix::fs::symlink(&real_parent, &linked_parent)
+            .expect("symlinked evidence parent");
+        assert!(
+            archive_recovery_require_real_parent_chain(
+                &source_root,
+                &linked_parent.join("evidence.md")
+            )
+            .is_err(),
+            "retained evidence reads must reject a symlinked ancestor"
+        );
     }
 
     #[test]
@@ -81754,8 +81816,11 @@ mod archive_recovery_tests {
             "---json\n{\"id\":7,\"from\":\"ArchiveOnly\"}\n---\n",
         )
         .expect("incomplete competing message");
-        std::fs::write(storage_root.join(".gitignore"), ".mailbox.activity.lock\n")
-            .expect("ignore the retained mailbox activity lock");
+        std::fs::write(
+            storage_root.join(".gitignore"),
+            ".mailbox.activity.lock\n.doctor/recovery-evidence/.archive-recover-ignore-probe\n",
+        )
+        .expect("ignore the activity lock but only a deliberately narrow doctor probe");
         let connection =
             mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().into_owned())
                 .expect("seed database");
@@ -82185,6 +82250,29 @@ mod archive_recovery_tests {
             ),
             doctor::manifest::ManifestVerdict::Verified
         ));
+
+        // Regression: undo must re-establish the root-level ignore contract
+        // before creating its run or restoring a byte. A narrow/removed rule
+        // cannot be detected only after partial restoration.
+        std::fs::write(storage_root.join(".gitignore"), ".mailbox.activity.lock\n")
+            .expect("temporarily remove fixture doctor-root ignore");
+        let unsafe_undo = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &database_url),
+                ("STORAGE_ROOT", &storage_root_text),
+            ],
+            || handle_doctor_archive_recover_undo(run_id.clone(), true, false, true),
+        );
+        assert!(
+            unsafe_undo.is_err(),
+            "undo must refuse when the doctor root is no longer ignored"
+        );
+        assert!(!loser.exists(), "refused undo must restore no evidence");
+        std::fs::write(
+            storage_root.join(".gitignore"),
+            ".mailbox.activity.lock\n.doctor/\n",
+        )
+        .expect("restore the exact admitted fixture ignore bytes");
 
         let undo_preview = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[
