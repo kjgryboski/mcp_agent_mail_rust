@@ -80833,15 +80833,15 @@ fn handle_doctor_archive_recover(
         archive_recovery_require_safe_doctor_root(&config.storage_root, &run_id, Some(&plan))?;
         archive_recovery_require_untracked_only_plan(&config.storage_root, &plan)?;
     }
-    let _mailbox_lock = if !dry_run {
+    let _mailbox_locks = if !dry_run {
         // Mutating recovery must not race a live mailbox owner. This happens
         // after the first pure preview calculation so preview itself remains
         // lock/run-dir free, and before any doctor run artifacts are created.
         // Validate the lock and doctor-root ignore contract before acquiring
         // the lock so a refused apply cannot create a Git-visible lock file.
         archive_recovery_require_safe_doctor_root(&config.storage_root, &run_id, Some(&plan))?;
-        let mailbox_lock =
-            acquire_doctor_mailbox_activity_lock_for_storage_root(&config.storage_root, false)?;
+        let mailbox_locks =
+            acquire_cli_mailbox_mutation_locks(&config.database_url, Some(&config.storage_root))?;
         // The lock closes the owner race; recompute under it and bind apply to
         // the fresh plan so a changed archive cannot reuse a stale approval.
         plan = archive_recovery_plan(
@@ -80859,7 +80859,7 @@ fn handle_doctor_archive_recover(
             ));
         }
         archive_recovery_require_safe_doctor_root(&config.storage_root, &run_id, Some(&plan))?;
-        mailbox_lock
+        Some(mailbox_locks)
     } else {
         None
     };
@@ -81342,8 +81342,14 @@ fn handle_doctor_archive_recover_undo(
     // activity-lock path must not create a Git-visible artifact. Recheck while
     // holding the lock below to close configuration/ignore drift.
     archive_recovery_require_safe_doctor_root(&config.storage_root, &restore_run_id, None)?;
-    let _mailbox_lock =
-        acquire_doctor_mailbox_activity_lock_for_storage_root(&config.storage_root, dry_run)?;
+    let _mailbox_locks = if dry_run {
+        None
+    } else {
+        Some(acquire_cli_mailbox_mutation_locks(
+            &config.database_url,
+            Some(&config.storage_root),
+        )?)
+    };
     let (_run_dir, intent, terminal) =
         archive_recovery_read_sealed_run(&config.storage_root, &run_id)?;
     archive_recovery_require_safe_doctor_root(
@@ -82262,6 +82268,34 @@ mod archive_recovery_tests {
         );
         drop(competing_mailbox_lock);
 
+        let competing_sqlite_lock =
+            acquire_doctor_mailbox_activity_lock_for_sqlite_path(&db_path, false)
+                .expect("acquire competing fixture SQLite lock");
+        let sqlite_lock_result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &database_url),
+                ("STORAGE_ROOT", &storage_root_text),
+            ],
+            || {
+                handle_doctor_archive_recover(
+                    false,
+                    true,
+                    true,
+                    canonical_identity.display().to_string(),
+                    vec![7],
+                    vec![loser_relative.clone()],
+                    Some(plan_digest.clone()),
+                )
+            },
+        );
+        assert!(
+            sqlite_lock_result.is_err(),
+            "a direct SQLite owner must refuse recovery apply before evidence moves"
+        );
+        assert!(loser.exists());
+        assert!(!storage_root.join(".doctor/runs").exists());
+        drop(competing_sqlite_lock);
+
         let apply_capture = StdioCapture::install().expect("install apply capture");
         let apply_result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[
@@ -82355,6 +82389,26 @@ mod archive_recovery_tests {
             ),
             doctor::manifest::ManifestVerdict::Verified
         ));
+
+        let competing_undo_sqlite_lock =
+            acquire_doctor_mailbox_activity_lock_for_sqlite_path(&db_path, false)
+                .expect("acquire competing undo SQLite lock");
+        let locked_undo = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &database_url),
+                ("STORAGE_ROOT", &storage_root_text),
+            ],
+            || handle_doctor_archive_recover_undo(run_id.clone(), false, true, true),
+        );
+        assert!(
+            locked_undo.is_err(),
+            "a direct SQLite owner must refuse recovery undo before restoration"
+        );
+        assert!(
+            !loser.exists(),
+            "refused locked undo must restore no evidence"
+        );
+        drop(competing_undo_sqlite_lock);
 
         // Regression: undo must re-establish the root-level ignore contract
         // before creating its run or restoring a byte. A narrow/removed rule
