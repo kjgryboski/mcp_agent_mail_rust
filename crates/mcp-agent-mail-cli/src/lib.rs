@@ -82087,6 +82087,18 @@ fn historical_artifact_relative_path(storage_root: &Path, target: &Path) -> CliR
     Ok(relative.to_string_lossy().replace('\\', "/"))
 }
 
+fn historical_artifact_mode_matches(path: &Path, expected: u32) -> CliResult<bool> {
+    #[cfg(unix)]
+    {
+        archive_recovery_mode_matches(path, Some(expected))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, expected);
+        Ok(true)
+    }
+}
+
 fn historical_artifact_inspect_target(
     storage_root: &Path,
     project_root: &Path,
@@ -82119,7 +82131,7 @@ fn historical_artifact_inspect_target(
             let observed_sha256 = archive_recovery_file_sha256(target)?;
             let mode = archive_recovery_file_mode(target)?;
             if observed_sha256 != content_sha256
-                || !archive_recovery_mode_matches(target, Some(0o644))?
+                || !historical_artifact_mode_matches(target, 0o644)?
             {
                 return Err(CliError::InvalidArgument(format!(
                     "existing historical artifact {path} diverges from DB-authoritative bytes or mode"
@@ -82881,7 +82893,7 @@ fn historical_strict_allowlist_commit(
         match operation {
             StrictAllowlistOperation::Add => {
                 archive_recovery_require_regular_exact(&target, &action.content_sha256)?;
-                if !archive_recovery_mode_matches(&target, Some(action.mode))? {
+                if !historical_artifact_mode_matches(&target, action.mode)? {
                     return Err(CliError::InvalidArgument(format!(
                         "strict Git add target {} changed mode",
                         action.path
@@ -83274,7 +83286,7 @@ fn handle_doctor_historical_artifact_reconcile(
             if !result.ok
                 || result.after_hash.strip_prefix("sha256:") != Some(action.content_sha256.as_str())
                 || archive_recovery_require_regular_exact(&target, &action.content_sha256).is_err()
-                || !archive_recovery_mode_matches(&target, Some(action.mode))?
+                || !historical_artifact_mode_matches(&target, action.mode)?
             {
                 return Err(historical_artifact_partial_failure(
                     &ctx,
@@ -83542,7 +83554,7 @@ fn handle_doctor_historical_artifact_reconcile_undo(
     for action in &intent.plan.actions {
         let target = config.storage_root.join(Path::new(&action.path));
         archive_recovery_require_regular_exact(&target, &action.content_sha256)?;
-        if !archive_recovery_mode_matches(&target, Some(action.mode))? {
+        if !historical_artifact_mode_matches(&target, action.mode)? {
             return Err(CliError::InvalidArgument(format!(
                 "historical reconciliation undo target {} changed mode",
                 action.path
@@ -83752,6 +83764,659 @@ fn handle_doctor_historical_artifact_reconcile_undo(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod historical_artifact_reconcile_tests {
+    use super::*;
+
+    struct HistoricalFixture {
+        _temp: tempfile::TempDir,
+        storage_root: PathBuf,
+        db_path: PathBuf,
+        canonical_identity: PathBuf,
+        doctor_root: PathBuf,
+    }
+
+    impl HistoricalFixture {
+        fn database_url(&self) -> String {
+            format!("sqlite:///{}", self.db_path.display())
+        }
+
+        fn env_strings(&self) -> (String, String, String) {
+            (
+                self.database_url(),
+                self.storage_root.display().to_string(),
+                self.doctor_root.display().to_string(),
+            )
+        }
+    }
+
+    fn commit_all_fixture_files(repository: &git2::Repository, message: &str) -> git2::Oid {
+        let mut index = repository.index().expect("fixture index");
+        index
+            .add_path(Path::new(".gitignore"))
+            .expect("stage fixture ignore");
+        index
+            .add_path(Path::new("projects/canonical/project.json"))
+            .expect("stage fixture project metadata");
+        index.write().expect("persist fixture index");
+        let tree_id = index.write_tree().expect("fixture tree id");
+        let tree = repository.find_tree(tree_id).expect("fixture tree");
+        let signature = git2::Signature::now("Historical Fixture", "test@example.invalid")
+            .expect("fixture signature");
+        repository
+            .commit(Some("HEAD"), &signature, &signature, message, &tree, &[])
+            .expect("fixture commit")
+    }
+
+    fn historical_fixture() -> HistoricalFixture {
+        let temp = tempfile::tempdir().expect("historical fixture tempdir");
+        let storage_root = temp.path().join("mailbox");
+        let db_path = temp.path().join("mailbox.sqlite3");
+        let canonical_identity = temp.path().join("canonical-project");
+        let doctor_root = temp.path().join("external-doctor");
+        std::fs::create_dir_all(&canonical_identity).expect("canonical identity directory");
+        std::fs::create_dir_all(storage_root.join("projects/canonical"))
+            .expect("canonical archive directory");
+        let repository = git2::Repository::init(&storage_root).expect("fixture mailbox Git repo");
+        std::fs::write(storage_root.join(".gitignore"), ".mailbox.activity.lock\n")
+            .expect("fixture ignore");
+        std::fs::write(
+            storage_root.join("projects/canonical/project.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "slug": "canonical",
+                "human_key": canonical_identity.display().to_string(),
+            }))
+            .expect("project metadata JSON"),
+        )
+        .expect("fixture project metadata");
+        commit_all_fixture_files(&repository, "historical fixture baseline");
+
+        let connection =
+            mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().into_owned())
+                .expect("fixture database");
+        let escaped_identity = canonical_identity.display().to_string().replace('\'', "''");
+        let statements = [
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL)",
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, program TEXT NOT NULL, model TEXT NOT NULL, task_description TEXT NOT NULL, inception_ts INTEGER NOT NULL, last_active_ts INTEGER NOT NULL, attachments_policy TEXT NOT NULL, contact_policy TEXT NOT NULL, reaper_exempt INTEGER NOT NULL, registration_token TEXT, retired_at INTEGER)",
+            "CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, path_pattern TEXT NOT NULL, exclusive INTEGER NOT NULL, reason TEXT NOT NULL, created_ts INTEGER NOT NULL, expires_ts INTEGER NOT NULL, released_ts INTEGER)",
+            "CREATE TABLE file_reservation_releases (reservation_id INTEGER PRIMARY KEY, released_ts INTEGER NOT NULL)",
+            "CREATE TABLE db_identity (singleton INTEGER PRIMARY KEY, generation_id TEXT NOT NULL)",
+        ];
+        for statement in statements {
+            connection
+                .execute_raw(statement)
+                .expect("fixture schema statement");
+        }
+        for statement in [
+            format!(
+                "INSERT INTO projects (id, slug, human_key) VALUES (1, 'canonical', '{escaped_identity}')"
+            ),
+            "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, registration_token, retired_at) VALUES (1, 1, 'WhiteDeer', 'codex', 'gpt-test', 'historical fixture', 1700000000000000, 1700000100000000, 'auto', 'auto', 0, 'super-secret-token', NULL)".to_string(),
+            "INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) VALUES (41, 1, 1, 'src/exact.rs', 1, 'historical fixture', 1700000200000000, 1700000300000000, NULL)".to_string(),
+            "INSERT INTO file_reservation_releases (reservation_id, released_ts) VALUES (41, 1700000400000000)".to_string(),
+            format!(
+                "INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) VALUES (42, 1, 1, 'src/active.rs', 1, 'active refusal', 1700000200000000, {}, NULL)",
+                mcp_agent_mail_db::now_micros() + 3_600_000_000
+            ),
+            "INSERT INTO db_identity (singleton, generation_id) VALUES (0, 'a1b2c3d4')".to_string(),
+        ] {
+            connection
+                .execute_raw(&statement)
+                .expect("fixture row statement");
+        }
+        drop(connection);
+
+        HistoricalFixture {
+            _temp: temp,
+            storage_root,
+            db_path,
+            canonical_identity,
+            doctor_root,
+        }
+    }
+
+    fn extract_json_object(output: &str, status: &str) -> serde_json::Value {
+        let mut start = 0usize;
+        while let Some(relative) = output[start..].find('{') {
+            let object_start = start + relative;
+            let mut depth = 0i32;
+            let mut in_string = false;
+            let mut escaped = false;
+            for (offset, character) in output[object_start..].char_indices() {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                match character {
+                    '\\' if in_string => escaped = true,
+                    '"' => in_string = !in_string,
+                    '{' if !in_string => depth += 1,
+                    '}' if !in_string => {
+                        depth -= 1;
+                        if depth == 0 {
+                            let end = object_start + offset + 1;
+                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(
+                                &output[object_start..end],
+                            ) && value.get("status") == Some(&serde_json::json!(status))
+                            {
+                                return value;
+                            }
+                            start = end;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if start <= object_start {
+                break;
+            }
+        }
+        panic!("missing JSON object with status={status}; output={output}");
+    }
+
+    fn call_with_fixture_env<T>(fixture: &HistoricalFixture, call: impl FnOnce() -> T) -> T {
+        let (database_url, storage_root, doctor_root) = fixture.env_strings();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root.as_str()),
+                ("AM_DOCTOR_BACKUPS_DIR", doctor_root.as_str()),
+            ],
+            call,
+        )
+    }
+
+    fn capture_call(call: impl FnOnce() -> CliResult<()>) -> (CliResult<()>, String) {
+        use ftui_runtime::stdio_capture::StdioCapture;
+        let capture = StdioCapture::install().expect("install stdout capture");
+        let result = call();
+        let output = capture.drain_to_string();
+        drop(capture);
+        (result, output)
+    }
+
+    #[test]
+    fn historical_plan_digest_is_ordered_redacted_and_content_bound() {
+        let action = HistoricalArtifactAction {
+            kind: HistoricalArtifactKind::AgentProfile,
+            selector: HistoricalArtifactSelector::Agent {
+                name: "WhiteDeer".to_string(),
+            },
+            path: "projects/canonical/agents/WhiteDeer/profile.json".to_string(),
+            expected_precondition: "absent".to_string(),
+            content_sha256: archive_recovery_sha256(b"secret payload"),
+            bytes: 14,
+            mode: 0o644,
+            db_row_sha256: archive_recovery_sha256(b"db row"),
+            content: b"secret payload".to_vec(),
+        };
+        let plan = HistoricalArtifactPlan {
+            schema_version: "historical-artifact-reconcile-plan-v1".to_string(),
+            canonical_identity_sha256: archive_recovery_sha256(b"/canonical"),
+            canonical_project_slug: "canonical".to_string(),
+            selected_agents: vec!["WhiteDeer".to_string()],
+            selected_reservation_ids: Vec::new(),
+            expected_git_head: "1".repeat(40),
+            expected_git_tree: "2".repeat(40),
+            expected_git_index_sha256: "3".repeat(64),
+            expected_git_status: ArchiveRecoveryGitStatusSnapshot {
+                entry_count: 0,
+                sha256: archive_recovery_sha256(b"status"),
+            },
+            actions: vec![action],
+            observed_exact: Vec::new(),
+        };
+        assert_eq!(
+            historical_artifact_plan_digest(&plan).expect("first digest"),
+            historical_artifact_plan_digest(&plan).expect("repeat digest")
+        );
+        let serialized = serde_json::to_string(&plan).expect("serialized redacted plan");
+        assert!(!serialized.contains("secret payload"));
+        assert!(!serialized.contains("/canonical"));
+        assert!(serialized.contains("content_sha256"));
+    }
+
+    #[test]
+    fn historical_command_classification_and_flags_keep_preview_read_only() {
+        let command = DoctorCommand::HistoricalArtifactReconcile {
+            dry_run: true,
+            yes: false,
+            json: true,
+            canonical_identity: "/canonical".to_string(),
+            agent_names: vec!["WhiteDeer".to_string()],
+            reservation_ids: Vec::new(),
+            plan_sha256: None,
+        };
+        assert!(doctor_command_is_read_only(&command));
+        let contradictory = handle_doctor_historical_artifact_reconcile(
+            true,
+            true,
+            true,
+            "/canonical".to_string(),
+            vec!["WhiteDeer".to_string()],
+            Vec::new(),
+            None,
+        )
+        .expect_err("preview must reject --yes before reading config");
+        assert!(contradictory.to_string().contains("contradictory"));
+        let unbound = handle_doctor_historical_artifact_reconcile(
+            false,
+            true,
+            true,
+            "/canonical".to_string(),
+            vec!["WhiteDeer".to_string()],
+            Vec::new(),
+            None,
+        )
+        .expect_err("apply must require digest before reading config");
+        assert!(unbound.to_string().contains("plan-sha256"));
+    }
+
+    #[test]
+    fn historical_allowlist_refuses_traversal_cross_project_and_git_metadata() {
+        for path in [
+            "/absolute",
+            "projects/canonical/../other/file.json",
+            "projects/other/file.json",
+            "projects/canonical/.git/config",
+            "projects//canonical/file.json",
+        ] {
+            assert!(
+                historical_strict_allowlist_path(path, "canonical").is_err(),
+                "unsafe path accepted: {path}"
+            );
+        }
+        assert!(
+            historical_strict_allowlist_path(
+                "projects/canonical/agents/WhiteDeer/profile.json",
+                "canonical"
+            )
+            .is_ok()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn historical_target_inspection_refuses_symlink_leaf_and_parent() {
+        let temp = tempfile::tempdir().expect("symlink fixture");
+        let storage_root = temp.path().join("mailbox");
+        let project_root = storage_root.join("projects/canonical");
+        std::fs::create_dir_all(project_root.join("agents/WhiteDeer"))
+            .expect("real fixture parent");
+        let outside = temp.path().join("outside.json");
+        std::fs::write(&outside, b"{} ").expect("outside fixture");
+        let leaf = project_root.join("agents/WhiteDeer/profile.json");
+        std::os::unix::fs::symlink(&outside, &leaf).expect("leaf symlink");
+        let mut actions = Vec::new();
+        let mut exact = Vec::new();
+        assert!(
+            historical_artifact_inspect_target(
+                &storage_root,
+                &project_root,
+                &leaf,
+                HistoricalArtifactKind::AgentProfile,
+                HistoricalArtifactSelector::Agent {
+                    name: "WhiteDeer".to_string(),
+                },
+                b"{}".to_vec(),
+                archive_recovery_sha256(b"row"),
+                &mut actions,
+                &mut exact,
+            )
+            .is_err()
+        );
+
+        let linked_parent = project_root.join("agents/LinkedDeer");
+        std::os::unix::fs::symlink(temp.path(), &linked_parent).expect("parent symlink");
+        assert!(
+            historical_artifact_require_safe_parent_prefix(
+                &project_root,
+                &linked_parent.join("profile.json")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn historical_isolated_preview_apply_and_undo_preserve_all_evidence() {
+        let fixture = historical_fixture();
+        let database_url = fixture.database_url();
+        let identity = fixture.canonical_identity.display().to_string();
+        let db_before = archive_recovery_file_sha256(&fixture.db_path).expect("DB before hash");
+        let git_before =
+            archive_recovery_git_snapshot(&fixture.storage_root).expect("Git before snapshot");
+        let status_before = archive_recovery_git_status_snapshot(&fixture.storage_root)
+            .expect("status before")
+            .expect("Git status snapshot");
+        eprintln!(
+            "historical-e2e fixture: projects=1 agents=1 selected_reservations=1 active_refusal_rows=1 db_sha256={} git_head={:?}",
+            db_before, git_before.0
+        );
+
+        let active_error =
+            historical_artifact_plan(&fixture.storage_root, &database_url, &identity, &[], &[42])
+                .expect_err("active reservation must refuse");
+        assert!(active_error.to_string().contains("is active"));
+        assert_eq!(
+            archive_recovery_file_sha256(&fixture.db_path).expect("DB after active refusal"),
+            db_before
+        );
+
+        let plan = historical_artifact_plan(
+            &fixture.storage_root,
+            &database_url,
+            &identity,
+            &["WhiteDeer".to_string()],
+            &[41],
+        )
+        .expect("bounded historical plan");
+        let plan_digest = historical_artifact_plan_digest(&plan).expect("plan digest");
+        assert_eq!(plan.actions.len(), 3);
+        assert_eq!(plan.expected_git_status, status_before);
+        assert!(
+            plan.actions
+                .iter()
+                .any(|action| action.path.contains("id-41-ga1b2c3d4.json"))
+        );
+        assert!(
+            serde_json::to_string(&plan)
+                .expect("redacted plan")
+                .contains("WhiteDeer")
+        );
+        assert!(
+            !serde_json::to_string(&plan)
+                .unwrap()
+                .contains("super-secret-token")
+        );
+        eprintln!(
+            "historical-e2e preview plan_sha256={} actions={} status_entries={}",
+            plan_digest,
+            plan.actions.len(),
+            plan.expected_git_status.entry_count
+        );
+
+        let _capture_guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (preview_result, preview_stdout) = capture_call(|| {
+            call_with_fixture_env(&fixture, || {
+                handle_doctor_historical_artifact_reconcile(
+                    true,
+                    false,
+                    true,
+                    identity.clone(),
+                    vec!["WhiteDeer".to_string()],
+                    vec![41],
+                    None,
+                )
+            })
+        });
+        assert!(preview_result.is_ok(), "preview failed: {preview_result:?}");
+        let preview = extract_json_object(&preview_stdout, "preview");
+        assert_eq!(preview["plan_sha256"], plan_digest);
+        assert_eq!(preview["db_writes"], 0);
+        assert_eq!(preview["provider_writes"], 0);
+        assert_eq!(preview["service_writes"], 0);
+        assert_eq!(preview["audit_writes"], 0);
+        assert!(!fixture.doctor_root.exists());
+        assert_eq!(
+            archive_recovery_file_sha256(&fixture.db_path).expect("DB after preview"),
+            db_before
+        );
+        assert_eq!(
+            archive_recovery_git_snapshot(&fixture.storage_root).expect("Git after preview"),
+            git_before
+        );
+
+        let unrelated = fixture.storage_root.join("projects/unrelated-pending.txt");
+        std::fs::write(&unrelated, b"unrelated state\n").expect("unrelated dirty fixture");
+        let stale_result = call_with_fixture_env(&fixture, || {
+            handle_doctor_historical_artifact_reconcile(
+                false,
+                true,
+                true,
+                identity.clone(),
+                vec!["WhiteDeer".to_string()],
+                vec![41],
+                Some(plan_digest.clone()),
+            )
+        });
+        assert!(stale_result.is_err(), "status drift must stale the plan");
+        assert!(!fixture.doctor_root.exists());
+        let dirty_plan = historical_artifact_plan(
+            &fixture.storage_root,
+            &database_url,
+            &identity,
+            &["WhiteDeer".to_string()],
+            &[41],
+        )
+        .expect("dirty baseline plan");
+        let dirty_digest = historical_artifact_plan_digest(&dirty_plan).expect("dirty digest");
+        assert_ne!(dirty_digest, plan_digest);
+        assert!(
+            !serde_json::to_string(&dirty_plan)
+                .unwrap()
+                .contains("unrelated-pending")
+        );
+
+        let (apply_result, apply_stdout) = capture_call(|| {
+            call_with_fixture_env(&fixture, || {
+                handle_doctor_historical_artifact_reconcile(
+                    false,
+                    true,
+                    true,
+                    identity.clone(),
+                    vec!["WhiteDeer".to_string()],
+                    vec![41],
+                    Some(dirty_digest.clone()),
+                )
+            })
+        });
+        assert!(apply_result.is_ok(), "apply failed: {apply_result:?}");
+        let applied = extract_json_object(&apply_stdout, "applied");
+        let source_run_id = applied["run_id"]
+            .as_str()
+            .expect("applied run id")
+            .to_string();
+        assert_eq!(applied["artifacts_written"], 3);
+        assert_eq!(applied["db_writes"], 0);
+        assert_eq!(applied["provider_writes"], 0);
+        assert_eq!(applied["service_writes"], 0);
+        assert!(unrelated.is_file(), "unrelated dirt was not preserved");
+        assert_eq!(
+            archive_recovery_file_sha256(&fixture.db_path).expect("DB after apply"),
+            db_before
+        );
+        let profile_path = fixture
+            .storage_root
+            .join("projects/canonical/agents/WhiteDeer/profile.json");
+        let stable_path = fixture
+            .storage_root
+            .join("projects/canonical/file_reservations/id-41-ga1b2c3d4.json");
+        let mirror_path = dirty_plan
+            .actions
+            .iter()
+            .find(|action| action.kind == HistoricalArtifactKind::ReservationPathMirror)
+            .map(|action| fixture.storage_root.join(Path::new(&action.path)))
+            .expect("mirror path");
+        for path in [&profile_path, &stable_path, &mirror_path] {
+            assert!(
+                path.is_file(),
+                "missing applied artifact: {}",
+                path.display()
+            );
+        }
+        let profile_text = std::fs::read_to_string(&profile_path).expect("profile readback");
+        assert!(!profile_text.contains("registration_token"));
+        assert!(!profile_text.contains("super-secret-token"));
+        let reservation_text = std::fs::read_to_string(&stable_path).expect("reservation readback");
+        assert!(reservation_text.contains("released_ts"));
+        assert!(reservation_text.contains("a1b2c3d4"));
+
+        let applied_repo = git2::Repository::open(&fixture.storage_root).expect("applied repo");
+        let applied_head = applied_repo
+            .head()
+            .and_then(|head| head.peel_to_commit())
+            .expect("applied head");
+        let applied_parent = applied_head.parent(0).expect("applied parent");
+        let applied_diff = applied_repo
+            .diff_tree_to_tree(
+                Some(&applied_parent.tree().expect("parent tree")),
+                Some(&applied_head.tree().expect("applied tree")),
+                None,
+            )
+            .expect("applied diff");
+        let applied_paths = applied_diff
+            .deltas()
+            .filter_map(|delta| delta.new_file().path())
+            .filter_map(Path::to_str)
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        let expected_paths = dirty_plan
+            .actions
+            .iter()
+            .map(|action| action.path.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(applied_paths, expected_paths);
+        eprintln!(
+            "historical-e2e apply run={} head={} exact_paths={:?}",
+            source_run_id,
+            applied_head.id(),
+            applied_paths
+        );
+
+        let git_after_apply =
+            archive_recovery_git_snapshot(&fixture.storage_root).expect("Git after apply");
+        let status_after_apply = archive_recovery_git_status_snapshot(&fixture.storage_root)
+            .expect("status after apply")
+            .expect("Git status after apply");
+        assert_eq!(status_after_apply, dirty_plan.expected_git_status);
+        let (undo_preview_result, undo_preview_stdout) = capture_call(|| {
+            call_with_fixture_env(&fixture, || {
+                handle_doctor_historical_artifact_reconcile_undo(
+                    source_run_id.clone(),
+                    true,
+                    false,
+                    true,
+                )
+            })
+        });
+        assert!(
+            undo_preview_result.is_ok(),
+            "undo preview failed: {undo_preview_result:?}"
+        );
+        let undo_preview = extract_json_object(&undo_preview_stdout, "preview");
+        assert_eq!(undo_preview["artifacts_to_preserve"], 3);
+        assert_eq!(undo_preview["artifacts_preserved"], 0);
+        assert_eq!(
+            archive_recovery_git_snapshot(&fixture.storage_root).expect("Git after undo preview"),
+            git_after_apply
+        );
+
+        let (undo_result, undo_stdout) = capture_call(|| {
+            call_with_fixture_env(&fixture, || {
+                handle_doctor_historical_artifact_reconcile_undo(
+                    source_run_id.clone(),
+                    false,
+                    true,
+                    true,
+                )
+            })
+        });
+        assert!(undo_result.is_ok(), "undo failed: {undo_result:?}");
+        let undone = extract_json_object(&undo_stdout, "preserved-and-uncommitted");
+        let undo_run_id = undone["undo_run_id"]
+            .as_str()
+            .expect("undo run id")
+            .to_string();
+        assert_eq!(undone["artifacts_preserved"], 3);
+        assert_eq!(undone["db_writes"], 0);
+        for action in &dirty_plan.actions {
+            let live = fixture.storage_root.join(Path::new(&action.path));
+            assert!(!live.exists(), "undo left live artifact: {}", action.path);
+            let evidence = fixture
+                .doctor_root
+                .join("runs")
+                .join(&undo_run_id)
+                .join("recovery-evidence/created")
+                .join(Path::new(&action.path));
+            assert_eq!(
+                archive_recovery_file_sha256(&evidence).expect("undo evidence hash"),
+                action.content_sha256,
+                "undo evidence hash mismatch for {}",
+                action.path
+            );
+        }
+        assert!(unrelated.is_file(), "undo disturbed unrelated dirt");
+        assert_eq!(
+            archive_recovery_file_sha256(&fixture.db_path).expect("DB after undo"),
+            db_before
+        );
+        assert_eq!(
+            archive_recovery_git_status_snapshot(&fixture.storage_root)
+                .expect("status after undo")
+                .expect("Git status after undo"),
+            dirty_plan.expected_git_status
+        );
+        assert!(matches!(
+            doctor::manifest::verify_run_manifest_default(
+                &fixture.doctor_root.join("runs").join(&source_run_id),
+                &source_run_id,
+            ),
+            doctor::manifest::ManifestVerdict::Verified
+        ));
+        assert!(matches!(
+            doctor::manifest::verify_run_manifest_default(
+                &fixture.doctor_root.join("runs").join(&undo_run_id),
+                &undo_run_id,
+            ),
+            doctor::manifest::ManifestVerdict::Verified
+        ));
+        eprintln!(
+            "historical-e2e undo run={} db_sha256={} evidence_files={} status_sha256={}",
+            undo_run_id,
+            db_before,
+            dirty_plan.actions.len(),
+            dirty_plan.expected_git_status.sha256
+        );
+
+        std::fs::write(&profile_path, b"{\"divergent\":true}").expect("divergent artifact fixture");
+        let divergent = historical_artifact_plan(
+            &fixture.storage_root,
+            &database_url,
+            &identity,
+            &["WhiteDeer".to_string()],
+            &[],
+        )
+        .expect_err("divergent existing artifact must refuse");
+        assert!(divergent.to_string().contains("diverges"));
+    }
+
+    #[test]
+    fn historical_preview_refuses_index_lock_without_removing_it() {
+        let fixture = historical_fixture();
+        let index_lock = git2::Repository::open(&fixture.storage_root)
+            .expect("fixture repository")
+            .path()
+            .join("index.lock");
+        std::fs::write(&index_lock, b"owned elsewhere\n").expect("index lock fixture");
+        let error = historical_artifact_plan(
+            &fixture.storage_root,
+            &fixture.database_url(),
+            &fixture.canonical_identity.display().to_string(),
+            &["WhiteDeer".to_string()],
+            &[],
+        )
+        .expect_err("index lock must refuse");
+        assert!(error.to_string().contains("index.lock"));
+        assert_eq!(
+            std::fs::read(&index_lock).expect("index lock retained"),
+            b"owned elsewhere\n"
+        );
+    }
 }
 
 #[cfg(test)]
