@@ -22,6 +22,7 @@ clap = { workspace = true, features = ["derive"] }
 fastmcp.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha1.workspace = true
 json5.workspace = true
 toml_edit.workspace = true
 ftui.workspace = true

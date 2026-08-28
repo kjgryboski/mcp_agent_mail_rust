@@ -509,8 +509,15 @@ fn reject_unexpected_symlink(path: &Path, op: &Op) -> Result<(), MutateError> {
 /// The recovery filename contains only a SHA-256 digest of the full encoded
 /// path.  This both prevents basename collisions and avoids leaking an
 /// absolute archive path into retained doctor artifacts.
+fn uses_archive_recovery_scope(ctx: &MutateContext) -> bool {
+    matches!(
+        ctx.fixer_id.as_str(),
+        "archive-recover" | "historical-artifact-reconcile"
+    )
+}
+
 fn advisory_lock_path(ctx: &MutateContext, protected_path: &Path) -> PathBuf {
-    if ctx.fixer_id == "archive-recover" {
+    if uses_archive_recovery_scope(ctx) {
         let mut hasher = Sha256::new();
         hasher.update(protected_path.as_os_str().as_encoded_bytes());
         let digest = hex::encode(hasher.finalize());
@@ -538,7 +545,7 @@ fn ensure_archive_recovery_real_parent_chain(
     ctx: &MutateContext,
     path: &Path,
 ) -> Result<(), MutateError> {
-    if ctx.fixer_id != "archive-recover" {
+    if !uses_archive_recovery_scope(ctx) {
         return Ok(());
     }
 
@@ -607,7 +614,7 @@ fn ensure_archive_recovery_run_artifact_ignored(
     ctx: &MutateContext,
     path: &Path,
 ) -> Result<(), MutateError> {
-    if ctx.fixer_id != "archive-recover" || !path.starts_with(&ctx.run_dir) {
+    if !uses_archive_recovery_scope(ctx) || !path.starts_with(&ctx.run_dir) {
         return Ok(());
     }
     let repository = match git2::Repository::discover(&ctx.repo_root) {
@@ -989,7 +996,7 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
     let lock_parent = lock_path.parent().unwrap_or_else(|| Path::new("."));
     ensure_archive_recovery_run_artifact_ignored(ctx, &lock_path)?;
     ensure_archive_recovery_real_parent_chain(ctx, &lock_path)?;
-    if ctx.fixer_id != "archive-recover" {
+    if !uses_archive_recovery_scope(ctx) {
         fs::create_dir_all(lock_parent)?;
     }
     let lock_file = OpenOptions::new()
@@ -1153,7 +1160,7 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
                 // Destination scope already checked at step 1.
                 ensure_archive_recovery_run_artifact_ignored(ctx, &to)?;
                 ensure_archive_recovery_real_parent_chain(ctx, &to)?;
-                if ctx.fixer_id != "archive-recover"
+                if !uses_archive_recovery_scope(ctx)
                     && let Some(parent) = to.parent()
                 {
                     fs::create_dir_all(parent).map_err(MutateError::Io)?;
@@ -1168,7 +1175,7 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
                 let to_lock_parent = to_lock_path.parent().unwrap_or_else(|| Path::new("."));
                 ensure_archive_recovery_run_artifact_ignored(ctx, &to_lock_path)?;
                 ensure_archive_recovery_real_parent_chain(ctx, &to_lock_path)?;
-                if ctx.fixer_id != "archive-recover" {
+                if !uses_archive_recovery_scope(ctx) {
                     fs::create_dir_all(to_lock_parent).map_err(MutateError::Io)?;
                 }
                 let to_lock_file = OpenOptions::new()

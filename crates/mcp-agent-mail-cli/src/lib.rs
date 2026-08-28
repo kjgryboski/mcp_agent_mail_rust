@@ -2575,6 +2575,52 @@ pub enum DoctorCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Restore explicitly selected missing historical agent/reservation
+    /// artifacts from one canonical project's read-only SQLite authority.
+    /// Preview is zero-write; apply requires the exact preview digest and an
+    /// offline mailbox mutation lock.
+    #[command(name = "historical-artifact-reconcile")]
+    HistoricalArtifactReconcile {
+        /// Preview the exact bounded plan without creating run artifacts,
+        /// touching Git, or writing SQLite.
+        #[arg(long)]
+        dry_run: bool,
+        /// Apply the exact reviewed plan. Requires --plan-sha256.
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Emit redacted machine-readable evidence.
+        #[arg(long)]
+        json: bool,
+        /// Exact absolute human_key of the canonical project in SQLite.
+        #[arg(long, value_name = "ABSOLUTE_HUMAN_KEY")]
+        canonical_identity: String,
+        /// Exact registered agent whose missing profile may be restored.
+        #[arg(long = "agent-name", value_name = "NAME")]
+        agent_names: Vec<String>,
+        /// Positive historical reservation whose missing canonical artifacts
+        /// may be restored. Active reservations are always refused.
+        #[arg(long = "reservation-id", value_name = "ID")]
+        reservation_ids: Vec<i64>,
+        /// SHA-256 plan digest returned by preview. Required for apply.
+        #[arg(long, value_name = "SHA256")]
+        plan_sha256: Option<String>,
+    },
+    /// Preserve and uncommit only the artifacts created by one sealed
+    /// historical-artifact reconciliation run.
+    #[command(name = "historical-artifact-reconcile-undo")]
+    HistoricalArtifactReconcileUndo {
+        /// Exact reconciliation run id from its sealed terminal receipt.
+        run_id: String,
+        /// Print the verified compensating plan without changing state.
+        #[arg(long)]
+        dry_run: bool,
+        /// Execute the reviewed evidence-preserving compensation.
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Emit redacted machine-readable evidence.
+        #[arg(long)]
+        json: bool,
+    },
     /// Attempt automatic remediation for detected issues.
     ///
     /// Runs all doctor checks, then fixes each fixable issue:
@@ -3586,7 +3632,9 @@ fn doctor_command_is_read_only(action: &DoctorCommand) -> bool {
         // inventory FM findings without being steered into killing the owner.
         // `--dry-run` and `--yes` (list == false) remain mutating-intent and
         // are intentionally still blocked.
-        DoctorCommand::Fix { list: true, .. } => true,
+        DoctorCommand::Fix { list: true, .. }
+        | DoctorCommand::HistoricalArtifactReconcile { dry_run: true, .. }
+        | DoctorCommand::HistoricalArtifactReconcileUndo { dry_run: true, .. } => true,
         // `am doctor reclaim` only moves STALE recovery debris (forensic bundles
         // + old corrupt-DB quarantines) — never the live mailbox DB or its
         // sidecars — so it is safe to run even while a live owner holds the
@@ -9538,6 +9586,29 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
             yes,
             json,
         } => handle_doctor_archive_recover_undo(run_id, dry_run, yes, json),
+        DoctorCommand::HistoricalArtifactReconcile {
+            dry_run,
+            yes,
+            json,
+            canonical_identity,
+            agent_names,
+            reservation_ids,
+            plan_sha256,
+        } => handle_doctor_historical_artifact_reconcile(
+            dry_run,
+            yes,
+            json,
+            canonical_identity,
+            agent_names,
+            reservation_ids,
+            plan_sha256,
+        ),
+        DoctorCommand::HistoricalArtifactReconcileUndo {
+            run_id,
+            dry_run,
+            yes,
+            json,
+        } => handle_doctor_historical_artifact_reconcile_undo(run_id, dry_run, yes, json),
         DoctorCommand::Fix {
             dry_run,
             yes,
@@ -81765,6 +81836,1900 @@ fn handle_doctor_archive_recover_undo(
             } else {
                 "restored"
             },
+        );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Project-scoped historical artifact reconciliation
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum HistoricalArtifactSelector {
+    Agent { name: String },
+    Reservation { id: i64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum HistoricalArtifactKind {
+    AgentProfile,
+    ReservationStable,
+    ReservationPathMirror,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct HistoricalArtifactAction {
+    kind: HistoricalArtifactKind,
+    selector: HistoricalArtifactSelector,
+    path: String,
+    expected_precondition: String,
+    content_sha256: String,
+    bytes: u64,
+    mode: u32,
+    db_row_sha256: String,
+    #[serde(skip, default)]
+    content: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct HistoricalArtifactObservation {
+    selector: HistoricalArtifactSelector,
+    path: String,
+    content_sha256: String,
+    mode: Option<u32>,
+    db_row_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct HistoricalArtifactPlan {
+    schema_version: String,
+    canonical_identity_sha256: String,
+    canonical_project_slug: String,
+    selected_agents: Vec<String>,
+    selected_reservation_ids: Vec<i64>,
+    expected_git_head: String,
+    expected_git_tree: String,
+    expected_git_index_sha256: String,
+    expected_git_status: ArchiveRecoveryGitStatusSnapshot,
+    actions: Vec<HistoricalArtifactAction>,
+    observed_exact: Vec<HistoricalArtifactObservation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HistoricalArtifactIntent {
+    schema_version: String,
+    run_id: String,
+    plan_sha256: String,
+    plan: HistoricalArtifactPlan,
+    created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HistoricalArtifactGitReceipt {
+    schema_version: String,
+    operation: String,
+    parent_head: String,
+    parent_tree: String,
+    commit_head: String,
+    commit_tree: String,
+    parent_index_sha256: String,
+    commit_index_sha256: String,
+    allowed_paths: Vec<String>,
+    pre_status: ArchiveRecoveryGitStatusSnapshot,
+    post_status: ArchiveRecoveryGitStatusSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HistoricalArtifactTerminalReceipt {
+    schema_version: String,
+    run_id: String,
+    plan_sha256: String,
+    status: String,
+    git_receipt: HistoricalArtifactGitReceipt,
+    artifacts_written: usize,
+    db_writes: u8,
+    provider_writes: u8,
+    service_writes: u8,
+    created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HistoricalArtifactUndoIntent {
+    schema_version: String,
+    run_id: String,
+    source_run_id: String,
+    source_plan_sha256: String,
+    source_terminal_sha256: String,
+    paths: Vec<String>,
+    created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HistoricalArtifactUndoTerminalReceipt {
+    schema_version: String,
+    run_id: String,
+    source_run_id: String,
+    source_plan_sha256: String,
+    source_terminal_sha256: String,
+    status: String,
+    git_receipt: HistoricalArtifactGitReceipt,
+    artifacts_preserved: usize,
+    db_writes: u8,
+    provider_writes: u8,
+    service_writes: u8,
+    created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HistoricalArtifactOutput {
+    status: &'static str,
+    dry_run: bool,
+    plan_sha256: String,
+    plan: HistoricalArtifactPlan,
+    db_writes: u8,
+    provider_writes: u8,
+    service_writes: u8,
+    audit_writes: u8,
+    artifacts_written: usize,
+    run_id: Option<String>,
+    witness_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StrictAllowlistOperation {
+    Add,
+    Delete,
+}
+
+fn historical_artifact_plan_digest(plan: &HistoricalArtifactPlan) -> CliResult<String> {
+    serde_json::to_vec(plan)
+        .map(|bytes| archive_recovery_sha256(&bytes))
+        .map_err(|error| {
+            CliError::Other(format!(
+                "failed to serialize historical artifact plan: {error}"
+            ))
+        })
+}
+
+fn historical_artifact_json_bytes(value: &serde_json::Value) -> CliResult<Vec<u8>> {
+    serde_json::to_vec_pretty(value).map_err(|error| {
+        CliError::Other(format!(
+            "failed to serialize canonical historical artifact: {error}"
+        ))
+    })
+}
+
+fn historical_artifact_safe_component(kind: &str, value: &str) -> CliResult<()> {
+    let path = Path::new(value);
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.contains('/')
+        || value.contains('\\')
+        || path.components().count() != 1
+        || !matches!(
+            path.components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        return Err(CliError::InvalidArgument(format!(
+            "{kind} is not one exact safe archive component"
+        )));
+    }
+    Ok(())
+}
+
+fn historical_artifact_require_safe_parent_prefix(root: &Path, target: &Path) -> CliResult<()> {
+    let parent = target.parent().ok_or_else(|| {
+        CliError::InvalidArgument("historical artifact target has no parent".to_string())
+    })?;
+    let relative = parent.strip_prefix(root).map_err(|_| {
+        CliError::InvalidArgument(
+            "historical artifact target escaped the canonical project".to_string(),
+        )
+    })?;
+    let root_metadata = std::fs::symlink_metadata(root)?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.file_type().is_dir() {
+        return Err(CliError::InvalidArgument(
+            "canonical project archive root must be one real directory".to_string(),
+        ));
+    }
+    let mut cursor = root.to_path_buf();
+    let mut missing_prefix = false;
+    for component in relative.components() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return Err(CliError::InvalidArgument(
+                "historical artifact parent contains an unsafe component".to_string(),
+            ));
+        }
+        cursor.push(component.as_os_str());
+        if missing_prefix {
+            if std::fs::symlink_metadata(&cursor).is_ok() {
+                return Err(CliError::InvalidArgument(
+                    "historical artifact parent has a discontinuous directory chain".to_string(),
+                ));
+            }
+            continue;
+        }
+        match std::fs::symlink_metadata(&cursor) {
+            Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            }
+            Ok(_) => {
+                return Err(CliError::InvalidArgument(
+                    "historical artifact parent chain contains a non-directory or symlink"
+                        .to_string(),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing_prefix = true;
+            }
+            Err(error) => return Err(CliError::Io(error)),
+        }
+    }
+    Ok(())
+}
+
+fn historical_artifact_relative_path(storage_root: &Path, target: &Path) -> CliResult<String> {
+    let relative = target.strip_prefix(storage_root).map_err(|_| {
+        CliError::InvalidArgument("historical artifact escaped STORAGE_ROOT".to_string())
+    })?;
+    if relative
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(CliError::InvalidArgument(
+            "historical artifact path contains an unsafe component".to_string(),
+        ));
+    }
+    Ok(relative.to_string_lossy().replace('\\', "/"))
+}
+
+fn historical_artifact_inspect_target(
+    storage_root: &Path,
+    project_root: &Path,
+    target: &Path,
+    kind: HistoricalArtifactKind,
+    selector: HistoricalArtifactSelector,
+    content: Vec<u8>,
+    db_row_sha256: String,
+    actions: &mut Vec<HistoricalArtifactAction>,
+    observed_exact: &mut Vec<HistoricalArtifactObservation>,
+) -> CliResult<()> {
+    historical_artifact_require_safe_parent_prefix(project_root, target)?;
+    let path = historical_artifact_relative_path(storage_root, target)?;
+    let content_sha256 = archive_recovery_sha256(&content);
+    match std::fs::symlink_metadata(target) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            actions.push(HistoricalArtifactAction {
+                kind,
+                selector,
+                path,
+                expected_precondition: "absent".to_string(),
+                content_sha256,
+                bytes: content.len() as u64,
+                mode: 0o644,
+                db_row_sha256,
+                content,
+            });
+        }
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            let observed_sha256 = archive_recovery_file_sha256(target)?;
+            let mode = archive_recovery_file_mode(target)?;
+            if observed_sha256 != content_sha256
+                || !archive_recovery_mode_matches(target, Some(0o644))?
+            {
+                return Err(CliError::InvalidArgument(format!(
+                    "existing historical artifact {path} diverges from DB-authoritative bytes or mode"
+                )));
+            }
+            observed_exact.push(HistoricalArtifactObservation {
+                selector,
+                path,
+                content_sha256,
+                mode,
+                db_row_sha256,
+            });
+        }
+        Ok(_) => {
+            return Err(CliError::InvalidArgument(format!(
+                "historical artifact target {path} is not an exact regular file"
+            )));
+        }
+        Err(error) => return Err(CliError::Io(error)),
+    }
+    Ok(())
+}
+
+fn historical_artifact_require_index_at_head(repository: &git2::Repository) -> CliResult<()> {
+    let head = repository
+        .head()
+        .and_then(|reference| reference.peel_to_commit())
+        .map_err(|error| {
+            CliError::InvalidArgument(format!("cannot resolve mailbox HEAD: {error}"))
+        })?;
+    let tree = head
+        .tree()
+        .map_err(|error| CliError::Other(error.to_string()))?;
+    let index = repository
+        .index()
+        .map_err(|error| CliError::Other(error.to_string()))?;
+    let diff = repository
+        .diff_tree_to_index(Some(&tree), Some(&index), None)
+        .map_err(|error| CliError::Other(error.to_string()))?;
+    if diff.deltas().len() != 0 {
+        return Err(CliError::InvalidArgument(
+            "historical artifact reconciliation refuses pre-existing staged changes".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn historical_artifact_plan(
+    storage_root: &Path,
+    database_url: &str,
+    canonical_identity: &str,
+    requested_agent_names: &[String],
+    requested_reservation_ids: &[i64],
+) -> CliResult<HistoricalArtifactPlan> {
+    if !Path::new(canonical_identity).is_absolute() {
+        return Err(CliError::InvalidArgument(
+            "canonical identity must be an exact absolute project path".to_string(),
+        ));
+    }
+    if requested_agent_names.is_empty() && requested_reservation_ids.is_empty() {
+        return Err(CliError::Usage(
+            "select at least one --agent-name or --reservation-id".to_string(),
+        ));
+    }
+    let mut selected_agents = requested_agent_names.to_vec();
+    selected_agents.sort();
+    if selected_agents.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(CliError::InvalidArgument(
+            "duplicate --agent-name selectors are not allowed".to_string(),
+        ));
+    }
+    for name in &selected_agents {
+        historical_artifact_safe_component("agent name", name)?;
+        if !mcp_agent_mail_core::is_valid_agent_name(name) {
+            return Err(CliError::InvalidArgument(format!(
+                "agent name {name} is not a canonical registered-agent name"
+            )));
+        }
+    }
+    let mut selected_reservation_ids = requested_reservation_ids.to_vec();
+    selected_reservation_ids.sort_unstable();
+    if selected_reservation_ids.iter().any(|id| *id <= 0)
+        || selected_reservation_ids
+            .windows(2)
+            .any(|pair| pair[0] == pair[1])
+    {
+        return Err(CliError::InvalidArgument(
+            "reservation selectors must be unique positive IDs".to_string(),
+        ));
+    }
+
+    let repository = git2::Repository::open(storage_root).map_err(|error| {
+        CliError::InvalidArgument(format!(
+            "historical artifact reconciliation requires a Git worktree rooted at STORAGE_ROOT: {error}"
+        ))
+    })?;
+    let workdir = repository.workdir().ok_or_else(|| {
+        CliError::InvalidArgument(
+            "historical artifact reconciliation refuses a bare repository".to_string(),
+        )
+    })?;
+    if workdir != storage_root {
+        return Err(CliError::InvalidArgument(
+            "mailbox Git worktree must be exactly STORAGE_ROOT".to_string(),
+        ));
+    }
+    historical_artifact_require_index_at_head(&repository)?;
+    if std::fs::symlink_metadata(repository.path().join("index.lock")).is_ok() {
+        return Err(CliError::InvalidArgument(
+            "mailbox Git index.lock exists; reconciliation refuses without removing or repairing it"
+                .to_string(),
+        ));
+    }
+
+    let opened = open_db_for_doctor_check_read_only_with_context(database_url)?;
+    let projects = opened
+        .conn
+        .query_sync("SELECT id, slug, human_key FROM projects", &[])
+        .map_err(|error| CliError::Other(format!("cannot read projects: {error}")))?;
+    let matching_projects = projects
+        .iter()
+        .filter_map(|row| {
+            let id = row.get_named::<i64>("id").ok()?;
+            let slug = row.get_named::<String>("slug").ok()?;
+            let human_key = row.get_named::<String>("human_key").ok()?;
+            (human_key.trim() == canonical_identity).then_some((id, slug))
+        })
+        .collect::<Vec<_>>();
+    if matching_projects.len() != 1 {
+        return Err(CliError::InvalidArgument(format!(
+            "canonical identity must resolve to exactly one SQLite project; found {}",
+            matching_projects.len()
+        )));
+    }
+    let (project_id, canonical_project_slug) = matching_projects[0].clone();
+    historical_artifact_safe_component("project slug", &canonical_project_slug)?;
+    let project_root = storage_root.join("projects").join(&canonical_project_slug);
+    if archive_recovery_project_human_key(&project_root).as_deref() != Some(canonical_identity) {
+        return Err(CliError::InvalidArgument(
+            "canonical archive project.json does not match the selected SQLite human_key"
+                .to_string(),
+        ));
+    }
+
+    let agent_rows = opened
+        .conn
+        .query_sync(
+            &format!(
+                "SELECT id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, retired_at FROM agents WHERE project_id = {project_id}"
+            ),
+            &[],
+        )
+        .map_err(|error| CliError::Other(format!("cannot read selected-project agents: {error}")))?;
+    let mut agents = Vec::<mcp_agent_mail_db::AgentRow>::new();
+    for row in &agent_rows {
+        agents.push(mcp_agent_mail_db::AgentRow {
+            id: Some(
+                row.get_named::<i64>("id")
+                    .map_err(|error| CliError::Other(error.to_string()))?,
+            ),
+            project_id: row
+                .get_named::<i64>("project_id")
+                .map_err(|error| CliError::Other(error.to_string()))?,
+            name: row
+                .get_named::<String>("name")
+                .map_err(|error| CliError::Other(error.to_string()))?,
+            program: row
+                .get_named::<String>("program")
+                .map_err(|error| CliError::Other(error.to_string()))?,
+            model: row
+                .get_named::<String>("model")
+                .map_err(|error| CliError::Other(error.to_string()))?,
+            task_description: row
+                .get_named::<String>("task_description")
+                .map_err(|error| CliError::Other(error.to_string()))?,
+            inception_ts: row
+                .get_named::<i64>("inception_ts")
+                .map_err(|error| CliError::Other(error.to_string()))?,
+            last_active_ts: row
+                .get_named::<i64>("last_active_ts")
+                .map_err(|error| CliError::Other(error.to_string()))?,
+            attachments_policy: row
+                .get_named::<String>("attachments_policy")
+                .map_err(|error| CliError::Other(error.to_string()))?,
+            contact_policy: row
+                .get_named::<String>("contact_policy")
+                .map_err(|error| CliError::Other(error.to_string()))?,
+            reaper_exempt: row
+                .get_named::<i64>("reaper_exempt")
+                .map_err(|error| CliError::Other(error.to_string()))?,
+            registration_token: None,
+            retired_at: row
+                .get_named::<Option<i64>>("retired_at")
+                .map_err(|error| CliError::Other(error.to_string()))?,
+        });
+    }
+
+    let db_generation = mcp_agent_mail_db::queries::db_generation_id_conn(&opened.conn);
+    let reservation_rows = opened
+        .conn
+        .query_sync(
+            &format!(
+                "SELECT id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts FROM file_reservations WHERE project_id = {project_id}"
+            ),
+            &[],
+        )
+        .map_err(|error| CliError::Other(format!("cannot read selected-project reservations: {error}")))?;
+    let mut reservations = Vec::<mcp_agent_mail_db::FileReservationRow>::new();
+    for row in &reservation_rows {
+        let id = row
+            .get_named::<i64>("id")
+            .map_err(|error| CliError::Other(error.to_string()))?;
+        let ledger = opened
+            .conn
+            .query_sync(
+                &format!(
+                    "SELECT released_ts FROM file_reservation_releases WHERE reservation_id = {id}"
+                ),
+                &[],
+            )
+            .map_err(|error| {
+                CliError::Other(format!("cannot read reservation release ledger: {error}"))
+            })?;
+        if ledger.len() > 1 {
+            return Err(CliError::InvalidArgument(format!(
+                "reservation {id} has ambiguous release-ledger authority"
+            )));
+        }
+        let hot_released = row
+            .get_named::<Option<i64>>("released_ts")
+            .map_err(|error| CliError::Other(error.to_string()))?;
+        let released_ts = ledger
+            .first()
+            .map(|release| release.get_named::<i64>("released_ts"))
+            .transpose()
+            .map_err(|error| CliError::Other(error.to_string()))?
+            .or(hot_released);
+        reservations.push(mcp_agent_mail_db::FileReservationRow {
+            id: Some(id),
+            project_id: row
+                .get_named::<i64>("project_id")
+                .map_err(|error| CliError::Other(error.to_string()))?,
+            agent_id: row
+                .get_named::<i64>("agent_id")
+                .map_err(|error| CliError::Other(error.to_string()))?,
+            path_pattern: row
+                .get_named::<String>("path_pattern")
+                .map_err(|error| CliError::Other(error.to_string()))?,
+            exclusive: row
+                .get_named::<i64>("exclusive")
+                .map_err(|error| CliError::Other(error.to_string()))?,
+            reason: row
+                .get_named::<String>("reason")
+                .map_err(|error| CliError::Other(error.to_string()))?,
+            created_ts: row
+                .get_named::<i64>("created_ts")
+                .map_err(|error| CliError::Other(error.to_string()))?,
+            expires_ts: row
+                .get_named::<i64>("expires_ts")
+                .map_err(|error| CliError::Other(error.to_string()))?,
+            released_ts,
+        });
+    }
+
+    let mut actions = Vec::new();
+    let mut observed_exact = Vec::new();
+    for agent_name in &selected_agents {
+        let matches = agents
+            .iter()
+            .filter(|agent| agent.name == *agent_name)
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err(CliError::InvalidArgument(format!(
+                "agent {agent_name} must resolve to exactly one row in the canonical project; found {}",
+                matches.len()
+            )));
+        }
+        let agent = matches[0];
+        let profile = serde_json::json!({
+            "name": agent.name,
+            "program": agent.program,
+            "model": agent.model,
+            "task_description": agent.task_description,
+            "inception_ts": mcp_agent_mail_db::micros_to_iso(agent.inception_ts),
+            "last_active_ts": mcp_agent_mail_db::micros_to_iso(agent.last_active_ts),
+            "attachments_policy": agent.attachments_policy,
+            "contact_policy": agent.contact_policy,
+            "reaper_exempt": agent.reaper_exempt != 0,
+            "retired_at": agent.retired_at.map(mcp_agent_mail_db::micros_to_iso),
+            "deregistered_at": serde_json::Value::Null,
+        });
+        let authority = serde_json::json!({
+            "id": agent.id,
+            "project_id": agent.project_id,
+            "profile": profile,
+        });
+        let db_row_sha256 = archive_recovery_sha256(
+            &serde_json::to_vec(&authority).map_err(|error| CliError::Other(error.to_string()))?,
+        );
+        historical_artifact_inspect_target(
+            storage_root,
+            &project_root,
+            &project_root
+                .join("agents")
+                .join(agent_name)
+                .join("profile.json"),
+            HistoricalArtifactKind::AgentProfile,
+            HistoricalArtifactSelector::Agent {
+                name: agent_name.clone(),
+            },
+            historical_artifact_json_bytes(&profile)?,
+            db_row_sha256,
+            &mut actions,
+            &mut observed_exact,
+        )?;
+    }
+
+    for reservation_id in &selected_reservation_ids {
+        let matches = reservations
+            .iter()
+            .filter(|reservation| reservation.id == Some(*reservation_id))
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err(CliError::InvalidArgument(format!(
+                "reservation {reservation_id} must resolve to exactly one row in the canonical project; found {}",
+                matches.len()
+            )));
+        }
+        let reservation = matches[0];
+        let holder_matches = agents
+            .iter()
+            .filter(|agent| agent.id == Some(reservation.agent_id))
+            .collect::<Vec<_>>();
+        if holder_matches.len() != 1 {
+            return Err(CliError::InvalidArgument(format!(
+                "reservation {reservation_id} holder must resolve to exactly one canonical-project agent"
+            )));
+        }
+        if reservation.released_ts.is_none_or(|released| released <= 0)
+            && reservation.expires_ts > mcp_agent_mail_db::now_micros()
+        {
+            return Err(CliError::InvalidArgument(format!(
+                "reservation {reservation_id} is active; historical reconciliation refuses it"
+            )));
+        }
+        let holder = holder_matches[0];
+        let mut artifact = serde_json::json!({
+            "id": reservation.id.unwrap_or(0),
+            "project": canonical_identity,
+            "agent": holder.name,
+            "path_pattern": reservation.path_pattern,
+            "exclusive": reservation.exclusive != 0,
+            "reason": reservation.reason,
+            "created_ts": mcp_agent_mail_db::micros_to_iso(reservation.created_ts),
+            "expires_ts": mcp_agent_mail_db::micros_to_iso(reservation.expires_ts),
+        });
+        if let Some(released_ts) = reservation.released_ts.filter(|value| *value > 0) {
+            artifact
+                .as_object_mut()
+                .expect("reservation artifact object")
+                .insert(
+                    "released_ts".to_string(),
+                    serde_json::Value::String(mcp_agent_mail_db::micros_to_iso(released_ts)),
+                );
+        }
+        if let Some(generation) = db_generation.as_deref().filter(|value| !value.is_empty()) {
+            artifact
+                .as_object_mut()
+                .expect("reservation artifact object")
+                .insert(
+                    "db_generation".to_string(),
+                    serde_json::Value::String(generation.to_string()),
+                );
+        }
+        let authority = serde_json::json!({
+            "reservation": reservation,
+            "holder_id": holder.id,
+            "holder_name": holder.name,
+            "db_generation": db_generation,
+            "effective_release_source": if reservation.released_ts.is_some() { "ledger_or_hot_row" } else { "unreleased" },
+        });
+        let db_row_sha256 = archive_recovery_sha256(
+            &serde_json::to_vec(&authority).map_err(|error| CliError::Other(error.to_string()))?,
+        );
+        let content = historical_artifact_json_bytes(&artifact)?;
+        let reservation_root = project_root.join("file_reservations");
+        let stable_name = mcp_agent_mail_core::reservation_artifact::reservation_artifact_filename(
+            db_generation.as_deref(),
+            *reservation_id,
+        );
+        historical_artifact_inspect_target(
+            storage_root,
+            &project_root,
+            &reservation_root.join(stable_name),
+            HistoricalArtifactKind::ReservationStable,
+            HistoricalArtifactSelector::Reservation {
+                id: *reservation_id,
+            },
+            content.clone(),
+            db_row_sha256.clone(),
+            &mut actions,
+            &mut observed_exact,
+        )?;
+        use sha1::Digest as _;
+        let path_digest = hex::encode(sha1::Sha1::digest(reservation.path_pattern.as_bytes()));
+        historical_artifact_inspect_target(
+            storage_root,
+            &project_root,
+            &reservation_root.join(format!("{path_digest}.json")),
+            HistoricalArtifactKind::ReservationPathMirror,
+            HistoricalArtifactSelector::Reservation {
+                id: *reservation_id,
+            },
+            content,
+            db_row_sha256,
+            &mut actions,
+            &mut observed_exact,
+        )?;
+    }
+
+    actions.sort_by(|left, right| left.path.cmp(&right.path));
+    observed_exact.sort_by(|left, right| left.path.cmp(&right.path));
+    if actions.windows(2).any(|pair| pair[0].path == pair[1].path) {
+        return Err(CliError::InvalidArgument(
+            "selected historical rows map to a duplicate artifact path".to_string(),
+        ));
+    }
+    if actions.is_empty() {
+        return Err(CliError::InvalidArgument(
+            "all selected historical artifacts are already exact; refusing a no-op receipt"
+                .to_string(),
+        ));
+    }
+    let status_entries = archive_recovery_git_status_entries(&repository)?;
+    for path in actions.iter().map(|action| &action.path) {
+        if status_entries.contains_key(path) {
+            return Err(CliError::InvalidArgument(format!(
+                "missing artifact target {path} already has Git status; refusing"
+            )));
+        }
+    }
+    for observation in &observed_exact {
+        if status_entries.contains_key(&observation.path) {
+            return Err(CliError::InvalidArgument(format!(
+                "existing exact artifact {} is not cleanly tracked; refusing",
+                observation.path
+            )));
+        }
+    }
+    let (expected_git_head, expected_git_tree, expected_git_index_sha256) =
+        archive_recovery_git_snapshot(storage_root)?;
+    let (Some(expected_git_head), Some(expected_git_tree), Some(expected_git_index_sha256)) = (
+        expected_git_head,
+        expected_git_tree,
+        expected_git_index_sha256,
+    ) else {
+        return Err(CliError::InvalidArgument(
+            "historical reconciliation requires an admitted mailbox Git snapshot".to_string(),
+        ));
+    };
+    let expected_git_status = archive_recovery_git_status_snapshot_from_entries(&status_entries)?;
+    Ok(HistoricalArtifactPlan {
+        schema_version: "historical-artifact-reconcile-plan-v1".to_string(),
+        canonical_identity_sha256: archive_recovery_sha256(canonical_identity.as_bytes()),
+        canonical_project_slug,
+        selected_agents,
+        selected_reservation_ids,
+        expected_git_head,
+        expected_git_tree,
+        expected_git_index_sha256,
+        expected_git_status,
+        actions,
+        observed_exact,
+    })
+}
+
+fn historical_strict_allowlist_path(path: &str, project_slug: &str) -> CliResult<()> {
+    if path.is_empty()
+        || path.contains('\\')
+        || path.starts_with('/')
+        || path.split('/').any(|component| {
+            component.is_empty() || component == "." || component == ".." || component == ".git"
+        })
+    {
+        return Err(CliError::InvalidArgument(
+            "strict Git allowlist contains an unsafe path".to_string(),
+        ));
+    }
+    let prefix = format!("projects/{project_slug}/");
+    if !path.starts_with(&prefix) {
+        return Err(CliError::InvalidArgument(
+            "strict Git allowlist escaped the canonical project".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn historical_head_update_refname(repository: &git2::Repository) -> CliResult<String> {
+    let head = repository
+        .find_reference("HEAD")
+        .map_err(|error| CliError::Other(format!("cannot resolve mailbox HEAD: {error}")))?;
+    Ok(head
+        .symbolic_target()
+        .map_or_else(|| "HEAD".to_string(), str::to_string))
+}
+
+fn historical_build_tree_with_updates(
+    repository: &git2::Repository,
+    base: Option<&git2::Tree<'_>>,
+    updates: &[(String, Option<git2::Oid>)],
+) -> CliResult<Option<git2::Oid>> {
+    let mut direct = Vec::<(String, Option<git2::Oid>)>::new();
+    let mut nested = BTreeMap::<String, Vec<(String, Option<git2::Oid>)>>::new();
+    for (path, oid) in updates {
+        if let Some((prefix, rest)) = path.split_once('/') {
+            nested
+                .entry(prefix.to_string())
+                .or_default()
+                .push((rest.to_string(), *oid));
+        } else {
+            direct.push((path.clone(), *oid));
+        }
+    }
+    let mut builder = repository
+        .treebuilder(base)
+        .map_err(|error| CliError::Other(error.to_string()))?;
+    for (name, oid) in direct {
+        match oid {
+            Some(oid) => {
+                builder
+                    .insert(name, oid, 0o100_644)
+                    .map_err(|error| CliError::Other(error.to_string()))?;
+            }
+            None => {
+                builder
+                    .remove(name)
+                    .map_err(|error| CliError::Other(error.to_string()))?;
+            }
+        }
+    }
+    for (prefix, mut sub_updates) in nested {
+        sub_updates.sort_by(|left, right| left.0.cmp(&right.0));
+        let base_entry = base.and_then(|tree| tree.get_name(&prefix));
+        if base_entry.is_some_and(|entry| entry.kind() != Some(git2::ObjectType::Tree)) {
+            return Err(CliError::InvalidArgument(
+                "strict Git allowlist encountered a non-directory ancestor".to_string(),
+            ));
+        }
+        let base_subtree = base_entry.and_then(|entry| repository.find_tree(entry.id()).ok());
+        match historical_build_tree_with_updates(repository, base_subtree.as_ref(), &sub_updates)? {
+            Some(oid) => {
+                builder
+                    .insert(prefix, oid, 0o040_000)
+                    .map_err(|error| CliError::Other(error.to_string()))?;
+            }
+            None => {
+                builder
+                    .remove(prefix)
+                    .map_err(|error| CliError::Other(error.to_string()))?;
+            }
+        }
+    }
+    let oid = builder
+        .write()
+        .map_err(|error| CliError::Other(error.to_string()))?;
+    let tree = repository
+        .find_tree(oid)
+        .map_err(|error| CliError::Other(error.to_string()))?;
+    Ok((!tree.is_empty()).then_some(oid))
+}
+
+fn historical_verify_tree_diff(
+    repository: &git2::Repository,
+    before: &git2::Tree<'_>,
+    after: &git2::Tree<'_>,
+    actions: &[HistoricalArtifactAction],
+    operation: StrictAllowlistOperation,
+) -> CliResult<()> {
+    let expected = actions
+        .iter()
+        .map(|action| (action.path.as_str(), action))
+        .collect::<BTreeMap<_, _>>();
+    let diff = repository
+        .diff_tree_to_tree(Some(before), Some(after), None)
+        .map_err(|error| CliError::Other(error.to_string()))?;
+    if diff.deltas().len() != expected.len() {
+        return Err(CliError::Other(
+            "strict Git tree diff contains a non-allowlisted path count".to_string(),
+        ));
+    }
+    let mut observed = BTreeSet::new();
+    for delta in diff.deltas() {
+        let (path, accepted) = match operation {
+            StrictAllowlistOperation::Add => (
+                delta.new_file().path(),
+                delta.status() == git2::Delta::Added,
+            ),
+            StrictAllowlistOperation::Delete => (
+                delta.old_file().path(),
+                delta.status() == git2::Delta::Deleted,
+            ),
+        };
+        if !accepted {
+            return Err(CliError::Other(
+                "strict Git tree diff contains a rename, modification, copy, or type change"
+                    .to_string(),
+            ));
+        }
+        let path = path
+            .and_then(Path::to_str)
+            .map(|value| value.replace('\\', "/"))
+            .ok_or_else(|| {
+                CliError::InvalidArgument(
+                    "strict Git tree diff contains an unaddressable path".to_string(),
+                )
+            })?;
+        let action = expected.get(path.as_str()).ok_or_else(|| {
+            CliError::Other("strict Git tree diff escaped its allowlist".to_string())
+        })?;
+        if !observed.insert(path.clone()) {
+            return Err(CliError::Other(
+                "strict Git tree diff repeated an allowlisted path".to_string(),
+            ));
+        }
+        let tree = match operation {
+            StrictAllowlistOperation::Add => after,
+            StrictAllowlistOperation::Delete => before,
+        };
+        let entry = tree.get_path(Path::new(&path)).map_err(|_| {
+            CliError::Other("strict Git tree diff cannot resolve its reviewed blob".to_string())
+        })?;
+        if entry.filemode() != 0o100_644 {
+            return Err(CliError::Other(
+                "strict Git tree diff observed an unexpected file mode".to_string(),
+            ));
+        }
+        let blob = repository
+            .find_blob(entry.id())
+            .map_err(|error| CliError::Other(error.to_string()))?;
+        if archive_recovery_sha256(blob.content()) != action.content_sha256 {
+            return Err(CliError::Other(
+                "strict Git tree diff blob does not match the reviewed content hash".to_string(),
+            ));
+        }
+    }
+    if observed.len() != expected.len() {
+        return Err(CliError::Other(
+            "strict Git tree diff did not cover every allowlisted path".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn historical_require_plan_git_snapshot(
+    storage_root: &Path,
+    plan: &HistoricalArtifactPlan,
+) -> CliResult<()> {
+    let (head, tree, index) = archive_recovery_git_snapshot(storage_root)?;
+    if head.as_deref() != Some(plan.expected_git_head.as_str())
+        || tree.as_deref() != Some(plan.expected_git_tree.as_str())
+        || index.as_deref() != Some(plan.expected_git_index_sha256.as_str())
+    {
+        return Err(CliError::InvalidArgument(
+            "mailbox Git head/tree/index differs from the reviewed historical plan".to_string(),
+        ));
+    }
+    let repository =
+        git2::Repository::open(storage_root).map_err(|error| CliError::Other(error.to_string()))?;
+    historical_artifact_require_index_at_head(&repository)
+}
+
+#[allow(clippy::too_many_lines)]
+fn historical_strict_allowlist_commit(
+    storage_root: &Path,
+    config: &Config,
+    project_slug: &str,
+    expected_head: &str,
+    expected_tree: &str,
+    expected_index_sha256: &str,
+    expected_baseline_status: &ArchiveRecoveryGitStatusSnapshot,
+    actions: &[HistoricalArtifactAction],
+    operation: StrictAllowlistOperation,
+    message: &str,
+) -> CliResult<HistoricalArtifactGitReceipt> {
+    if actions.is_empty() {
+        return Err(CliError::InvalidArgument(
+            "strict Git allowlist cannot be empty".to_string(),
+        ));
+    }
+    let mut paths = actions
+        .iter()
+        .map(|action| action.path.clone())
+        .collect::<Vec<_>>();
+    paths.sort();
+    if paths.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(CliError::InvalidArgument(
+            "strict Git allowlist contains duplicate paths".to_string(),
+        ));
+    }
+    for path in &paths {
+        historical_strict_allowlist_path(path, project_slug)?;
+    }
+    let repository =
+        git2::Repository::open(storage_root).map_err(|error| CliError::Other(error.to_string()))?;
+    if repository.workdir() != Some(storage_root) {
+        return Err(CliError::InvalidArgument(
+            "strict Git commit requires a non-bare worktree rooted at STORAGE_ROOT".to_string(),
+        ));
+    }
+    if std::fs::symlink_metadata(repository.path().join("index.lock")).is_ok() {
+        return Err(CliError::InvalidArgument(
+            "mailbox Git index.lock exists; strict commit refuses without cleanup".to_string(),
+        ));
+    }
+    let (head, tree, index) = archive_recovery_git_snapshot(storage_root)?;
+    if head.as_deref() != Some(expected_head)
+        || tree.as_deref() != Some(expected_tree)
+        || index.as_deref() != Some(expected_index_sha256)
+    {
+        return Err(CliError::InvalidArgument(
+            "strict Git commit snapshot differs from its reviewed parent".to_string(),
+        ));
+    }
+    historical_artifact_require_index_at_head(&repository)?;
+
+    let mut current_status = archive_recovery_git_status_entries(&repository)?;
+    for action in actions {
+        let expected_bits = match operation {
+            StrictAllowlistOperation::Add => git2::Status::WT_NEW.bits(),
+            StrictAllowlistOperation::Delete => git2::Status::WT_DELETED.bits(),
+        };
+        if current_status.remove(&action.path) != Some(expected_bits) {
+            return Err(CliError::InvalidArgument(format!(
+                "strict Git commit status for {} is not the reviewed {:?} transition",
+                action.path, operation
+            )));
+        }
+        let target = storage_root.join(Path::new(&action.path));
+        match operation {
+            StrictAllowlistOperation::Add => {
+                archive_recovery_require_regular_exact(&target, &action.content_sha256)?;
+                if !archive_recovery_mode_matches(&target, Some(action.mode))? {
+                    return Err(CliError::InvalidArgument(format!(
+                        "strict Git add target {} changed mode",
+                        action.path
+                    )));
+                }
+            }
+            StrictAllowlistOperation::Delete => {
+                if std::fs::symlink_metadata(&target).is_ok() {
+                    return Err(CliError::InvalidArgument(format!(
+                        "strict Git delete target {} still exists in the worktree",
+                        action.path
+                    )));
+                }
+            }
+        }
+    }
+    if archive_recovery_git_status_snapshot_from_entries(&current_status)?
+        != *expected_baseline_status
+    {
+        return Err(CliError::InvalidArgument(
+            "strict Git commit observed unrelated status drift".to_string(),
+        ));
+    }
+
+    let refname = historical_head_update_refname(&repository)?;
+    let mut transaction = repository.transaction().map_err(|error| {
+        CliError::Other(format!("cannot start Git reference transaction: {error}"))
+    })?;
+    transaction
+        .lock_ref(&refname)
+        .map_err(|error| CliError::Other(format!("cannot lock mailbox Git ref: {error}")))?;
+    let parent = repository
+        .head()
+        .and_then(|reference| reference.peel_to_commit())
+        .map_err(|error| {
+            CliError::Other(format!("cannot resolve locked mailbox parent: {error}"))
+        })?;
+    if parent.id().to_string() != expected_head || parent.tree_id().to_string() != expected_tree {
+        return Err(CliError::InvalidArgument(
+            "mailbox Git parent changed after reference-lock acquisition".to_string(),
+        ));
+    }
+    let parent_tree = parent
+        .tree()
+        .map_err(|error| CliError::Other(error.to_string()))?;
+    let mut updates = Vec::with_capacity(actions.len());
+    for action in actions {
+        let oid = match operation {
+            StrictAllowlistOperation::Add => {
+                let target = storage_root.join(Path::new(&action.path));
+                archive_recovery_require_regular_exact(&target, &action.content_sha256)?;
+                Some(
+                    repository
+                        .blob_path(&target)
+                        .map_err(|error| CliError::Other(error.to_string()))?,
+                )
+            }
+            StrictAllowlistOperation::Delete => {
+                let entry = parent_tree.get_path(Path::new(&action.path)).map_err(|_| {
+                    CliError::InvalidArgument(format!(
+                        "strict Git delete path {} is absent from the reviewed parent",
+                        action.path
+                    ))
+                })?;
+                let blob = repository
+                    .find_blob(entry.id())
+                    .map_err(|error| CliError::Other(error.to_string()))?;
+                if archive_recovery_sha256(blob.content()) != action.content_sha256 {
+                    return Err(CliError::InvalidArgument(format!(
+                        "strict Git delete path {} differs from its sealed bytes",
+                        action.path
+                    )));
+                }
+                None
+            }
+        };
+        updates.push((action.path.clone(), oid));
+    }
+    updates.sort_by(|left, right| left.0.cmp(&right.0));
+    let tree_oid = historical_build_tree_with_updates(&repository, Some(&parent_tree), &updates)?
+        .ok_or_else(|| {
+        CliError::Other("strict Git commit produced an empty mailbox tree".to_string())
+    })?;
+    let commit_tree = repository
+        .find_tree(tree_oid)
+        .map_err(|error| CliError::Other(error.to_string()))?;
+    historical_verify_tree_diff(&repository, &parent_tree, &commit_tree, actions, operation)?;
+    let signature = git2::Signature::now(&config.git_author_name, &config.git_author_email)
+        .map_err(|error| CliError::Other(error.to_string()))?;
+    let commit_oid = repository
+        .commit(
+            None,
+            &signature,
+            &signature,
+            message,
+            &commit_tree,
+            &[&parent],
+        )
+        .map_err(|error| {
+            CliError::Other(format!("cannot create strict Git commit object: {error}"))
+        })?;
+    transaction
+        .set_target(&refname, commit_oid, Some(&signature), message)
+        .map_err(|error| CliError::Other(format!("cannot stage strict Git ref update: {error}")))?;
+    transaction
+        .commit()
+        .map_err(|error| CliError::Other(format!("cannot advance strict Git ref: {error}")))?;
+
+    let mut real_index = repository
+        .index()
+        .map_err(|error| CliError::Other(error.to_string()))?;
+    real_index.read_tree(&commit_tree).map_err(|error| {
+        CliError::Other(format!(
+            "strict Git commit advanced HEAD but could not align the exact index tree: {error}"
+        ))
+    })?;
+    real_index.write().map_err(|error| {
+        CliError::Other(format!(
+            "strict Git commit advanced HEAD but could not persist the exact index tree: {error}"
+        ))
+    })?;
+
+    let committed = repository
+        .find_commit(commit_oid)
+        .map_err(|error| CliError::Other(error.to_string()))?;
+    if committed.parent_count() != 1
+        || committed
+            .parent_id(0)
+            .map_err(|error| CliError::Other(error.to_string()))?
+            != parent.id()
+        || committed.tree_id() != tree_oid
+    {
+        return Err(CliError::Other(
+            "strict Git commit receipt failed parent/tree verification".to_string(),
+        ));
+    }
+    historical_verify_tree_diff(&repository, &parent_tree, &commit_tree, actions, operation)?;
+    let post_entries = archive_recovery_git_status_entries(&repository)?;
+    let post_status = archive_recovery_git_status_snapshot_from_entries(&post_entries)?;
+    if post_status != *expected_baseline_status {
+        return Err(CliError::Other(
+            "strict Git commit changed status outside the reviewed allowlist".to_string(),
+        ));
+    }
+    let (_, observed_tree, observed_index) = archive_recovery_git_snapshot(storage_root)?;
+    let tree_oid_text = tree_oid.to_string();
+    if observed_tree.as_deref() != Some(tree_oid_text.as_str()) {
+        return Err(CliError::Other(
+            "strict Git commit tree readback differs from its receipt".to_string(),
+        ));
+    }
+    let commit_index_sha256 = observed_index.ok_or_else(|| {
+        CliError::Other("strict Git commit cannot read back its index digest".to_string())
+    })?;
+    Ok(HistoricalArtifactGitReceipt {
+        schema_version: "strict-allowlist-git-receipt-v1".to_string(),
+        operation: match operation {
+            StrictAllowlistOperation::Add => "add".to_string(),
+            StrictAllowlistOperation::Delete => "delete".to_string(),
+        },
+        parent_head: expected_head.to_string(),
+        parent_tree: expected_tree.to_string(),
+        commit_head: commit_oid.to_string(),
+        commit_tree: tree_oid.to_string(),
+        parent_index_sha256: expected_index_sha256.to_string(),
+        commit_index_sha256,
+        allowed_paths: paths,
+        pre_status: expected_baseline_status.clone(),
+        post_status,
+    })
+}
+
+fn historical_artifact_run_context(
+    storage_root: &Path,
+    run_id: &str,
+) -> CliResult<doctor::mutate::MutateContext> {
+    let run_dir = doctor::runs::scaffold_fresh_run_dir(storage_root, run_id)?;
+    let actions_file = doctor::runs::open_actions_log(&run_dir)?;
+    Ok(doctor::mutate::MutateContext {
+        run_id: run_id.to_string(),
+        run_dir,
+        capabilities: doctor::mutate::Capabilities {
+            write_scopes: vec![
+                storage_root.join("projects"),
+                doctor::runs::doctor_root(storage_root),
+            ],
+        },
+        actions_file: std::sync::Mutex::new(actions_file),
+        fixer_id: "historical-artifact-reconcile".to_string(),
+        repo_root: storage_root.to_path_buf(),
+        dry_run: false,
+        start: std::time::Instant::now(),
+        extra_locks: Vec::new(),
+    })
+}
+
+fn historical_artifact_partial_failure(
+    ctx: &doctor::mutate::MutateContext,
+    run_id: &str,
+    plan_sha256: &str,
+    phase: &str,
+    completed_actions: usize,
+    primary: impl std::fmt::Display,
+) -> CliError {
+    let partial = serde_json::json!({
+        "schema_version": "historical-artifact-reconcile-partial-v1",
+        "run_id": run_id,
+        "plan_sha256": plan_sha256,
+        "phase": phase,
+        "completed_actions": completed_actions,
+        "error_class": "HISTORICAL_RECONCILIATION_REVIEW_REQUIRED",
+        "created_at": chrono::Utc::now().to_rfc3339(),
+        "db_writes": 0,
+        "provider_writes": 0,
+        "service_writes": 0,
+    });
+    let receipt = doctor::mutate::mutate(
+        ctx,
+        &ctx.run_dir.join("recovery-evidence").join("partial.json"),
+        doctor::mutate::Op::WriteFile {
+            content: serde_json::to_vec_pretty(&partial).unwrap_or_default(),
+            mode: 0o600,
+        },
+    );
+    match receipt {
+        Ok(_) => CliError::Other(format!(
+            "{primary}; a sealed partial historical-reconciliation receipt requires review"
+        )),
+        Err(receipt_error) => CliError::Other(format!(
+            "{primary}; partial receipt also failed: {receipt_error}"
+        )),
+    }
+}
+
+fn historical_artifact_witness_path(storage_root: &Path, path: &Path) -> String {
+    path.strip_prefix(storage_root)
+        .map(|relative| relative.display().to_string())
+        .unwrap_or_else(|_| {
+            path.strip_prefix(doctor::runs::doctor_root(storage_root))
+                .map(|relative| format!("DOCTOR_ROOT/{}", relative.display()))
+                .unwrap_or_else(|_| "DOCTOR_ROOT/witness.json".to_string())
+        })
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn handle_doctor_historical_artifact_reconcile(
+    dry_run: bool,
+    yes: bool,
+    json: bool,
+    canonical_identity: String,
+    agent_names: Vec<String>,
+    reservation_ids: Vec<i64>,
+    supplied_plan_sha256: Option<String>,
+) -> CliResult<()> {
+    if dry_run && yes {
+        return Err(CliError::Usage(
+            "--dry-run and --yes are contradictory for historical reconciliation".to_string(),
+        ));
+    }
+    if dry_run && supplied_plan_sha256.is_some() {
+        return Err(CliError::Usage(
+            "--plan-sha256 is apply-only; omit it from preview".to_string(),
+        ));
+    }
+    if !dry_run && (!yes || supplied_plan_sha256.is_none()) {
+        return Err(CliError::Usage(
+            "historical reconciliation apply requires --yes and the exact preview --plan-sha256"
+                .to_string(),
+        ));
+    }
+    let config = Config::from_env();
+    let mut plan = historical_artifact_plan(
+        &config.storage_root,
+        &config.database_url,
+        &canonical_identity,
+        &agent_names,
+        &reservation_ids,
+    )?;
+    let mut plan_sha256 = historical_artifact_plan_digest(&plan)?;
+    let run_id = if dry_run {
+        format!(
+            "historical-artifact-reconcile-preview-{}",
+            &plan_sha256[..16]
+        )
+    } else {
+        format!(
+            "historical-artifact-reconcile-{}",
+            chrono::Utc::now().format("%Y%m%d_%H%M%S_%f")
+        )
+    };
+    archive_recovery_require_safe_doctor_root(&config.storage_root, &run_id, None)?;
+    let _mailbox_locks = if dry_run {
+        None
+    } else {
+        let locks =
+            acquire_cli_mailbox_mutation_locks(&config.database_url, Some(&config.storage_root))?;
+        plan = historical_artifact_plan(
+            &config.storage_root,
+            &config.database_url,
+            &canonical_identity,
+            &agent_names,
+            &reservation_ids,
+        )?;
+        plan_sha256 = historical_artifact_plan_digest(&plan)?;
+        if supplied_plan_sha256.as_deref() != Some(plan_sha256.as_str()) {
+            return Err(CliError::InvalidArgument(
+                "historical reconciliation plan changed after locked revalidation; refusing"
+                    .to_string(),
+            ));
+        }
+        archive_recovery_require_safe_doctor_root(&config.storage_root, &run_id, None)?;
+        Some(locks)
+    };
+
+    let mut output = HistoricalArtifactOutput {
+        status: if dry_run { "preview" } else { "applied" },
+        dry_run,
+        plan_sha256: plan_sha256.clone(),
+        plan,
+        db_writes: 0,
+        provider_writes: 0,
+        service_writes: 0,
+        audit_writes: 0,
+        artifacts_written: 0,
+        run_id: None,
+        witness_path: None,
+    };
+    if !dry_run {
+        historical_require_plan_git_snapshot(&config.storage_root, &output.plan)?;
+        for action in &output.plan.actions {
+            let target = config.storage_root.join(Path::new(&action.path));
+            historical_artifact_require_safe_parent_prefix(
+                &config
+                    .storage_root
+                    .join("projects")
+                    .join(&output.plan.canonical_project_slug),
+                &target,
+            )?;
+            if std::fs::symlink_metadata(&target).is_ok() {
+                return Err(CliError::InvalidArgument(format!(
+                    "historical artifact target {} is no longer absent",
+                    action.path
+                )));
+            }
+        }
+        let ctx = historical_artifact_run_context(&config.storage_root, &run_id)?;
+        output.run_id = Some(run_id.clone());
+        let intent = HistoricalArtifactIntent {
+            schema_version: "historical-artifact-reconcile-intent-v1".to_string(),
+            run_id: run_id.clone(),
+            plan_sha256: plan_sha256.clone(),
+            plan: output.plan.clone(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let evidence_dir = ctx.run_dir.join("recovery-evidence");
+        doctor::mutate::mutate(
+            &ctx,
+            &evidence_dir.join("intent.json"),
+            doctor::mutate::Op::WriteFile {
+                content: serde_json::to_vec_pretty(&intent)
+                    .map_err(|error| CliError::Other(error.to_string()))?,
+                mode: 0o600,
+            },
+        )
+        .map_err(|error| CliError::Other(format!("cannot seal reconciliation intent: {error}")))?;
+
+        for action in &output.plan.actions {
+            let target = config.storage_root.join(Path::new(&action.path));
+            let result = doctor::mutate::mutate(
+                &ctx,
+                &target,
+                doctor::mutate::Op::WriteFile {
+                    content: action.content.clone(),
+                    mode: action.mode,
+                },
+            )
+            .map_err(|error| {
+                historical_artifact_partial_failure(
+                    &ctx,
+                    &run_id,
+                    &plan_sha256,
+                    "artifact-write",
+                    output.artifacts_written,
+                    format!(
+                        "cannot restore historical artifact {}: {error}",
+                        action.path
+                    ),
+                )
+            })?;
+            if !result.ok
+                || result.after_hash.strip_prefix("sha256:") != Some(action.content_sha256.as_str())
+                || archive_recovery_require_regular_exact(&target, &action.content_sha256).is_err()
+                || !archive_recovery_mode_matches(&target, Some(action.mode))?
+            {
+                return Err(historical_artifact_partial_failure(
+                    &ctx,
+                    &run_id,
+                    &plan_sha256,
+                    "artifact-readback",
+                    output.artifacts_written,
+                    format!("historical artifact {} failed exact readback", action.path),
+                ));
+            }
+            output.artifacts_written += 1;
+        }
+
+        let git_receipt = historical_strict_allowlist_commit(
+            &config.storage_root,
+            &config,
+            &output.plan.canonical_project_slug,
+            &output.plan.expected_git_head,
+            &output.plan.expected_git_tree,
+            &output.plan.expected_git_index_sha256,
+            &output.plan.expected_git_status,
+            &output.plan.actions,
+            StrictAllowlistOperation::Add,
+            &format!("doctor: reconcile historical artifacts ({run_id})"),
+        )
+        .map_err(|error| {
+            historical_artifact_partial_failure(
+                &ctx,
+                &run_id,
+                &plan_sha256,
+                "strict-git-commit",
+                output.artifacts_written,
+                error,
+            )
+        })?;
+        let terminal = HistoricalArtifactTerminalReceipt {
+            schema_version: "historical-artifact-reconcile-terminal-v1".to_string(),
+            run_id: run_id.clone(),
+            plan_sha256: plan_sha256.clone(),
+            status: "applied".to_string(),
+            git_receipt,
+            artifacts_written: output.artifacts_written,
+            db_writes: 0,
+            provider_writes: 0,
+            service_writes: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        doctor::mutate::mutate(
+            &ctx,
+            &evidence_dir.join("terminal.json"),
+            doctor::mutate::Op::WriteFile {
+                content: serde_json::to_vec_pretty(&terminal)
+                    .map_err(|error| CliError::Other(error.to_string()))?,
+                mode: 0o600,
+            },
+        )
+        .map_err(|error| {
+            historical_artifact_partial_failure(
+                &ctx,
+                &run_id,
+                &plan_sha256,
+                "terminal-receipt",
+                output.artifacts_written,
+                error,
+            )
+        })?;
+        let intent_sha256 = archive_recovery_sha256(
+            &serde_json::to_vec(&intent).map_err(|error| CliError::Other(error.to_string()))?,
+        );
+        let witness = serde_json::json!({
+            "schema_version": "historical-artifact-reconcile-witness-v1",
+            "intent_sha256": intent_sha256,
+            "terminal": terminal,
+            "db_writes": 0,
+            "provider_writes": 0,
+            "service_writes": 0,
+            "audit_writes": 0,
+            "undo_prerequisite": "Run historical-artifact-reconcile-undo <run-id> --dry-run before --yes.",
+            "note": "Receipts contain selectors, relative paths, and hashes only; no database URL, token, provider credential, or absolute storage path is emitted."
+        });
+        let witness_path = evidence_dir.join("witness.json");
+        doctor::mutate::mutate(
+            &ctx,
+            &witness_path,
+            doctor::mutate::Op::WriteFile {
+                content: serde_json::to_vec_pretty(&witness)
+                    .map_err(|error| CliError::Other(error.to_string()))?,
+                mode: 0o600,
+            },
+        )
+        .map_err(|error| {
+            historical_artifact_partial_failure(
+                &ctx,
+                &run_id,
+                &plan_sha256,
+                "witness-write",
+                output.artifacts_written,
+                error,
+            )
+        })?;
+        output.witness_path = Some(historical_artifact_witness_path(
+            &config.storage_root,
+            &witness_path,
+        ));
+        doctor::manifest::seal_run_manifest_default(&ctx.run_dir, &run_id).map_err(|error| {
+            historical_artifact_partial_failure(
+                &ctx,
+                &run_id,
+                &plan_sha256,
+                "manifest-seal",
+                output.artifacts_written,
+                error,
+            )
+        })?;
+    }
+    if json {
+        ftui_runtime::ftui_println!(
+            "{}",
+            serde_json::to_string(&output).map_err(|error| CliError::Other(error.to_string()))?
+        );
+    } else {
+        ftui_runtime::ftui_println!(
+            "Historical artifact reconciliation {}: {} bounded action(s), plan_sha256={}",
+            if dry_run { "preview" } else { "applied" },
+            output.plan.actions.len(),
+            output.plan_sha256,
+        );
+    }
+    Ok(())
+}
+
+fn historical_artifact_read_sealed_run(
+    storage_root: &Path,
+    run_id: &str,
+) -> CliResult<(
+    PathBuf,
+    HistoricalArtifactIntent,
+    HistoricalArtifactTerminalReceipt,
+    String,
+)> {
+    archive_recovery_safe_run_id(run_id)?;
+    if !run_id.starts_with("historical-artifact-reconcile-")
+        || run_id.starts_with("historical-artifact-reconcile-undo-")
+        || run_id.contains("preview")
+    {
+        return Err(CliError::Usage(
+            "historical-artifact-reconcile-undo requires an explicit applied reconciliation run id"
+                .to_string(),
+        ));
+    }
+    let run_dir = doctor::runs::doctor_root(storage_root)
+        .join("runs")
+        .join(run_id);
+    if !matches!(
+        doctor::manifest::verify_run_manifest_default(&run_dir, run_id),
+        doctor::manifest::ManifestVerdict::Verified
+    ) {
+        return Err(CliError::InvalidArgument(
+            "historical reconciliation run manifest is not verified".to_string(),
+        ));
+    }
+    let evidence_dir = run_dir.join("recovery-evidence");
+    let intent = serde_json::from_slice::<HistoricalArtifactIntent>(
+        &std::fs::read(evidence_dir.join("intent.json")).map_err(|_| {
+            CliError::InvalidArgument("historical reconciliation intent is unreadable".to_string())
+        })?,
+    )
+    .map_err(|_| {
+        CliError::InvalidArgument("historical reconciliation intent is malformed".to_string())
+    })?;
+    let terminal_bytes = std::fs::read(evidence_dir.join("terminal.json")).map_err(|_| {
+        CliError::InvalidArgument("historical reconciliation terminal is unreadable".to_string())
+    })?;
+    let terminal = serde_json::from_slice::<HistoricalArtifactTerminalReceipt>(&terminal_bytes)
+        .map_err(|_| {
+            CliError::InvalidArgument("historical reconciliation terminal is malformed".to_string())
+        })?;
+    let terminal_sha256 = archive_recovery_sha256(&terminal_bytes);
+    let expected_paths = intent
+        .plan
+        .actions
+        .iter()
+        .map(|action| action.path.clone())
+        .collect::<Vec<_>>();
+    if intent.schema_version != "historical-artifact-reconcile-intent-v1"
+        || intent.plan.schema_version != "historical-artifact-reconcile-plan-v1"
+        || terminal.schema_version != "historical-artifact-reconcile-terminal-v1"
+        || intent.run_id != run_id
+        || terminal.run_id != run_id
+        || terminal.status != "applied"
+        || intent.plan_sha256 != terminal.plan_sha256
+        || historical_artifact_plan_digest(&intent.plan)? != intent.plan_sha256
+        || terminal.artifacts_written != intent.plan.actions.len()
+        || terminal.git_receipt.operation != "add"
+        || terminal.git_receipt.parent_head != intent.plan.expected_git_head
+        || terminal.git_receipt.parent_tree != intent.plan.expected_git_tree
+        || terminal.git_receipt.parent_index_sha256 != intent.plan.expected_git_index_sha256
+        || terminal.git_receipt.pre_status != intent.plan.expected_git_status
+        || terminal.git_receipt.post_status != intent.plan.expected_git_status
+        || terminal.git_receipt.allowed_paths != expected_paths
+        || terminal.db_writes != 0
+        || terminal.provider_writes != 0
+        || terminal.service_writes != 0
+    {
+        return Err(CliError::InvalidArgument(
+            "historical reconciliation receipts are internally inconsistent".to_string(),
+        ));
+    }
+    Ok((run_dir, intent, terminal, terminal_sha256))
+}
+
+#[allow(clippy::too_many_lines)]
+fn handle_doctor_historical_artifact_reconcile_undo(
+    run_id: String,
+    dry_run: bool,
+    yes: bool,
+    json: bool,
+) -> CliResult<()> {
+    if dry_run && yes {
+        return Err(CliError::Usage(
+            "--dry-run and --yes are contradictory for historical reconciliation undo".to_string(),
+        ));
+    }
+    if !dry_run && !yes {
+        return Err(CliError::Usage(
+            "historical reconciliation undo is mutating; preview with --dry-run, then repeat with --yes"
+                .to_string(),
+        ));
+    }
+    let config = Config::from_env();
+    let undo_run_id = if dry_run {
+        format!(
+            "historical-artifact-reconcile-undo-preview-{}",
+            &archive_recovery_sha256(run_id.as_bytes())[..16]
+        )
+    } else {
+        format!(
+            "historical-artifact-reconcile-undo-{}",
+            chrono::Utc::now().format("%Y%m%d_%H%M%S_%f")
+        )
+    };
+    archive_recovery_require_safe_doctor_root(&config.storage_root, &undo_run_id, None)?;
+    let _mailbox_locks = if dry_run {
+        None
+    } else {
+        Some(acquire_cli_mailbox_mutation_locks(
+            &config.database_url,
+            Some(&config.storage_root),
+        )?)
+    };
+    let (_source_run_dir, intent, terminal, terminal_sha256) =
+        historical_artifact_read_sealed_run(&config.storage_root, &run_id)?;
+    let (head, tree, index) = archive_recovery_git_snapshot(&config.storage_root)?;
+    if head.as_deref() != Some(terminal.git_receipt.commit_head.as_str())
+        || tree.as_deref() != Some(terminal.git_receipt.commit_tree.as_str())
+        || index.as_deref() != Some(terminal.git_receipt.commit_index_sha256.as_str())
+        || archive_recovery_git_status_snapshot(&config.storage_root)?.as_ref()
+            != Some(&terminal.git_receipt.post_status)
+    {
+        return Err(CliError::InvalidArgument(
+            "historical reconciliation undo requires the exact sealed post-apply Git snapshot"
+                .to_string(),
+        ));
+    }
+    for action in &intent.plan.actions {
+        let target = config.storage_root.join(Path::new(&action.path));
+        archive_recovery_require_regular_exact(&target, &action.content_sha256)?;
+        if !archive_recovery_mode_matches(&target, Some(action.mode))? {
+            return Err(CliError::InvalidArgument(format!(
+                "historical reconciliation undo target {} changed mode",
+                action.path
+            )));
+        }
+    }
+
+    let mut evidence_paths = Vec::<String>::new();
+    let mut git_receipt = None;
+    if !dry_run {
+        let ctx = historical_artifact_run_context(&config.storage_root, &undo_run_id)?;
+        let evidence_dir = ctx.run_dir.join("recovery-evidence");
+        let undo_intent = HistoricalArtifactUndoIntent {
+            schema_version: "historical-artifact-reconcile-undo-intent-v1".to_string(),
+            run_id: undo_run_id.clone(),
+            source_run_id: run_id.clone(),
+            source_plan_sha256: intent.plan_sha256.clone(),
+            source_terminal_sha256: terminal_sha256.clone(),
+            paths: intent
+                .plan
+                .actions
+                .iter()
+                .map(|action| action.path.clone())
+                .collect(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        doctor::mutate::mutate(
+            &ctx,
+            &evidence_dir.join("intent.json"),
+            doctor::mutate::Op::WriteFile {
+                content: serde_json::to_vec_pretty(&undo_intent)
+                    .map_err(|error| CliError::Other(error.to_string()))?,
+                mode: 0o600,
+            },
+        )
+        .map_err(|error| {
+            CliError::Other(format!("cannot seal reconciliation undo intent: {error}"))
+        })?;
+
+        for action in &intent.plan.actions {
+            let source = config.storage_root.join(Path::new(&action.path));
+            let destination = evidence_dir.join("created").join(Path::new(&action.path));
+            let result = doctor::mutate::mutate(
+                &ctx,
+                &source,
+                doctor::mutate::Op::Rename {
+                    to: destination.clone(),
+                },
+            )
+            .map_err(|error| {
+                historical_artifact_partial_failure(
+                    &ctx,
+                    &undo_run_id,
+                    &intent.plan_sha256,
+                    "undo-evidence-preservation",
+                    evidence_paths.len(),
+                    error,
+                )
+            })?;
+            if !result.ok
+                || result.before_hash.strip_prefix("sha256:")
+                    != Some(action.content_sha256.as_str())
+                || archive_recovery_require_regular_exact(&destination, &action.content_sha256)
+                    .is_err()
+            {
+                return Err(historical_artifact_partial_failure(
+                    &ctx,
+                    &undo_run_id,
+                    &intent.plan_sha256,
+                    "undo-evidence-readback",
+                    evidence_paths.len(),
+                    format!("undo evidence for {} failed readback", action.path),
+                ));
+            }
+            evidence_paths.push(
+                destination
+                    .strip_prefix(&ctx.run_dir)
+                    .map(|path| path.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_else(|_| "recovery-evidence/created".to_string()),
+            );
+        }
+        let receipt = historical_strict_allowlist_commit(
+            &config.storage_root,
+            &config,
+            &intent.plan.canonical_project_slug,
+            &terminal.git_receipt.commit_head,
+            &terminal.git_receipt.commit_tree,
+            &terminal.git_receipt.commit_index_sha256,
+            &terminal.git_receipt.post_status,
+            &intent.plan.actions,
+            StrictAllowlistOperation::Delete,
+            &format!("doctor: preserve and uncommit historical artifacts ({undo_run_id})"),
+        )
+        .map_err(|error| {
+            historical_artifact_partial_failure(
+                &ctx,
+                &undo_run_id,
+                &intent.plan_sha256,
+                "undo-strict-git-commit",
+                evidence_paths.len(),
+                error,
+            )
+        })?;
+        let undo_terminal = HistoricalArtifactUndoTerminalReceipt {
+            schema_version: "historical-artifact-reconcile-undo-terminal-v1".to_string(),
+            run_id: undo_run_id.clone(),
+            source_run_id: run_id.clone(),
+            source_plan_sha256: intent.plan_sha256.clone(),
+            source_terminal_sha256: terminal_sha256.clone(),
+            status: "preserved-and-uncommitted".to_string(),
+            git_receipt: receipt.clone(),
+            artifacts_preserved: evidence_paths.len(),
+            db_writes: 0,
+            provider_writes: 0,
+            service_writes: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        doctor::mutate::mutate(
+            &ctx,
+            &evidence_dir.join("terminal.json"),
+            doctor::mutate::Op::WriteFile {
+                content: serde_json::to_vec_pretty(&undo_terminal)
+                    .map_err(|error| CliError::Other(error.to_string()))?,
+                mode: 0o600,
+            },
+        )
+        .map_err(|error| {
+            historical_artifact_partial_failure(
+                &ctx,
+                &undo_run_id,
+                &intent.plan_sha256,
+                "undo-terminal-receipt",
+                evidence_paths.len(),
+                error,
+            )
+        })?;
+        let witness = serde_json::json!({
+            "schema_version": "historical-artifact-reconcile-undo-witness-v1",
+            "source_run_id": run_id,
+            "source_plan_sha256": intent.plan_sha256,
+            "source_terminal_sha256": terminal_sha256,
+            "terminal": undo_terminal,
+            "evidence_paths": evidence_paths,
+            "original_receipt_preserved": true,
+            "db_writes": 0,
+            "provider_writes": 0,
+            "service_writes": 0,
+            "note": "Created bytes are retained inside the sealed undo run; no file deletion or broad Git cleanup occurred."
+        });
+        doctor::mutate::mutate(
+            &ctx,
+            &evidence_dir.join("witness.json"),
+            doctor::mutate::Op::WriteFile {
+                content: serde_json::to_vec_pretty(&witness)
+                    .map_err(|error| CliError::Other(error.to_string()))?,
+                mode: 0o600,
+            },
+        )
+        .map_err(|error| {
+            historical_artifact_partial_failure(
+                &ctx,
+                &undo_run_id,
+                &intent.plan_sha256,
+                "undo-witness-write",
+                evidence_paths.len(),
+                error,
+            )
+        })?;
+        doctor::manifest::seal_run_manifest_default(&ctx.run_dir, &undo_run_id).map_err(
+            |error| {
+                historical_artifact_partial_failure(
+                    &ctx,
+                    &undo_run_id,
+                    &intent.plan_sha256,
+                    "undo-manifest-seal",
+                    evidence_paths.len(),
+                    error,
+                )
+            },
+        )?;
+        git_receipt = Some(receipt);
+    }
+    let output = serde_json::json!({
+        "status": if dry_run { "preview" } else { "preserved-and-uncommitted" },
+        "dry_run": dry_run,
+        "source_run_id": run_id,
+        "undo_run_id": (!dry_run).then_some(undo_run_id),
+        "artifacts_to_preserve": intent.plan.actions.len(),
+        "artifacts_preserved": if dry_run { 0 } else { evidence_paths.len() },
+        "git_receipt": git_receipt,
+        "original_receipt_preserved": true,
+        "db_writes": 0,
+        "provider_writes": 0,
+        "service_writes": 0,
+        "absolute_paths_emitted": false,
+    });
+    if json {
+        ftui_runtime::ftui_println!(
+            "{}",
+            serde_json::to_string(&output).map_err(|error| CliError::Other(error.to_string()))?
+        );
+    } else {
+        ftui_runtime::ftui_println!(
+            "Historical artifact undo {}: {} bounded artifact(s)",
+            if dry_run { "preview" } else { "completed" },
+            intent.plan.actions.len(),
         );
     }
     Ok(())
