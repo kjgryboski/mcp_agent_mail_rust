@@ -82318,7 +82318,18 @@ fn historical_artifact_plan(
         });
     }
 
-    let db_generation = mcp_agent_mail_db::queries::db_generation_id_conn(&opened.conn);
+    let db_generation = opened
+        .conn
+        .query_sync(
+            "SELECT generation_id FROM db_identity WHERE singleton = 0",
+            &[],
+        )
+        .ok()
+        .and_then(|rows| {
+            rows.first()
+                .and_then(|row| row.get_named::<String>("generation_id").ok())
+        })
+        .filter(|generation| !generation.is_empty());
     let reservation_rows = opened
         .conn
         .query_sync(
@@ -82622,9 +82633,14 @@ fn historical_head_update_refname(repository: &git2::Repository) -> CliResult<St
     let head = repository
         .find_reference("HEAD")
         .map_err(|error| CliError::Other(format!("cannot resolve mailbox HEAD: {error}")))?;
-    Ok(head
-        .symbolic_target()
-        .map_or_else(|| "HEAD".to_string(), str::to_string))
+    Ok(
+        match head.symbolic_target().map_err(|error| {
+            CliError::Other(format!("cannot read symbolic mailbox HEAD: {error}"))
+        })? {
+            Some(target) => target.to_string(),
+            None => "HEAD".to_string(),
+        },
+    )
 }
 
 fn historical_build_tree_with_updates(
@@ -82664,7 +82680,10 @@ fn historical_build_tree_with_updates(
     for (prefix, mut sub_updates) in nested {
         sub_updates.sort_by(|left, right| left.0.cmp(&right.0));
         let base_entry = base.and_then(|tree| tree.get_name(&prefix));
-        if base_entry.is_some_and(|entry| entry.kind() != Some(git2::ObjectType::Tree)) {
+        if base_entry
+            .as_ref()
+            .is_some_and(|entry| entry.kind() != Some(git2::ObjectType::Tree))
+        {
             return Err(CliError::InvalidArgument(
                 "strict Git allowlist encountered a non-directory ancestor".to_string(),
             ));
