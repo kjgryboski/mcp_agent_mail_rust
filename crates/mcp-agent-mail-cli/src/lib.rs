@@ -80942,7 +80942,12 @@ fn handle_doctor_archive_recover(
                     doctor::mutate::Op::Rename { to: destination },
                 );
                 let move_result = match move_result {
-                    Ok(result) if result.before_hash == loser.sha256 => result,
+                    Ok(result)
+                        if result.before_hash.strip_prefix("sha256:")
+                            == Some(loser.sha256.as_str()) =>
+                    {
+                        result
+                    }
                     Ok(_) => {
                         return Err(archive_recovery_partial_failure(
                             &ctx,
@@ -81407,7 +81412,12 @@ fn handle_doctor_archive_recover_undo(
                 },
             );
             let result = match result {
-                Ok(result) if result.after_hash == *expected_sha256 => result,
+                Ok(result)
+                    if result.after_hash.strip_prefix("sha256:")
+                        == Some(expected_sha256.as_str()) =>
+                {
+                    result
+                }
                 Ok(_) => {
                     return Err(archive_recovery_partial_failure(
                         &ctx,
