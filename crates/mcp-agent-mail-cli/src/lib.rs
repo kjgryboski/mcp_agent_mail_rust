@@ -80571,11 +80571,14 @@ fn archive_recovery_preflight_apply(
 
 /// Refuse any recovery artifact that the mailbox coalescer could commit or
 /// re-import. A configured doctor root outside this worktree is intrinsically
-/// safe; an in-worktree root must itself be ignored according to Git. Requiring
-/// the root (rather than one synthetic descendant probe) prevents a narrow
-/// ignore rule from admitting the probe while leaving actual run artifacts
-/// visible to Git.
-fn archive_recovery_require_safe_doctor_root(storage_root: &Path) -> CliResult<()> {
+/// safe; for an in-worktree root, every concrete file the planned run can
+/// create must be ignored according to Git. The mutation chokepoint repeats
+/// this test for dynamic lock and backup filenames immediately before write.
+fn archive_recovery_require_safe_doctor_root(
+    storage_root: &Path,
+    run_id: &str,
+    plan: Option<&ArchiveRecoveryPlan>,
+) -> CliResult<()> {
     let doctor_root = doctor::runs::doctor_root(storage_root);
     let Ok(repository) = git2::Repository::discover(storage_root) else {
         return Ok(());
@@ -80602,24 +80605,54 @@ fn archive_recovery_require_safe_doctor_root(storage_root: &Path) -> CliResult<(
     if !doctor_root.starts_with(workdir) {
         return Ok(());
     }
-    let relative = doctor_root.strip_prefix(workdir).map_err(|_| {
-        CliError::InvalidArgument("archive recovery doctor root is invalid".to_string())
-    })?;
-    if relative.as_os_str().is_empty() {
+    if doctor_root == workdir {
         return Err(CliError::InvalidArgument(
             "archive recovery doctor root cannot be the mailbox Git worktree".to_string(),
         ));
     }
-    let ignored = repository.status_should_ignore(relative).map_err(|err| {
-        CliError::InvalidArgument(format!(
-            "cannot determine whether the doctor recovery root is Git-ignored: {err}"
-        ))
-    })?;
-    if !ignored {
-        return Err(CliError::InvalidArgument(
-            "archive recovery refused: the resolved doctor root itself is not Git-ignored; configure an external AM_DOCTOR_BACKUPS_DIR or add a root-level ignore rule, then re-run the reviewed preview"
-                .to_string(),
-        ));
+
+    let run_root = doctor_root.join("runs").join(run_id);
+    let evidence_root = run_root.join("recovery-evidence");
+    let mut artifacts = vec![
+        run_root.join("actions.jsonl"),
+        run_root.join("backups/.archive-recovery-ignore-preflight"),
+        run_root.join("locks/.archive-recovery-ignore-preflight.lock"),
+        run_root.join("manifest.json"),
+        evidence_root.join("intent.json"),
+        evidence_root.join("partial.json"),
+        evidence_root.join("terminal.json"),
+        evidence_root.join("witness.json"),
+    ];
+    if let Some(plan) = plan {
+        for loser in plan
+            .groups
+            .iter()
+            .flat_map(|group| group.evidence_preserved.iter())
+        {
+            artifacts.push(
+                evidence_root
+                    .join("losers")
+                    .join(archive_recovery_relative_evidence_path(&loser.path)?),
+            );
+        }
+    }
+    for artifact in artifacts {
+        let relative = artifact.strip_prefix(workdir).map_err(|_| {
+            CliError::InvalidArgument(
+                "archive recovery artifact escaped the mailbox Git worktree".to_string(),
+            )
+        })?;
+        let ignored = repository.status_should_ignore(relative).map_err(|error| {
+            CliError::InvalidArgument(format!(
+                "cannot determine whether a planned recovery artifact is Git-ignored: {error}"
+            ))
+        })?;
+        if !ignored {
+            return Err(CliError::InvalidArgument(
+                "archive recovery refused: at least one concrete doctor run artifact is not Git-ignored; configure an external AM_DOCTOR_BACKUPS_DIR or a complete root-level ignore rule, then re-run preview"
+                    .to_string(),
+            ));
+        }
     }
     Ok(())
 }
@@ -80784,21 +80817,29 @@ fn handle_doctor_archive_recover(
         &message_ids,
         &preserve_conflict_paths,
     )?;
+    let mut plan_sha256 = archive_recovery_plan_digest(&plan)?;
+    let run_id = if dry_run {
+        format!("archive-recover-preview-{}", &plan_sha256[..16])
+    } else {
+        format!(
+            "archive-recover-{}",
+            chrono::Utc::now().format("%Y%m%d_%H%M%S_%f")
+        )
+    };
     if dry_run {
         // A preview is an authorization artifact, not merely an inventory.
         // Refuse to mint a digest unless the exact tracked-winner/untracked-
         // loser contract and complete Git status set are already satisfied.
-        archive_recovery_require_safe_doctor_root(&config.storage_root)?;
+        archive_recovery_require_safe_doctor_root(&config.storage_root, &run_id, Some(&plan))?;
         archive_recovery_require_untracked_only_plan(&config.storage_root, &plan)?;
     }
-    let mut plan_sha256 = archive_recovery_plan_digest(&plan)?;
     let _mailbox_lock = if !dry_run {
         // Mutating recovery must not race a live mailbox owner. This happens
         // after the first pure preview calculation so preview itself remains
         // lock/run-dir free, and before any doctor run artifacts are created.
         // Validate the lock and doctor-root ignore contract before acquiring
         // the lock so a refused apply cannot create a Git-visible lock file.
-        archive_recovery_require_safe_doctor_root(&config.storage_root)?;
+        archive_recovery_require_safe_doctor_root(&config.storage_root, &run_id, Some(&plan))?;
         let mailbox_lock =
             acquire_doctor_mailbox_activity_lock_for_storage_root(&config.storage_root, false)?;
         // The lock closes the owner race; recompute under it and bind apply to
@@ -80817,7 +80858,7 @@ fn handle_doctor_archive_recover(
                     .to_string(),
             ));
         }
-        archive_recovery_require_safe_doctor_root(&config.storage_root)?;
+        archive_recovery_require_safe_doctor_root(&config.storage_root, &run_id, Some(&plan))?;
         mailbox_lock
     } else {
         None
@@ -80836,10 +80877,6 @@ fn handle_doctor_archive_recover(
         witness_path: None,
     };
     if !dry_run {
-        let run_id = format!(
-            "archive-recover-{}",
-            chrono::Utc::now().format("%Y%m%d_%H%M%S_%f")
-        );
         archive_recovery_preflight_apply(&config.storage_root, &run_id, &output.plan)?;
         let _expected_untracked_paths =
             archive_recovery_require_untracked_only_plan(&config.storage_root, &output.plan)?;
@@ -81285,15 +81322,30 @@ fn handle_doctor_archive_recover_undo(
         ));
     }
     let config = Config::from_env();
+    let restore_run_id = if dry_run {
+        format!(
+            "archive-recover-undo-preview-{}",
+            &archive_recovery_sha256(run_id.as_bytes())[..16]
+        )
+    } else {
+        format!(
+            "archive-recover-undo-{}",
+            chrono::Utc::now().format("%Y%m%d_%H%M%S_%f")
+        )
+    };
     // This preflight is deliberately before lock acquisition: an unsafe
     // activity-lock path must not create a Git-visible artifact. Recheck while
     // holding the lock below to close configuration/ignore drift.
-    archive_recovery_require_safe_doctor_root(&config.storage_root)?;
+    archive_recovery_require_safe_doctor_root(&config.storage_root, &restore_run_id, None)?;
     let _mailbox_lock =
         acquire_doctor_mailbox_activity_lock_for_storage_root(&config.storage_root, dry_run)?;
-    archive_recovery_require_safe_doctor_root(&config.storage_root)?;
     let (_run_dir, intent, terminal) =
         archive_recovery_read_sealed_run(&config.storage_root, &run_id)?;
+    archive_recovery_require_safe_doctor_root(
+        &config.storage_root,
+        &restore_run_id,
+        Some(&intent.plan),
+    )?;
     let expected_original_paths = intent
         .plan
         .groups
@@ -81311,10 +81363,6 @@ fn handle_doctor_archive_recover_undo(
     let restore_pairs = archive_recovery_undo_pairs(&config.storage_root, &run_id, &intent.plan)?;
     let mut undo_run_id = None;
     if !dry_run {
-        let restore_run_id = format!(
-            "archive-recover-undo-{}",
-            chrono::Utc::now().format("%Y%m%d_%H%M%S_%f")
-        );
         let ctx = archive_recovery_run_context(&config.storage_root, &restore_run_id)?;
         undo_run_id = Some(restore_run_id.clone());
         let undo_intent = ArchiveRecoveryUndoIntent {

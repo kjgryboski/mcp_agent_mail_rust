@@ -599,6 +599,47 @@ fn ensure_archive_recovery_real_parent_chain(
     Ok(())
 }
 
+/// Every dynamically named recovery artifact inside the mailbox worktree must
+/// be ignored at the exact path Git will observe. This complements the
+/// handler's preflight for fixed run files and covers nanosecond backup names
+/// and hashed lock names that cannot be enumerated earlier.
+fn ensure_archive_recovery_run_artifact_ignored(
+    ctx: &MutateContext,
+    path: &Path,
+) -> Result<(), MutateError> {
+    if ctx.fixer_id != "archive-recover" || !path.starts_with(&ctx.run_dir) {
+        return Ok(());
+    }
+    let repository = match git2::Repository::discover(&ctx.repo_root) {
+        Ok(repository) => repository,
+        Err(_) => return Ok(()),
+    };
+    let Some(workdir) = repository.workdir() else {
+        return Ok(());
+    };
+    if !ctx.run_dir.starts_with(workdir) {
+        return Ok(());
+    }
+    let relative = path.strip_prefix(workdir).map_err(|_| {
+        MutateError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "archive recovery run artifact escaped the mailbox Git worktree",
+        ))
+    })?;
+    let ignored = repository.status_should_ignore(relative).map_err(|error| {
+        MutateError::Io(std::io::Error::other(format!(
+            "cannot verify recovery artifact ignore status: {error}"
+        )))
+    })?;
+    if !ignored {
+        return Err(MutateError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "archive recovery refused a Git-visible run artifact",
+        )));
+    }
+    Ok(())
+}
+
 fn ensure_existing_regular_db_file(path: &Path, op: &'static str) -> Result<(), MutateError> {
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_file() => Ok(()),
@@ -946,6 +987,7 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
     // source evidence (see `advisory_lock_path`).
     let lock_path = advisory_lock_path(ctx, path);
     let lock_parent = lock_path.parent().unwrap_or_else(|| Path::new("."));
+    ensure_archive_recovery_run_artifact_ignored(ctx, &lock_path)?;
     ensure_archive_recovery_real_parent_chain(ctx, &lock_path)?;
     if ctx.fixer_id != "archive-recover" {
         fs::create_dir_all(lock_parent)?;
@@ -996,6 +1038,7 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
     // letting PathBuf::join drop the backup prefix. The `rel` value recorded
     // in actions.jsonl preserves the original path semantics for undo.
     let backup_path = backup_path_for(&ctx.run_dir, &ctx.repo_root, path, started_at_ns);
+    ensure_archive_recovery_run_artifact_ignored(ctx, &backup_path)?;
     ensure_archive_recovery_real_parent_chain(ctx, &backup_path)?;
     let rel = path.strip_prefix(&ctx.repo_root).unwrap_or(path);
     let path_meta_kind = fs::symlink_metadata(path);
@@ -1094,6 +1137,7 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
     // 7. Execute atomically.
     let exec_result: Result<(), MutateError> = match op.clone() {
         Op::WriteFile { content, mode } => {
+            ensure_archive_recovery_run_artifact_ignored(ctx, path)?;
             ensure_archive_recovery_real_parent_chain(ctx, path)?;
             match atomic_write_file(path, &content, mode).map_err(MutateError::Io) {
                 Ok(()) => {
@@ -1107,6 +1151,7 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
         Op::Rename { to } => {
             let result = (|| -> Result<(), MutateError> {
                 // Destination scope already checked at step 1.
+                ensure_archive_recovery_run_artifact_ignored(ctx, &to)?;
                 ensure_archive_recovery_real_parent_chain(ctx, &to)?;
                 if ctx.fixer_id != "archive-recover"
                     && let Some(parent) = to.parent()
@@ -1121,6 +1166,7 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
                 // source lock.
                 let to_lock_path = advisory_lock_path(ctx, &to);
                 let to_lock_parent = to_lock_path.parent().unwrap_or_else(|| Path::new("."));
+                ensure_archive_recovery_run_artifact_ignored(ctx, &to_lock_path)?;
                 ensure_archive_recovery_real_parent_chain(ctx, &to_lock_path)?;
                 if ctx.fixer_id != "archive-recover" {
                     fs::create_dir_all(to_lock_parent).map_err(MutateError::Io)?;
