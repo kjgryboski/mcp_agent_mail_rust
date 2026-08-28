@@ -79896,6 +79896,8 @@ enum ArchiveRecoveryGitReceipt {
     },
 }
 
+type ArchiveRecoveryUndoPair = (PathBuf, PathBuf, String, Option<u32>);
+
 fn archive_recovery_sha256(bytes: &[u8]) -> String {
     use sha2::{Digest as _, Sha256};
     hex::encode(Sha256::digest(bytes))
@@ -79992,9 +79994,7 @@ fn archive_recovery_git_parent_blob(
     let Ok(repository) = git2::Repository::discover(storage_root) else {
         return None;
     };
-    let Some(workdir) = repository.workdir() else {
-        return None;
-    };
+    let workdir = repository.workdir()?;
     // `discover` may otherwise walk upward into the CLI checkout when the
     // storage root itself is not a Git worktree.  Only a worktree rooted
     // within the supplied storage root is admissible evidence.
@@ -81275,7 +81275,7 @@ fn archive_recovery_undo_pairs(
     storage_root: &Path,
     source_run_id: &str,
     plan: &ArchiveRecoveryPlan,
-) -> CliResult<Vec<(PathBuf, PathBuf, String, Option<u32>)>> {
+) -> CliResult<Vec<ArchiveRecoveryUndoPair>> {
     let projects_root = storage_root.join("projects");
     let source_root = doctor::runs::doctor_root(storage_root)
         .join("runs")
