@@ -82032,19 +82032,16 @@ fn historical_windows_attributes_are_reparse(attributes: u32) -> bool {
     attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
+#[cfg(windows)]
 fn historical_metadata_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt as _;
-        historical_windows_attributes_are_reparse(metadata.file_attributes())
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
+    use std::os::windows::fs::MetadataExt as _;
+    metadata.file_type().is_symlink()
+        || historical_windows_attributes_are_reparse(metadata.file_attributes())
+}
+
+#[cfg(not(windows))]
+fn historical_metadata_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }
 
 fn historical_artifact_require_safe_parent_prefix(root: &Path, target: &Path) -> CliResult<()> {
@@ -82407,12 +82404,15 @@ fn historical_artifact_plan(
         let hot_released = row
             .get_named::<Option<i64>>("released_ts")
             .map_err(|error| CliError::Other(error.to_string()))?;
-        let released_ts = ledger
-            .first()
-            .map(|release| release.get_named::<i64>("released_ts"))
-            .transpose()
-            .map_err(|error| CliError::Other(error.to_string()))?
-            .or(hot_released);
+        let ledger_released = match ledger.first() {
+            Some(release) => Some(
+                release
+                    .get_named::<i64>("released_ts")
+                    .map_err(|error| CliError::Other(error.to_string()))?,
+            ),
+            None => None,
+        };
+        let released_ts = ledger_released.or(hot_released);
         reservations.push(mcp_agent_mail_db::FileReservationRow {
             id: Some(id),
             project_id: row
@@ -82477,15 +82477,14 @@ fn historical_artifact_plan(
                 "agent {agent_name} has ambiguous deregistration authority"
             )));
         }
-        let deregistered_at = deregistration_rows
-            .first()
-            .map(|row| row.get_named::<i64>("deregistered_at"))
-            .transpose()
-            .map_err(|error| {
+        let deregistered_at = match deregistration_rows.first() {
+            Some(row) => Some(row.get_named::<i64>("deregistered_at").map_err(|error| {
                 CliError::Other(format!(
                     "cannot decode agent {agent_name} deregistration authority: {error}"
                 ))
-            })?;
+            })?),
+            None => None,
+        };
         let profile = serde_json::json!({
             "name": agent.name,
             "program": agent.program,
