@@ -1262,6 +1262,13 @@ fn scan_project_messages(
             continue;
         };
 
+        // Thread digests intentionally live directly under `messages/threads/`.
+        // Accept only a real directory here: the symlink check above must remain
+        // first so a symlink named `threads` is still reported as unsafe.
+        if year_name == "threads" {
+            continue;
+        }
+
         // Validate year directory name: must be exactly 4 ASCII digits.
         if year_name.len() != 4 || !year_name.bytes().all(|b| b.is_ascii_digit()) {
             report.record(ArchiveAnomalyKind::InvalidDateDirectory {
@@ -2488,6 +2495,93 @@ mod tests {
             ),
         )
         .expect("write archive message");
+    }
+
+    fn write_valid_project_metadata(project_path: &Path) {
+        std::fs::create_dir_all(project_path).expect("create project directory");
+        std::fs::write(
+            project_path.join("project.json"),
+            r#"{"slug":"project","human_key":"/work/project"}"#,
+        )
+        .expect("write project metadata");
+    }
+
+    #[test]
+    fn scan_archive_anomalies_ignores_real_thread_digest_directory() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let storage_root = temp.path().join("storage");
+        let project_path = storage_root.join("projects").join("project");
+        write_valid_project_metadata(&project_path);
+        std::fs::create_dir_all(project_path.join("messages").join("threads"))
+            .expect("create thread digest directory");
+
+        let report = scan_archive_anomalies(&storage_root);
+
+        assert!(
+            !report.anomalies.iter().any(|anomaly| matches!(
+                &anomaly.kind,
+                ArchiveAnomalyKind::InvalidDateDirectory { name, .. } if name == "threads"
+            )),
+            "a real messages/threads directory is a supported thread-digest location"
+        );
+    }
+
+    #[test]
+    fn scan_archive_anomalies_still_reports_similar_invalid_directory() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let storage_root = temp.path().join("storage");
+        let project_path = storage_root.join("projects").join("project");
+        write_valid_project_metadata(&project_path);
+        std::fs::create_dir_all(project_path.join("messages").join("thread"))
+            .expect("create malformed date directory");
+
+        let report = scan_archive_anomalies(&storage_root);
+
+        assert!(
+            report.anomalies.iter().any(|anomaly| matches!(
+                &anomaly.kind,
+                ArchiveAnomalyKind::InvalidDateDirectory {
+                    level: DateDirectoryLevel::Year,
+                    name,
+                    ..
+                } if name == "thread"
+            )),
+            "only the literal threads directory is exempt"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_archive_anomalies_still_reports_symlink_named_threads() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let storage_root = temp.path().join("storage");
+        let project_path = storage_root.join("projects").join("project");
+        write_valid_project_metadata(&project_path);
+        let messages_dir = project_path.join("messages");
+        let symlink_target = temp.path().join("thread-digest-target");
+        std::fs::create_dir_all(&messages_dir).expect("create messages directory");
+        std::fs::create_dir_all(&symlink_target).expect("create symlink target");
+        let threads_path = messages_dir.join("threads");
+        symlink(&symlink_target, &threads_path).expect("create threads symlink");
+
+        let report = scan_archive_anomalies(&storage_root);
+
+        assert!(
+            report.anomalies.iter().any(|anomaly| matches!(
+                &anomaly.kind,
+                ArchiveAnomalyKind::UnexpectedSymlink { path, .. } if path == &threads_path
+            )),
+            "a symlink named threads must remain an archive anomaly"
+        );
+        assert!(
+            !report.anomalies.iter().any(|anomaly| matches!(
+                &anomaly.kind,
+                ArchiveAnomalyKind::InvalidDateDirectory { name, .. } if name == "threads"
+            )),
+            "the symlink is classified by the stronger symlink finding"
+        );
     }
 
     #[test]
