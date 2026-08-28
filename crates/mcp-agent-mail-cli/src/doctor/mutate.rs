@@ -495,6 +495,39 @@ fn reject_unexpected_symlink(path: &Path, op: &Op) -> Result<(), MutateError> {
     }
 }
 
+/// Returns the advisory-lock location for one mutation path.
+///
+/// Ordinary doctor fixers retain the historical adjacent lock so independently
+/// running fixers can coordinate at the file they protect.  `archive-recover`
+/// is deliberately different: its sources and destinations are archive
+/// evidence, so putting a `.doctor-lock` beside either would itself alter the
+/// evidence being recovered.  Recovery handlers hold the global mailbox
+/// activity lock for their full run; consequently a retained, run-scoped lock
+/// namespace provides the necessary serialization without contaminating the
+/// archive.
+///
+/// The recovery filename contains only a SHA-256 digest of the full encoded
+/// path.  This both prevents basename collisions and avoids leaking an
+/// absolute archive path into retained doctor artifacts.
+fn advisory_lock_path(ctx: &MutateContext, protected_path: &Path) -> PathBuf {
+    if ctx.fixer_id == "archive-recover" {
+        let mut hasher = Sha256::new();
+        hasher.update(protected_path.as_os_str().as_encoded_bytes());
+        let digest = hex::encode(hasher.finalize());
+        return ctx
+            .run_dir
+            .join("locks")
+            .join(format!("path-{digest}.doctor-lock"));
+    }
+
+    let parent = protected_path.parent().unwrap_or_else(|| Path::new("."));
+    let basename = protected_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "_root_".to_string());
+    parent.join(format!(".{basename}.doctor-lock"))
+}
+
 fn ensure_existing_regular_db_file(path: &Path, op: &'static str) -> Result<(), MutateError> {
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_file() => Ok(()),
@@ -837,14 +870,12 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
         });
     }
 
-    // 3. Per-path advisory lock. Lock file lives next to target, distinct name.
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
-    let basename = path
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "_root_".to_string());
-    let lock_path = parent.join(format!(".{}.doctor-lock", basename));
+    // 3. Per-path advisory lock. Archive recovery deliberately uses the
+    // retained run-local namespace so no lock artifact is added beside its
+    // source evidence (see `advisory_lock_path`).
+    let lock_path = advisory_lock_path(ctx, path);
+    let lock_parent = lock_path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(lock_parent)?;
     let lock_file = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -999,18 +1030,15 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
                 if let Some(parent) = to.parent() {
                     fs::create_dir_all(parent).map_err(MutateError::Io)?;
                 }
-                // Also acquire an advisory lock on the destination basename.
-                // The source lock protects `path`; the destination lock
-                // prevents two concurrent renames from racing toward the same
-                // target.
-                let to_basename = to
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "_root_".to_string());
-                let to_lock_path = to
-                    .parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .join(format!(".{}.doctor-lock", to_basename));
+                // Also acquire an advisory lock on the destination. The
+                // source lock protects `path`; the destination lock prevents
+                // two concurrent renames from racing toward the same target.
+                // Archive recovery keeps this retained lock under the run
+                // directory for the same evidence-preservation reason as the
+                // source lock.
+                let to_lock_path = advisory_lock_path(ctx, &to);
+                let to_lock_parent = to_lock_path.parent().unwrap_or_else(|| Path::new("."));
+                fs::create_dir_all(to_lock_parent).map_err(MutateError::Io)?;
                 let to_lock_file = OpenOptions::new()
                     .create(true)
                     .read(true)
@@ -1230,6 +1258,12 @@ mod tests {
             start: Instant::now(),
             extra_locks: Vec::new(),
         }
+    }
+
+    fn make_archive_recover_ctx(td: &TempDir, run_id: &str) -> MutateContext {
+        let mut ctx = make_ctx(td, run_id);
+        ctx.fixer_id = "archive-recover".to_string();
+        ctx
     }
 
     #[test]
@@ -1782,6 +1816,117 @@ mod tests {
         assert!(
             !parent.join(".hello.txt.doctor-lock").exists(),
             "dry-run must not create advisory lock files"
+        );
+    }
+
+    #[test]
+    fn archive_recover_write_and_rename_keep_locks_in_retained_run_namespace() {
+        let td = TempDir::new().unwrap();
+        let ctx = make_archive_recover_ctx(&td, "2026-08-28T00-00-00Z__recover");
+
+        let write_target = td.path().join("archive").join("write.md");
+        mutate(
+            &ctx,
+            &write_target,
+            Op::WriteFile {
+                content: b"recovered write\n".to_vec(),
+                mode: 0o644,
+            },
+        )
+        .unwrap();
+
+        let rename_source = td.path().join("archive").join("source.md");
+        let rename_destination = td.path().join("recovered").join("destination.md");
+        fs::write(&rename_source, b"recovered rename\n").unwrap();
+        mutate(
+            &ctx,
+            &rename_source,
+            Op::Rename {
+                to: rename_destination.clone(),
+            },
+        )
+        .unwrap();
+
+        for protected_path in [&write_target, &rename_source, &rename_destination] {
+            let adjacent = protected_path.parent().unwrap().join(format!(
+                ".{}.doctor-lock",
+                protected_path.file_name().unwrap().to_string_lossy()
+            ));
+            assert!(
+                !adjacent.exists(),
+                "archive recovery must not add an adjacent lock beside {}",
+                protected_path.display()
+            );
+
+            let run_lock = advisory_lock_path(&ctx, protected_path);
+            assert!(
+                run_lock.starts_with(ctx.run_dir.join("locks")),
+                "recovery lock must stay in the run namespace"
+            );
+            assert!(run_lock.exists(), "recovery lock must be retained");
+        }
+    }
+
+    #[test]
+    fn archive_recover_same_basename_paths_get_distinct_redacted_locks() {
+        let td = TempDir::new().unwrap();
+        let ctx = make_archive_recover_ctx(&td, "2026-08-28T00-00-01Z__collision");
+        let first = td.path().join("one").join("message.md");
+        let second = td.path().join("two").join("message.md");
+
+        mutate(
+            &ctx,
+            &first,
+            Op::WriteFile {
+                content: b"one\n".to_vec(),
+                mode: 0o644,
+            },
+        )
+        .unwrap();
+        mutate(
+            &ctx,
+            &second,
+            Op::WriteFile {
+                content: b"two\n".to_vec(),
+                mode: 0o644,
+            },
+        )
+        .unwrap();
+
+        let first_lock = advisory_lock_path(&ctx, &first);
+        let second_lock = advisory_lock_path(&ctx, &second);
+        assert_ne!(first_lock, second_lock, "full-path hashes must not collide");
+        assert!(first_lock.exists());
+        assert!(second_lock.exists());
+        let first_name = first_lock.file_name().unwrap().to_string_lossy();
+        assert!(!first_name.contains("one"));
+        assert!(!first_name.contains("message"));
+    }
+
+    #[test]
+    fn ordinary_fixer_retains_adjacent_advisory_lock_behavior() {
+        let td = TempDir::new().unwrap();
+        let ctx = make_ctx(&td, "2026-08-28T00-00-02Z__ordinary");
+        let target = td.path().join("ordinary.md");
+
+        mutate(
+            &ctx,
+            &target,
+            Op::WriteFile {
+                content: b"ordinary\n".to_vec(),
+                mode: 0o644,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            advisory_lock_path(&ctx, &target),
+            td.path().join(".ordinary.md.doctor-lock")
+        );
+        assert!(td.path().join(".ordinary.md.doctor-lock").exists());
+        assert!(
+            !ctx.run_dir.join("locks").exists(),
+            "ordinary fixers must not move their legacy lock surface"
         );
     }
 

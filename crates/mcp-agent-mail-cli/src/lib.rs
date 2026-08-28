@@ -2523,6 +2523,58 @@ pub enum DoctorCommand {
         #[arg(long, value_name = "DAYS")]
         reservation_retention_days: Option<u64>,
     },
+    /// Recover explicitly selected duplicate message IDs without guessing a
+    /// lexical winner. The canonical project identity and message IDs are
+    /// mandatory; preview emits a plan digest that apply must repeat.
+    #[command(name = "archive-recover")]
+    ArchiveRecover {
+        /// Preview the recovery plan without creating reports, locks, or
+        /// moving archive files.
+        #[arg(long)]
+        dry_run: bool,
+        /// Apply the exact reviewed plan. Requires --plan-sha256.
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Emit redacted machine-readable evidence.
+        #[arg(long)]
+        json: bool,
+        /// Exact absolute human_key of the canonical project in SQLite.
+        #[arg(long, value_name = "ABSOLUTE_HUMAN_KEY")]
+        canonical_identity: String,
+        /// Positive duplicate message ID to recover. Repeat for a bounded set.
+        #[arg(long = "message-id", value_name = "ID", required = true)]
+        message_ids: Vec<i64>,
+        /// Storage-root-relative conflicting artifact path that is allowed to
+        /// be preserved outside the canonical project. Repeat once for every
+        /// cross-project loser shown by preview; unlisted cross-project files
+        /// make the plan refuse.
+        #[arg(
+            long = "preserve-conflict-path",
+            value_name = "STORAGE_ROOT_RELATIVE_PATH"
+        )]
+        preserve_conflict_paths: Vec<PathBuf>,
+        /// SHA-256 plan digest returned by the reviewed preview. Required for
+        /// an apply so a changed archive cannot be recovered by surprise.
+        #[arg(long, value_name = "SHA256")]
+        plan_sha256: Option<String>,
+    },
+    /// Restore one completed untracked-conflict `archive-recover` run. This
+    /// is deliberately separate from generic `doctor undo`: it verifies the
+    /// sealed NO_TRACKED_TREE_CHANGE receipt before restoring exact evidence.
+    #[command(name = "archive-recover-undo")]
+    ArchiveRecoverUndo {
+        /// Exact archive-recover run id from its sealed terminal receipt.
+        run_id: String,
+        /// Print the verified compensating plan without changing mailbox or Git state.
+        #[arg(long)]
+        dry_run: bool,
+        /// Execute the reviewed compensating restore.
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Emit redacted machine-readable evidence.
+        #[arg(long)]
+        json: bool,
+    },
     /// Attempt automatic remediation for detected issues.
     ///
     /// Runs all doctor checks, then fixes each fixable issue:
@@ -9463,6 +9515,29 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
             prune_released_reservations,
             reservation_retention_days,
         ),
+        DoctorCommand::ArchiveRecover {
+            dry_run,
+            yes,
+            json,
+            canonical_identity,
+            message_ids,
+            preserve_conflict_paths,
+            plan_sha256,
+        } => handle_doctor_archive_recover(
+            dry_run,
+            yes,
+            json,
+            canonical_identity,
+            message_ids,
+            preserve_conflict_paths,
+            plan_sha256,
+        ),
+        DoctorCommand::ArchiveRecoverUndo {
+            run_id,
+            dry_run,
+            yes,
+            json,
+        } => handle_doctor_archive_recover_undo(run_id, dry_run, yes, json),
         DoctorCommand::Fix {
             dry_run,
             yes,
@@ -9529,6 +9604,11 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
             format,
         } => {
             let target = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            if archive_recovery_run_is_marked(&target, &run_id) {
+                return Err(CliError::Usage(format!(
+                    "run {run_id} is an archive-recover run; generic doctor undo is unsafe because it cannot verify the required sealed no-tracked-tree-change receipt. Use `am doctor archive-recover-undo {run_id} --dry-run` first"
+                )));
+            }
             doctor::handle_undo(&target, &run_id, dry_run, strict, format)
         }
         DoctorCommand::Ls { format } => {
@@ -79655,6 +79735,2648 @@ fn collect_prunable_reservation_archives(storage_root: &Path, retention_days: u6
     }
     out.sort();
     out
+}
+
+// ---------------------------------------------------------------------------
+// Explicit duplicate-message recovery
+// ---------------------------------------------------------------------------
+//
+// Archive normalization predates the doctor mutation chokepoint and is useful
+// for broad hygiene. It must not, however, decide semantic message identity by
+// path order. This narrow recovery plan is deliberately separate: the caller
+// supplies the canonical *project* identity and exact message ids, SQLite is
+// read only, and a unique evidence winner is mandatory before a loser can be
+// moved into reversible evidence preservation.
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ArchiveRecoveryEvidence {
+    project_identity_match: bool,
+    db_message_project_match: bool,
+    git_head_tracks_exact_bytes: bool,
+    complete_frontmatter: bool,
+    canonical_message_layout: bool,
+    nonempty_bytes: bool,
+}
+
+impl ArchiveRecoveryEvidence {
+    fn rank_key(&self) -> (bool, bool, bool, bool, bool, bool) {
+        (
+            self.project_identity_match,
+            self.db_message_project_match,
+            self.git_head_tracks_exact_bytes,
+            self.complete_frontmatter,
+            self.canonical_message_layout,
+            self.nonempty_bytes,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ArchiveRecoveryCandidate {
+    /// Redacted, storage-root-relative location safe to emit in JSON and the
+    /// witness. The absolute source path stays process-local.
+    path: String,
+    #[serde(skip)]
+    source_path: PathBuf,
+    project_slug: String,
+    sha256: String,
+    /// The exact blob at the admitted parent commit, if the evidence is
+    /// tracked. `None` is meaningful: untracked evidence is moved into the
+    /// sealed recovery run but is never represented as a Git deletion.
+    git_parent_blob: Option<String>,
+    bytes: u64,
+    mode: Option<u32>,
+    evidence: ArchiveRecoveryEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ArchiveRecoveryGroup {
+    message_id: i64,
+    winner: ArchiveRecoveryCandidate,
+    evidence_preserved: Vec<ArchiveRecoveryCandidate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ArchiveRecoveryPlan {
+    schema_version: String,
+    canonical_identity_sha256: String,
+    canonical_project_slug: String,
+    message_ids: Vec<i64>,
+    authorized_cross_project_evidence: Vec<String>,
+    /// Immutable mailbox Git state admitted with this preview.  Apply repeats
+    /// all three values while holding the mailbox lock; this prevents a plan
+    /// from being replayed after a ref, tree, or staging-area change.
+    expected_git_head: Option<String>,
+    expected_git_tree: Option<String>,
+    expected_git_index_sha256: Option<String>,
+    groups: Vec<ArchiveRecoveryGroup>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ArchiveRecoveryOutput {
+    status: &'static str,
+    dry_run: bool,
+    plan_sha256: String,
+    plan: ArchiveRecoveryPlan,
+    db_writes: u8,
+    provider_writes: u8,
+    service_writes: u8,
+    evidence_moves_applied: usize,
+    run_id: Option<String>,
+    witness_path: Option<String>,
+}
+
+/// Sealed before any recovery move. It deliberately contains only hashed
+/// identity and storage-root-relative artifact names: archive message bodies,
+/// human keys, database URLs, and filesystem prefixes are never receipts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ArchiveRecoveryIntent {
+    schema_version: String,
+    run_id: String,
+    plan_sha256: String,
+    plan: ArchiveRecoveryPlan,
+    doctor_root_class: String,
+    created_at: String,
+}
+
+/// The terminal receipt is written only after both the evidence moves and the
+/// no-tracked-tree-change invariant have been verified. A missing receipt means a
+/// partial run, which is a dedicated-undo investigation, never a silent
+/// generic filesystem rollback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ArchiveRecoveryTerminalReceipt {
+    schema_version: String,
+    run_id: String,
+    plan_sha256: String,
+    status: String,
+    git_receipt: ArchiveRecoveryGitReceipt,
+    evidence_moves_applied: usize,
+    created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ArchiveRecoveryPartialReceipt {
+    schema_version: String,
+    run_id: String,
+    plan_sha256: String,
+    phase: String,
+    evidence_moves_applied: usize,
+    error_class: String,
+    created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ArchiveRecoveryUndoIntent {
+    schema_version: String,
+    run_id: String,
+    source_run_id: String,
+    source_plan_sha256: String,
+    expected_original_paths: Vec<String>,
+    created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ArchiveRecoveryUndoTerminalReceipt {
+    schema_version: String,
+    run_id: String,
+    source_run_id: String,
+    source_plan_sha256: String,
+    status: String,
+    git_receipt: ArchiveRecoveryGitReceipt,
+    evidence_restored: usize,
+    created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum ArchiveRecoveryGitReceipt {
+    NoTrackedTreeChange {
+        head: String,
+        tree: String,
+        index_sha256: String,
+    },
+}
+
+fn archive_recovery_sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn archive_recovery_file_sha256(path: &Path) -> CliResult<String> {
+    Ok(archive_recovery_sha256(&std::fs::read(path)?))
+}
+
+#[cfg(unix)]
+fn archive_recovery_file_mode(path: &Path) -> CliResult<Option<u32>> {
+    use std::os::unix::fs::PermissionsExt as _;
+    Ok(Some(
+        std::fs::symlink_metadata(path)?.permissions().mode() & 0o777,
+    ))
+}
+
+#[cfg(not(unix))]
+fn archive_recovery_file_mode(_path: &Path) -> CliResult<Option<u32>> {
+    Ok(None)
+}
+
+fn archive_recovery_mode_matches(path: &Path, expected: Option<u32>) -> CliResult<bool> {
+    let observed = archive_recovery_file_mode(path)?;
+    Ok(expected.is_none() || observed == expected)
+}
+
+fn archive_recovery_project_human_key(project_dir: &Path) -> Option<String> {
+    let project_json = project_dir.join("project.json");
+    let metadata = std::fs::symlink_metadata(&project_json).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return None;
+    }
+    let content = std::fs::read_to_string(project_json).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&content).ok()?;
+    value
+        .get("human_key")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn archive_recovery_frontmatter_complete(message: &serde_json::Value) -> bool {
+    let nonempty_string = |key: &str| {
+        message
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    };
+    let created =
+        ["created_ts", "created_at", "created"]
+            .iter()
+            .any(|key| match message.get(*key) {
+                Some(serde_json::Value::Number(value)) => {
+                    value.as_i64().is_some_and(|value| value > 0)
+                }
+                Some(serde_json::Value::String(value)) => !value.trim().is_empty(),
+                _ => false,
+            });
+    nonempty_string("from")
+        && nonempty_string("subject")
+        && message.get("to").is_some_and(serde_json::Value::is_array)
+        && created
+}
+
+fn archive_recovery_git_parent_blob(
+    storage_root: &Path,
+    message_path: &Path,
+) -> Option<(String, bool)> {
+    let Ok(repository) = git2::Repository::discover(storage_root) else {
+        return None;
+    };
+    let Some(workdir) = repository.workdir() else {
+        return None;
+    };
+    // `discover` may otherwise walk upward into the CLI checkout when the
+    // storage root itself is not a Git worktree.  Only a worktree rooted
+    // within the supplied storage root is admissible evidence.
+    if !workdir.starts_with(storage_root) {
+        return None;
+    }
+    let Ok(relative) = message_path.strip_prefix(workdir) else {
+        return None;
+    };
+    let Ok(head) = repository.head() else {
+        return None;
+    };
+    let Ok(commit) = head.peel_to_commit() else {
+        return None;
+    };
+    let Ok(tree) = commit.tree() else {
+        return None;
+    };
+    let Ok(entry) = tree.get_path(relative) else {
+        return None;
+    };
+    let Ok(blob) = repository.find_blob(entry.id()) else {
+        return None;
+    };
+    let exact_worktree_bytes = std::fs::read(message_path)
+        .map(|bytes| blob.content() == bytes.as_slice())
+        .unwrap_or(false);
+    Some((entry.id().to_string(), exact_worktree_bytes))
+}
+
+fn archive_recovery_git_snapshot(
+    storage_root: &Path,
+) -> CliResult<(Option<String>, Option<String>, Option<String>)> {
+    let Ok(repository) = git2::Repository::discover(storage_root) else {
+        return Ok((None, None, None));
+    };
+    let Some(workdir) = repository.workdir() else {
+        return Ok((None, None, None));
+    };
+    if workdir != storage_root {
+        return Ok((None, None, None));
+    }
+    let head = repository.head().map_err(|err| {
+        CliError::InvalidArgument(format!(
+            "cannot resolve mailbox Git HEAD for archive recovery: {err}"
+        ))
+    })?;
+    let commit = head
+        .peel_to_commit()
+        .map_err(|err| CliError::Other(err.to_string()))?;
+    let index_path = repository.path().join("index");
+    let index_bytes = std::fs::read(&index_path).map_err(|err| {
+        CliError::InvalidArgument(format!(
+            "cannot read mailbox Git index for archive recovery: {err}"
+        ))
+    })?;
+    Ok((
+        head.target().map(|oid| oid.to_string()),
+        Some(commit.tree_id().to_string()),
+        Some(archive_recovery_sha256(&index_bytes)),
+    ))
+}
+
+fn archive_recovery_db_project_and_messages(
+    database_url: &str,
+    canonical_identity: &str,
+    message_ids: &[i64],
+) -> CliResult<(String, BTreeSet<i64>)> {
+    // A recovery preview is an evidence-gathering operation.  In particular,
+    // it must not create a SQLite journal, migrate the schema, or otherwise
+    // alter the mailbox merely by deciding whether a plan is safe.
+    let opened = open_db_for_doctor_check_read_only_with_context(database_url)?;
+    let projects = opened
+        .conn
+        .query_sync("SELECT id, slug, human_key FROM projects", &[])
+        .map_err(|err| {
+            CliError::Other(format!(
+                "failed to read projects for archive recovery: {err}"
+            ))
+        })?;
+    let matching = projects
+        .iter()
+        .filter_map(|row| {
+            let id = row.get_named::<i64>("id").ok()?;
+            let slug = row.get_named::<String>("slug").ok()?;
+            let human_key = row.get_named::<String>("human_key").ok()?;
+            (human_key.trim() == canonical_identity).then_some((id, slug))
+        })
+        .collect::<Vec<_>>();
+    if matching.len() != 1 {
+        return Err(CliError::InvalidArgument(format!(
+            "canonical identity must match exactly one SQLite project; matched {} project(s)",
+            matching.len()
+        )));
+    }
+    let (project_id, project_slug) = matching[0].clone();
+    let mut db_message_ids = BTreeSet::new();
+    for message_id in message_ids {
+        let rows = opened
+            .conn
+            .query_sync(
+                &format!("SELECT project_id FROM messages WHERE id = {message_id}"),
+                &[],
+            )
+            .map_err(|err| {
+                CliError::Other(format!(
+                    "failed to read message {message_id} for archive recovery: {err}"
+                ))
+            })?;
+        if rows.len() != 1 {
+            return Err(CliError::InvalidArgument(format!(
+                "message id {message_id} must resolve to exactly one SQLite row; found {}",
+                rows.len()
+            )));
+        }
+        let row_project_id = rows[0].get_named::<i64>("project_id").map_err(|err| {
+            CliError::Other(format!(
+                "message {message_id} has invalid project_id: {err}"
+            ))
+        })?;
+        if row_project_id != project_id {
+            return Err(CliError::InvalidArgument(format!(
+                "message id {message_id} does not belong to the selected canonical project"
+            )));
+        }
+        db_message_ids.insert(*message_id);
+    }
+    Ok((project_slug, db_message_ids))
+}
+
+fn archive_recovery_collect_candidates(
+    storage_root: &Path,
+    canonical_identity: &str,
+    canonical_project_slug: &str,
+    message_ids: &BTreeSet<i64>,
+) -> CliResult<BTreeMap<i64, Vec<ArchiveRecoveryCandidate>>> {
+    let projects_root = storage_root.join("projects");
+    let entries = std::fs::read_dir(&projects_root).map_err(|err| {
+        CliError::Other(format!(
+            "cannot inspect archive projects at {}: {err}",
+            projects_root.display()
+        ))
+    })?;
+    let mut projects = entries
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(CliError::Io)?;
+    projects.sort_by_key(std::fs::DirEntry::file_name);
+    let mut candidates = BTreeMap::<i64, Vec<ArchiveRecoveryCandidate>>::new();
+
+    for project in projects {
+        let project_dir = project.path();
+        let metadata = std::fs::symlink_metadata(&project_dir)?;
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let Some(project_slug) = project.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let project_identity_match = project_slug == canonical_project_slug
+            && archive_recovery_project_human_key(&project_dir).as_deref()
+                == Some(canonical_identity);
+        let messages_dir = project_dir.join("messages");
+        if !path_is_real_directory(&messages_dir) {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(&messages_dir).follow_links(false) {
+            let entry = entry.map_err(|err| {
+                CliError::Other(format!(
+                    "cannot traverse archive evidence below {}: {err}",
+                    messages_dir.display()
+                ))
+            })?;
+            let file_type = entry.file_type();
+            if !file_type.is_file()
+                || file_type.is_symlink()
+                || entry.path().extension().and_then(OsStr::to_str) != Some("md")
+            {
+                continue;
+            }
+            let Ok(relative) = entry.path().strip_prefix(&messages_dir) else {
+                continue;
+            };
+            let layout = doctor_archive_path_components(relative);
+            let canonical_message_layout = layout.len() == 3
+                && doctor_is_archive_year_component(layout[0])
+                && doctor_is_archive_month_component(layout[1]);
+            if !canonical_message_layout {
+                continue;
+            }
+            let bytes = std::fs::read(entry.path())?;
+            let Ok(content) = std::str::from_utf8(&bytes) else {
+                continue;
+            };
+            let Some(frontmatter) = doctor_extract_json_frontmatter(content) else {
+                continue;
+            };
+            let Ok(message) = serde_json::from_str::<serde_json::Value>(frontmatter) else {
+                continue;
+            };
+            let Some(message_id) = message
+                .get("id")
+                .and_then(serde_json::Value::as_i64)
+                .filter(|id| message_ids.contains(id))
+            else {
+                continue;
+            };
+            let git_parent_blob = archive_recovery_git_parent_blob(storage_root, entry.path());
+            let evidence = ArchiveRecoveryEvidence {
+                project_identity_match,
+                db_message_project_match: project_identity_match,
+                git_head_tracks_exact_bytes: git_parent_blob
+                    .as_ref()
+                    .is_some_and(|(_, exact)| *exact),
+                complete_frontmatter: archive_recovery_frontmatter_complete(&message),
+                canonical_message_layout,
+                nonempty_bytes: !bytes.is_empty(),
+            };
+            candidates
+                .entry(message_id)
+                .or_default()
+                .push(ArchiveRecoveryCandidate {
+                    path: entry
+                        .path()
+                        .strip_prefix(storage_root)
+                        .expect("archive candidate was discovered below storage root")
+                        .display()
+                        .to_string(),
+                    source_path: entry.path().to_path_buf(),
+                    project_slug: project_slug.clone(),
+                    sha256: archive_recovery_sha256(&bytes),
+                    git_parent_blob: git_parent_blob.map(|(blob, _)| blob),
+                    bytes: bytes.len() as u64,
+                    mode: archive_recovery_file_mode(entry.path())?,
+                    evidence,
+                });
+        }
+    }
+    for group in candidates.values_mut() {
+        group.sort_by(|left, right| left.path.cmp(&right.path));
+    }
+    Ok(candidates)
+}
+
+fn archive_recovery_plan(
+    storage_root: &Path,
+    database_url: &str,
+    canonical_identity: &str,
+    requested_message_ids: &[i64],
+    preserve_conflict_paths: &[PathBuf],
+) -> CliResult<ArchiveRecoveryPlan> {
+    if !Path::new(canonical_identity).is_absolute() {
+        return Err(CliError::InvalidArgument(
+            "--canonical-identity must be an absolute SQLite human_key".to_string(),
+        ));
+    }
+    let mut message_ids = requested_message_ids.to_vec();
+    message_ids.sort_unstable();
+    message_ids.dedup();
+    if message_ids.is_empty() || message_ids.iter().any(|id| *id <= 0) {
+        return Err(CliError::InvalidArgument(
+            "--message-id must contain one or more positive IDs".to_string(),
+        ));
+    }
+    let (canonical_project_slug, db_message_ids) =
+        archive_recovery_db_project_and_messages(database_url, canonical_identity, &message_ids)?;
+    let candidates = archive_recovery_collect_candidates(
+        storage_root,
+        canonical_identity,
+        &canonical_project_slug,
+        &db_message_ids,
+    )?;
+    let authorized_cross_project_evidence = preserve_conflict_paths
+        .iter()
+        .map(|path| {
+            if path.is_absolute()
+                || path
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+            {
+                return Err(CliError::InvalidArgument(
+                    "--preserve-conflict-path must be storage-root-relative and may not contain parent traversal"
+                        .to_string(),
+                ));
+            }
+            Ok(path.display().to_string())
+        })
+        .collect::<CliResult<BTreeSet<_>>>()?;
+    let mut groups = Vec::with_capacity(message_ids.len());
+    for message_id in &message_ids {
+        let Some(group) = candidates.get(message_id) else {
+            return Err(CliError::InvalidArgument(format!(
+                "message id {message_id} has no canonical archive candidates"
+            )));
+        };
+        if group.len() < 2 {
+            return Err(CliError::InvalidArgument(format!(
+                "message id {message_id} is not a duplicate archive group; refusing a no-op recovery"
+            )));
+        }
+        let selected = archive_recovery_select_group(*message_id, group)?;
+        for loser in &selected.evidence_preserved {
+            if loser.project_slug != canonical_project_slug
+                && !authorized_cross_project_evidence.contains(&loser.path)
+            {
+                return Err(CliError::InvalidArgument(format!(
+                    "message id {message_id} has cross-project conflict evidence {}; re-run with --preserve-conflict-path {} to authorize preserving exactly that artifact",
+                    loser.path, loser.path
+                )));
+            }
+        }
+        groups.push(selected);
+    }
+    let enumerated = groups
+        .iter()
+        .flat_map(|group| group.evidence_preserved.iter())
+        .filter(|candidate| candidate.project_slug != canonical_project_slug)
+        .map(|candidate| candidate.path.as_str())
+        .collect::<BTreeSet<_>>();
+    if authorized_cross_project_evidence
+        .iter()
+        .any(|path| !enumerated.contains(path.as_str()))
+    {
+        return Err(CliError::InvalidArgument(
+            "--preserve-conflict-path included a path that is not an enumerated cross-project duplicate; refusing broad scope"
+                .to_string(),
+        ));
+    }
+    let (expected_git_head, expected_git_tree, expected_git_index_sha256) =
+        archive_recovery_git_snapshot(storage_root)?;
+    Ok(ArchiveRecoveryPlan {
+        schema_version: "archive-recovery-plan-v1".to_string(),
+        canonical_identity_sha256: archive_recovery_sha256(canonical_identity.as_bytes()),
+        canonical_project_slug,
+        message_ids,
+        authorized_cross_project_evidence: authorized_cross_project_evidence.into_iter().collect(),
+        expected_git_head,
+        expected_git_tree,
+        expected_git_index_sha256,
+        groups,
+    })
+}
+
+fn archive_recovery_select_group(
+    message_id: i64,
+    candidates: &[ArchiveRecoveryCandidate],
+) -> CliResult<ArchiveRecoveryGroup> {
+    let mut ranked = candidates.to_vec();
+    ranked.sort_by(|left, right| {
+        right
+            .evidence
+            .rank_key()
+            .cmp(&left.evidence.rank_key())
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    let winner = ranked.first().cloned().ok_or_else(|| {
+        CliError::InvalidArgument(format!("message id {message_id} has no archive candidates"))
+    })?;
+    if !winner.evidence.project_identity_match || !winner.evidence.db_message_project_match {
+        return Err(CliError::InvalidArgument(format!(
+            "message id {message_id} has no candidate correlated to the selected canonical project"
+        )));
+    }
+    if ranked
+        .get(1)
+        .is_some_and(|next| next.evidence.rank_key() == winner.evidence.rank_key())
+    {
+        return Err(CliError::InvalidArgument(format!(
+            "message id {message_id} has an ambiguous top evidence vector; refusing to choose a winner"
+        )));
+    }
+    Ok(ArchiveRecoveryGroup {
+        message_id,
+        winner,
+        evidence_preserved: ranked.into_iter().skip(1).collect(),
+    })
+}
+
+fn archive_recovery_plan_digest(plan: &ArchiveRecoveryPlan) -> CliResult<String> {
+    let bytes = serde_json::to_vec(plan).map_err(|err| {
+        CliError::Other(format!("failed to serialize archive recovery plan: {err}"))
+    })?;
+    Ok(archive_recovery_sha256(&bytes))
+}
+
+/// Recovery has a sealed intent/terminal ledger in addition to the generic
+/// doctor action log. Route marked runs through the dedicated compensator so
+/// the admitted Git snapshot and exact untracked-path set are checked before
+/// any evidence is restored.
+fn archive_recovery_run_is_marked(target: &Path, run_id: &str) -> bool {
+    if run_id == "latest"
+        || run_id.is_empty()
+        || run_id.contains('/')
+        || run_id.contains('\\')
+        || run_id.contains("..")
+    {
+        return false;
+    }
+    if run_id.starts_with("archive-recover-") {
+        return true;
+    }
+    let run_dir = doctor::runs::doctor_root(target).join("runs").join(run_id);
+    if run_dir
+        .join("recovery-evidence")
+        .join("intent.json")
+        .is_file()
+    {
+        return true;
+    }
+    std::fs::read_to_string(run_dir.join("actions.jsonl"))
+        .ok()
+        .is_some_and(|actions| {
+            actions.lines().any(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("fixer_id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .as_deref()
+                    == Some("archive-recover")
+            })
+        })
+}
+
+fn archive_recovery_run_context(
+    storage_root: &Path,
+    run_id: &str,
+) -> CliResult<doctor::mutate::MutateContext> {
+    let run_dir = doctor::runs::scaffold_fresh_run_dir(storage_root, run_id)?;
+    let actions_file = doctor::runs::open_actions_log(&run_dir)?;
+    Ok(doctor::mutate::MutateContext {
+        run_id: run_id.to_string(),
+        run_dir,
+        capabilities: doctor::mutate::Capabilities {
+            write_scopes: vec![
+                storage_root.join("projects"),
+                doctor::runs::doctor_root(storage_root),
+            ],
+        },
+        actions_file: std::sync::Mutex::new(actions_file),
+        fixer_id: "archive-recover".to_string(),
+        repo_root: storage_root.to_path_buf(),
+        dry_run: false,
+        start: std::time::Instant::now(),
+        // The recovery handler holds the global mailbox activity lock across
+        // the whole run. Recovery-specific per-path locks are retained under
+        // the sealed run directory by mutate(), so no archive lock artifact
+        // is created beside source evidence.
+        extra_locks: Vec::new(),
+    })
+}
+
+fn archive_recovery_write_partial_receipt(
+    ctx: &doctor::mutate::MutateContext,
+    run_id: &str,
+    plan_sha256: &str,
+    phase: &str,
+    evidence_moves_applied: usize,
+) -> CliResult<()> {
+    let partial = ArchiveRecoveryPartialReceipt {
+        schema_version: "archive-recovery-partial-v1".to_string(),
+        run_id: run_id.to_string(),
+        plan_sha256: plan_sha256.to_string(),
+        phase: phase.to_string(),
+        evidence_moves_applied,
+        error_class: "RECOVERY_REVIEW_REQUIRED".to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let partial_path = ctx.run_dir.join("recovery-evidence").join("partial.json");
+    doctor::mutate::mutate(
+        ctx,
+        &partial_path,
+        doctor::mutate::Op::WriteFile {
+            content: serde_json::to_vec_pretty(&partial).unwrap_or_default(),
+            mode: 0o600,
+        },
+    )
+    .map(|_| ())
+    .map_err(|error| CliError::Other(format!("cannot write recovery partial receipt: {error}")))
+}
+
+fn archive_recovery_partial_failure(
+    ctx: &doctor::mutate::MutateContext,
+    run_id: &str,
+    plan_sha256: &str,
+    phase: &str,
+    evidence_moves_applied: usize,
+    primary: impl std::fmt::Display,
+) -> CliError {
+    match archive_recovery_write_partial_receipt(
+        ctx,
+        run_id,
+        plan_sha256,
+        phase,
+        evidence_moves_applied,
+    ) {
+        Ok(()) => CliError::Other(format!(
+            "{primary}; a partial recovery receipt was recorded for manual review"
+        )),
+        Err(receipt_error) => CliError::Other(format!(
+            "{primary}; partial recovery receipt also failed: {receipt_error}"
+        )),
+    }
+}
+
+fn archive_recovery_require_regular_exact(path: &Path, expected_sha256: &str) -> CliResult<()> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        CliError::InvalidArgument(format!(
+            "recovery evidence is missing or unreadable: {error}"
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(CliError::InvalidArgument(
+            "recovery evidence must be an exact regular file, never a symlink".to_string(),
+        ));
+    }
+    if archive_recovery_file_sha256(path)? != expected_sha256 {
+        return Err(CliError::InvalidArgument(
+            "recovery evidence bytes differ from the reviewed SHA-256".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Verify every future rename while the exclusive mailbox lock is held.  This
+/// deliberately runs before scaffolding a doctor run: a stale or tampered plan
+/// must leave neither evidence moves nor recovery artifacts behind.
+fn archive_recovery_preflight_apply(
+    storage_root: &Path,
+    run_id: &str,
+    plan: &ArchiveRecoveryPlan,
+) -> CliResult<()> {
+    let projects_root = storage_root.join("projects");
+    let evidence_root = doctor::runs::doctor_root(storage_root)
+        .join("runs")
+        .join(run_id)
+        .join("recovery-evidence")
+        .join("losers");
+    for group in &plan.groups {
+        for loser in &group.evidence_preserved {
+            let relative = loser.source_path.strip_prefix(storage_root).map_err(|_| {
+                CliError::InvalidArgument(
+                    "recovery plan contains a source outside STORAGE_ROOT; refusing".to_string(),
+                )
+            })?;
+            if !loser.source_path.starts_with(&projects_root) {
+                return Err(CliError::InvalidArgument(
+                    "recovery plan contains a source outside the archive projects root; refusing"
+                        .to_string(),
+                ));
+            }
+            archive_recovery_require_real_parent_chain(&projects_root, &loser.source_path)?;
+            archive_recovery_require_regular_exact(&loser.source_path, &loser.sha256).map_err(
+                |_| {
+                    CliError::InvalidArgument(format!(
+                        "recovery evidence changed after planning at {}; refusing before any move",
+                        loser.path
+                    ))
+                },
+            )?;
+            let destination = evidence_root.join(relative);
+            if destination.exists() {
+                return Err(CliError::InvalidArgument(format!(
+                    "recovery destination already exists for {}; refusing before any move",
+                    loser.path
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuse any recovery artifact that the mailbox coalescer could commit or
+/// re-import.  A configured doctor root outside this worktree is intrinsically
+/// safe; an in-worktree root must be ignored according to Git itself.
+fn archive_recovery_require_safe_doctor_root(storage_root: &Path) -> CliResult<()> {
+    let doctor_root = doctor::runs::doctor_root(storage_root);
+    let Ok(repository) = git2::Repository::discover(storage_root) else {
+        return Ok(());
+    };
+    let Some(workdir) = repository.workdir() else {
+        return Ok(());
+    };
+    let activity_lock = Path::new(".mailbox.activity.lock");
+    let activity_lock_is_tracked = repository
+        .index()
+        .ok()
+        .and_then(|index| index.get_path(activity_lock, 0).map(|_| ()))
+        .is_some();
+    let activity_lock_is_ignored = repository
+        .status_should_ignore(activity_lock)
+        .unwrap_or(false);
+    if !activity_lock_is_tracked && !activity_lock_is_ignored {
+        return Err(CliError::InvalidArgument(
+            "archive recovery refused: .mailbox.activity.lock must be tracked or Git-ignored before preview/apply"
+                .to_string(),
+        ));
+    }
+    if !doctor_root.starts_with(workdir) {
+        return Ok(());
+    }
+    let probe = doctor_root.join("recovery-evidence/.archive-recover-ignore-probe");
+    let relative = probe.strip_prefix(workdir).map_err(|_| {
+        CliError::InvalidArgument("archive recovery Git ignore probe is invalid".to_string())
+    })?;
+    let ignored = repository.status_should_ignore(relative).map_err(|err| {
+        CliError::InvalidArgument(format!(
+            "cannot determine whether the doctor recovery subtree is Git-ignored: {err}"
+        ))
+    })?;
+    if !ignored {
+        return Err(CliError::InvalidArgument(
+            "archive recovery apply refused: the resolved doctor recovery subtree is not Git-ignored; configure an external AM_DOCTOR_BACKUPS_DIR or add an ignore rule, then re-run the reviewed preview"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate the immutable Git portion of an admitted plan without staging or
+/// writing.  This deliberately rejects *any* dirty index/worktree state: an
+/// exact-path recovery must never accidentally absorb an operator's changes.
+fn archive_recovery_no_tracked_tree_change_receipt(
+    storage_root: &Path,
+    plan: &ArchiveRecoveryPlan,
+    expected_untracked_paths: &BTreeSet<String>,
+) -> CliResult<ArchiveRecoveryGitReceipt> {
+    let (Some(expected_head), Some(expected_tree), Some(expected_index)) = (
+        plan.expected_git_head.as_ref(),
+        plan.expected_git_tree.as_ref(),
+        plan.expected_git_index_sha256.as_ref(),
+    ) else {
+        return Err(CliError::InvalidArgument(
+            "untracked-only recovery requires an admitted canonical Git snapshot".to_string(),
+        ));
+    };
+    let repository = git2::Repository::open(storage_root).map_err(|error| {
+        CliError::InvalidArgument(format!(
+            "cannot reopen canonical mailbox Git worktree: {error}"
+        ))
+    })?;
+    let observed = archive_recovery_git_status_paths(&repository)?;
+    if observed != *expected_untracked_paths {
+        return Err(CliError::Other(
+            "archive recovery Git status differs from its exact approved untracked evidence set"
+                .to_string(),
+        ));
+    }
+    let (head, tree, index) = archive_recovery_git_snapshot(storage_root)?;
+    if head.as_deref() != Some(expected_head)
+        || tree.as_deref() != Some(expected_tree)
+        || index.as_deref() != Some(expected_index)
+    {
+        return Err(CliError::Other(
+            "untracked-only recovery changed admitted Git state; refusing a no-change receipt"
+                .to_string(),
+        ));
+    }
+    Ok(ArchiveRecoveryGitReceipt::NoTrackedTreeChange {
+        head: expected_head.clone(),
+        tree: expected_tree.clone(),
+        index_sha256: expected_index.clone(),
+    })
+}
+
+fn archive_recovery_git_status_paths(repository: &git2::Repository) -> CliResult<BTreeSet<String>> {
+    let mut options = git2::StatusOptions::new();
+    options.include_untracked(true).recurse_untracked_dirs(true);
+    let mut paths = BTreeSet::new();
+    for entry in repository
+        .statuses(Some(&mut options))
+        .map_err(|error| CliError::Other(error.to_string()))?
+        .iter()
+    {
+        let status = entry.status();
+        if status.is_index_new()
+            || status.is_index_modified()
+            || status.is_index_deleted()
+            || status.is_index_renamed()
+            || status.is_index_typechange()
+            || !status.is_wt_new()
+        {
+            return Err(CliError::InvalidArgument(
+                "archive recovery refuses staged or modified mailbox Git state".to_string(),
+            ));
+        }
+        let path = entry.path().ok_or_else(|| {
+            CliError::InvalidArgument(
+                "archive recovery encountered an unaddressable mailbox Git status path".to_string(),
+            )
+        })?;
+        paths.insert(path.replace('\\', "/"));
+    }
+    Ok(paths)
+}
+
+fn archive_recovery_require_untracked_only_plan(
+    storage_root: &Path,
+    plan: &ArchiveRecoveryPlan,
+) -> CliResult<BTreeSet<String>> {
+    for group in &plan.groups {
+        if !group.winner.evidence.git_head_tracks_exact_bytes
+            || group.winner.git_parent_blob.is_none()
+        {
+            return Err(CliError::InvalidArgument(
+                "selected recovery winner is not exact Git-tracked at the admitted HEAD"
+                    .to_string(),
+            ));
+        }
+        if group
+            .evidence_preserved
+            .iter()
+            .any(|loser| loser.git_parent_blob.is_some())
+        {
+            return Err(CliError::InvalidArgument(
+                "TRACKED_CONFLICT_REQUIRES_SEPARATE_EXACT_GIT_RECOVERY".to_string(),
+            ));
+        }
+    }
+    let repository = git2::Repository::open(storage_root).map_err(|error| {
+        CliError::InvalidArgument(format!(
+            "cannot open canonical mailbox Git worktree: {error}"
+        ))
+    })?;
+    let expected_untracked_paths = plan
+        .groups
+        .iter()
+        .flat_map(|group| group.evidence_preserved.iter())
+        .map(|loser| loser.path.replace('\\', "/"))
+        .collect::<BTreeSet<_>>();
+    let observed = archive_recovery_git_status_paths(&repository)?;
+    if observed != expected_untracked_paths {
+        return Err(CliError::InvalidArgument(
+            "archive recovery requires mailbox Git status to equal exactly the reviewed untracked evidence paths"
+                .to_string(),
+        ));
+    }
+    Ok(expected_untracked_paths)
+}
+
+fn handle_doctor_archive_recover(
+    dry_run: bool,
+    yes: bool,
+    json: bool,
+    canonical_identity: String,
+    message_ids: Vec<i64>,
+    preserve_conflict_paths: Vec<PathBuf>,
+    supplied_plan_sha256: Option<String>,
+) -> CliResult<()> {
+    if dry_run && yes {
+        return Err(CliError::Usage(
+            "--dry-run and --yes are contradictory for archive recovery".to_string(),
+        ));
+    }
+    if dry_run && supplied_plan_sha256.is_some() {
+        return Err(CliError::Usage(
+            "--plan-sha256 is an apply-only acknowledgement; omit it from preview".to_string(),
+        ));
+    }
+    if !dry_run && !yes {
+        return Err(CliError::Usage(
+            "archive recovery changes only evidence paths; re-run with --yes and the exact --plan-sha256 returned by preview"
+                .to_string(),
+        ));
+    }
+    if !dry_run && supplied_plan_sha256.is_none() {
+        return Err(CliError::Usage(
+            "archive recovery apply requires the exact --plan-sha256 returned by preview"
+                .to_string(),
+        ));
+    }
+    let config = Config::from_env();
+    let mut plan = archive_recovery_plan(
+        &config.storage_root,
+        &config.database_url,
+        &canonical_identity,
+        &message_ids,
+        &preserve_conflict_paths,
+    )?;
+    if dry_run {
+        // A preview is an authorization artifact, not merely an inventory.
+        // Refuse to mint a digest unless the exact tracked-winner/untracked-
+        // loser contract and complete Git status set are already satisfied.
+        archive_recovery_require_safe_doctor_root(&config.storage_root)?;
+        archive_recovery_require_untracked_only_plan(&config.storage_root, &plan)?;
+    }
+    let mut plan_sha256 = archive_recovery_plan_digest(&plan)?;
+    let _mailbox_lock = if !dry_run {
+        // Mutating recovery must not race a live mailbox owner. This happens
+        // after the first pure preview calculation so preview itself remains
+        // lock/run-dir free, and before any doctor run artifacts are created.
+        let mailbox_lock =
+            acquire_doctor_mailbox_activity_lock_for_storage_root(&config.storage_root, false)?;
+        // The lock closes the owner race; recompute under it and bind apply to
+        // the fresh plan so a changed archive cannot reuse a stale approval.
+        plan = archive_recovery_plan(
+            &config.storage_root,
+            &config.database_url,
+            &canonical_identity,
+            &message_ids,
+            &preserve_conflict_paths,
+        )?;
+        plan_sha256 = archive_recovery_plan_digest(&plan)?;
+        if supplied_plan_sha256.as_deref() != Some(plan_sha256.as_str()) {
+            return Err(CliError::InvalidArgument(
+                "--plan-sha256 must exactly match the fresh preview plan; archive recovery refused"
+                    .to_string(),
+            ));
+        }
+        archive_recovery_require_safe_doctor_root(&config.storage_root)?;
+        mailbox_lock
+    } else {
+        None
+    };
+
+    let mut output = ArchiveRecoveryOutput {
+        status: if dry_run { "preview" } else { "applied" },
+        dry_run,
+        plan_sha256: plan_sha256.clone(),
+        plan,
+        db_writes: 0,
+        provider_writes: 0,
+        service_writes: 0,
+        evidence_moves_applied: 0,
+        run_id: None,
+        witness_path: None,
+    };
+    if !dry_run {
+        let run_id = format!(
+            "archive-recover-{}",
+            chrono::Utc::now().format("%Y%m%d_%H%M%S_%f")
+        );
+        archive_recovery_preflight_apply(&config.storage_root, &run_id, &output.plan)?;
+        let _expected_untracked_paths =
+            archive_recovery_require_untracked_only_plan(&config.storage_root, &output.plan)?;
+        let ctx = archive_recovery_run_context(&config.storage_root, &run_id)?;
+        output.run_id = Some(run_id.clone());
+        let intent = ArchiveRecoveryIntent {
+            schema_version: "archive-recovery-intent-v1".to_string(),
+            run_id: run_id.clone(),
+            plan_sha256: plan_sha256.clone(),
+            plan: output.plan.clone(),
+            doctor_root_class: "ignored-or-external".to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let intent_path = doctor::runs::doctor_root(&config.storage_root)
+            .join("runs")
+            .join(&run_id)
+            .join("recovery-evidence")
+            .join("intent.json");
+        doctor::mutate::mutate(
+            &ctx,
+            &intent_path,
+            doctor::mutate::Op::WriteFile {
+                content: serde_json::to_vec_pretty(&intent).map_err(|error| {
+                    CliError::Other(format!("cannot encode recovery intent: {error}"))
+                })?,
+                mode: 0o600,
+            },
+        )
+        .map_err(|error| CliError::Other(format!("cannot seal recovery intent: {error}")))?;
+        for group in &output.plan.groups {
+            for loser in &group.evidence_preserved {
+                let source = loser.source_path.clone();
+                let relative = source.strip_prefix(&config.storage_root).map_err(|_| {
+                    CliError::InvalidArgument(
+                        "recovery candidate is outside the canonical storage root; refusing"
+                            .to_string(),
+                    )
+                })?;
+                let destination = doctor::runs::doctor_root(&config.storage_root)
+                    .join("runs")
+                    .join(&run_id)
+                    .join("recovery-evidence")
+                    .join("losers")
+                    .join(relative);
+                if let Err(error) = archive_recovery_require_real_parent_chain(
+                    &config.storage_root.join("projects"),
+                    &source,
+                )
+                .and_then(|()| archive_recovery_require_regular_exact(&source, &loser.sha256))
+                {
+                    return Err(archive_recovery_partial_failure(
+                        &ctx,
+                        &run_id,
+                        &plan_sha256,
+                        "evidence-move-revalidation",
+                        output.evidence_moves_applied,
+                        error,
+                    ));
+                }
+                let move_result = doctor::mutate::mutate(
+                    &ctx,
+                    &source,
+                    doctor::mutate::Op::Rename { to: destination },
+                );
+                let move_result = match move_result {
+                    Ok(result) if result.before_hash == loser.sha256 => result,
+                    Ok(_) => {
+                        return Err(archive_recovery_partial_failure(
+                            &ctx,
+                            &run_id,
+                            &plan_sha256,
+                            "evidence-move-hash",
+                            output.evidence_moves_applied,
+                            "recovery move observed bytes different from the reviewed evidence",
+                        ));
+                    }
+                    Err(error) => {
+                        return Err(archive_recovery_partial_failure(
+                            &ctx,
+                            &run_id,
+                            &plan_sha256,
+                            "evidence-move",
+                            output.evidence_moves_applied,
+                            format!("failed to preserve recovery evidence: {error}"),
+                        ));
+                    }
+                };
+                let destination = doctor::runs::doctor_root(&config.storage_root)
+                    .join("runs")
+                    .join(&run_id)
+                    .join("recovery-evidence")
+                    .join("losers")
+                    .join(relative);
+                if !move_result.ok
+                    || archive_recovery_require_regular_exact(&destination, &loser.sha256).is_err()
+                {
+                    return Err(archive_recovery_partial_failure(
+                        &ctx,
+                        &run_id,
+                        &plan_sha256,
+                        "evidence-move-readback",
+                        output.evidence_moves_applied,
+                        "recovery evidence readback failed after its move",
+                    ));
+                }
+                output.evidence_moves_applied += 1;
+            }
+        }
+        let git_receipt = match archive_recovery_no_tracked_tree_change_receipt(
+            &config.storage_root,
+            &output.plan,
+            &BTreeSet::new(),
+        ) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                return Err(archive_recovery_partial_failure(
+                    &ctx,
+                    &run_id,
+                    &plan_sha256,
+                    "post-move-git-verification",
+                    output.evidence_moves_applied,
+                    error,
+                ));
+            }
+        };
+        let terminal = ArchiveRecoveryTerminalReceipt {
+            schema_version: "archive-recovery-terminal-v1".to_string(),
+            run_id: run_id.clone(),
+            plan_sha256: plan_sha256.clone(),
+            status: "applied".to_string(),
+            git_receipt,
+            evidence_moves_applied: output.evidence_moves_applied,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let terminal_path = doctor::runs::doctor_root(&config.storage_root)
+            .join("runs")
+            .join(&run_id)
+            .join("recovery-evidence")
+            .join("terminal.json");
+        doctor::mutate::mutate(
+            &ctx,
+            &terminal_path,
+            doctor::mutate::Op::WriteFile {
+                content: serde_json::to_vec_pretty(&terminal).map_err(|error| {
+                    CliError::Other(format!("cannot encode recovery terminal receipt: {error}"))
+                })?,
+                mode: 0o600,
+            },
+        )
+        .map_err(|error| {
+            archive_recovery_partial_failure(
+                &ctx,
+                &run_id,
+                &plan_sha256,
+                "terminal-receipt",
+                output.evidence_moves_applied,
+                format!("cannot write recovery terminal receipt: {error}"),
+            )
+        })?;
+        let witness = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": "archive-recovery-witness-v2",
+            "intent_sha256": archive_recovery_sha256(&serde_json::to_vec(&intent).map_err(|error| CliError::Other(error.to_string()))?),
+            "terminal": &terminal,
+            "db_writes": 0,
+            "provider_writes": 0,
+            "service_writes": 0,
+            "undo_prerequisite": "From STORAGE_ROOT, run am doctor archive-recover-undo <run-id> --dry-run before --yes.",
+            "note": "No message bodies, human keys, database URLs, provider credentials, or absolute paths are emitted."
+        }))
+        .map_err(|error| {
+            archive_recovery_partial_failure(
+                &ctx,
+                &run_id,
+                &plan_sha256,
+                "witness-encode",
+                output.evidence_moves_applied,
+                format!("failed to serialize archive recovery witness: {error}"),
+            )
+        })?;
+        let witness_path = doctor::runs::doctor_root(&config.storage_root)
+            .join("runs")
+            .join(&run_id)
+            .join("recovery-evidence")
+            .join("witness.json");
+        doctor::mutate::mutate(
+            &ctx,
+            &witness_path,
+            doctor::mutate::Op::WriteFile {
+                content: witness,
+                mode: 0o600,
+            },
+        )
+        .map_err(|error| {
+            archive_recovery_partial_failure(
+                &ctx,
+                &run_id,
+                &plan_sha256,
+                "witness-write",
+                output.evidence_moves_applied,
+                format!("failed to write archive recovery witness: {error}"),
+            )
+        })?;
+        output.witness_path = Some(
+            witness_path
+                .strip_prefix(&config.storage_root)
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|_| {
+                    format!(
+                        "DOCTOR_ROOT/{}",
+                        witness_path
+                            .strip_prefix(doctor::runs::doctor_root(&config.storage_root))
+                            .unwrap_or(Path::new("witness.json"))
+                            .display()
+                    )
+                }),
+        );
+        doctor::manifest::seal_run_manifest_default(&ctx.run_dir, &run_id).map_err(|error| {
+            archive_recovery_partial_failure(
+                &ctx,
+                &run_id,
+                &plan_sha256,
+                "manifest-seal",
+                output.evidence_moves_applied,
+                format!(
+                    "archive recovery applied but could not seal its terminal manifest: {error}"
+                ),
+            )
+        })?;
+    }
+    if json {
+        ftui_runtime::ftui_println!(
+            "{}",
+            serde_json::to_string(&output).map_err(|err| CliError::Other(format!(
+                "failed to serialize archive recovery output: {err}"
+            )))?
+        );
+    } else {
+        ftui_runtime::ftui_println!(
+            "Archive recovery {}: {} selected duplicate group(s), plan_sha256={}",
+            if dry_run { "preview" } else { "applied" },
+            output.plan.groups.len(),
+            output.plan_sha256
+        );
+    }
+    Ok(())
+}
+
+fn archive_recovery_safe_run_id(run_id: &str) -> CliResult<()> {
+    if run_id.is_empty()
+        || run_id == "latest"
+        || run_id.contains('/')
+        || run_id.contains('\\')
+        || run_id.contains("..")
+    {
+        return Err(CliError::Usage(
+            "archive-recover-undo requires one explicit, path-safe run id".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn archive_recovery_read_sealed_run(
+    storage_root: &Path,
+    run_id: &str,
+) -> CliResult<(
+    PathBuf,
+    ArchiveRecoveryIntent,
+    ArchiveRecoveryTerminalReceipt,
+)> {
+    archive_recovery_safe_run_id(run_id)?;
+    let run_dir = doctor::runs::doctor_root(storage_root)
+        .join("runs")
+        .join(run_id);
+    match doctor::manifest::verify_run_manifest_default(&run_dir, run_id) {
+        doctor::manifest::ManifestVerdict::Verified => {}
+        verdict => {
+            return Err(CliError::InvalidArgument(format!(
+                "archive-recover-undo refuses an unverified recovery receipt ({})",
+                verdict.status_label()
+            )));
+        }
+    }
+    let evidence_dir = run_dir.join("recovery-evidence");
+    let intent = serde_json::from_slice::<ArchiveRecoveryIntent>(
+        &std::fs::read(evidence_dir.join("intent.json")).map_err(|_| {
+            CliError::InvalidArgument(
+                "archive recovery intent receipt is missing or unreadable".to_string(),
+            )
+        })?,
+    )
+    .map_err(|_| {
+        CliError::InvalidArgument("archive recovery intent receipt is malformed".to_string())
+    })?;
+    let terminal = serde_json::from_slice::<ArchiveRecoveryTerminalReceipt>(
+        &std::fs::read(evidence_dir.join("terminal.json")).map_err(|_| {
+            CliError::InvalidArgument("archive recovery terminal receipt is missing; run is partial and requires manual review".to_string())
+        })?,
+    )
+    .map_err(|_| CliError::InvalidArgument("archive recovery terminal receipt is malformed".to_string()))?;
+    if intent.run_id != run_id
+        || terminal.run_id != run_id
+        || intent.schema_version != "archive-recovery-intent-v1"
+        || intent.plan.schema_version != "archive-recovery-plan-v1"
+        || terminal.schema_version != "archive-recovery-terminal-v1"
+        || intent.plan_sha256 != terminal.plan_sha256
+        || archive_recovery_plan_digest(&intent.plan)? != intent.plan_sha256
+        || terminal.status != "applied"
+        || terminal.evidence_moves_applied
+            != intent
+                .plan
+                .groups
+                .iter()
+                .map(|group| group.evidence_preserved.len())
+                .sum::<usize>()
+    {
+        return Err(CliError::InvalidArgument(
+            "archive recovery receipts are not internally consistent".to_string(),
+        ));
+    }
+    match &terminal.git_receipt {
+        ArchiveRecoveryGitReceipt::NoTrackedTreeChange {
+            head,
+            tree,
+            index_sha256,
+        } if Some(head) == intent.plan.expected_git_head.as_ref()
+            && Some(tree) == intent.plan.expected_git_tree.as_ref()
+            && Some(index_sha256) == intent.plan.expected_git_index_sha256.as_ref() => {}
+        ArchiveRecoveryGitReceipt::NoTrackedTreeChange { .. } => {
+            return Err(CliError::InvalidArgument(
+                "archive recovery Git receipt does not match the admitted plan".to_string(),
+            ));
+        }
+    }
+    Ok((run_dir, intent, terminal))
+}
+
+fn archive_recovery_relative_evidence_path(path: &str) -> CliResult<PathBuf> {
+    let relative = PathBuf::from(path);
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(CliError::InvalidArgument(
+            "sealed recovery plan contains an unsafe evidence path".to_string(),
+        ));
+    }
+    Ok(relative)
+}
+
+fn archive_recovery_require_real_parent_chain(root: &Path, path: &Path) -> CliResult<()> {
+    let parent = path.parent().ok_or_else(|| {
+        CliError::InvalidArgument("recovery evidence path has no parent directory".to_string())
+    })?;
+    let relative = parent.strip_prefix(root).map_err(|_| {
+        CliError::InvalidArgument(
+            "recovery evidence parent is outside its admitted root".to_string(),
+        )
+    })?;
+    let root_metadata = std::fs::symlink_metadata(root)?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.file_type().is_dir() {
+        return Err(CliError::InvalidArgument(
+            "recovery evidence root must be a real directory".to_string(),
+        ));
+    }
+    let mut cursor = root.to_path_buf();
+    for component in relative.components() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return Err(CliError::InvalidArgument(
+                "recovery evidence parent contains an unsafe path component".to_string(),
+            ));
+        }
+        cursor.push(component.as_os_str());
+        let metadata = std::fs::symlink_metadata(&cursor)?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+            return Err(CliError::InvalidArgument(
+                "recovery evidence parent chain must contain only real directories".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn archive_recovery_undo_pairs(
+    storage_root: &Path,
+    source_run_id: &str,
+    plan: &ArchiveRecoveryPlan,
+) -> CliResult<Vec<(PathBuf, PathBuf, String, Option<u32>)>> {
+    let projects_root = storage_root.join("projects");
+    let source_root = doctor::runs::doctor_root(storage_root)
+        .join("runs")
+        .join(source_run_id)
+        .join("recovery-evidence")
+        .join("losers");
+    let mut pairs = Vec::new();
+    for loser in plan
+        .groups
+        .iter()
+        .flat_map(|group| group.evidence_preserved.iter())
+    {
+        let relative = archive_recovery_relative_evidence_path(&loser.path)?;
+        let destination = storage_root.join(&relative);
+        if !destination.starts_with(&projects_root) {
+            return Err(CliError::InvalidArgument(
+                "sealed recovery destination is outside the archive projects root".to_string(),
+            ));
+        }
+        archive_recovery_require_real_parent_chain(&projects_root, &destination)?;
+        if std::fs::symlink_metadata(&destination).is_ok() {
+            return Err(CliError::InvalidArgument(
+                "archive-recover-undo refuses to overwrite an existing destination".to_string(),
+            ));
+        }
+        let source = source_root.join(&relative);
+        archive_recovery_require_regular_exact(&source, &loser.sha256)?;
+        pairs.push((source, destination, loser.sha256.clone(), loser.mode));
+    }
+    Ok(pairs)
+}
+
+fn handle_doctor_archive_recover_undo(
+    run_id: String,
+    dry_run: bool,
+    yes: bool,
+    json: bool,
+) -> CliResult<()> {
+    if dry_run && yes {
+        return Err(CliError::Usage(
+            "--dry-run and --yes are contradictory for archive-recover-undo".to_string(),
+        ));
+    }
+    if !dry_run && !yes {
+        return Err(CliError::Usage(
+            "archive-recover-undo is restore-only but mutating; inspect --dry-run then repeat with --yes"
+                .to_string(),
+        ));
+    }
+    let config = Config::from_env();
+    let _mailbox_lock =
+        acquire_doctor_mailbox_activity_lock_for_storage_root(&config.storage_root, dry_run)?;
+    let (_run_dir, intent, terminal) =
+        archive_recovery_read_sealed_run(&config.storage_root, &run_id)?;
+    let expected_original_paths = intent
+        .plan
+        .groups
+        .iter()
+        .flat_map(|group| group.evidence_preserved.iter())
+        .map(|candidate| candidate.path.replace('\\', "/"))
+        .collect::<BTreeSet<_>>();
+    // A bounded recovery is deliberately untracked-only. Before undo, the
+    // admitted recovery state must be clean and identical to its receipt.
+    let _pre_undo_receipt = archive_recovery_no_tracked_tree_change_receipt(
+        &config.storage_root,
+        &intent.plan,
+        &BTreeSet::new(),
+    )?;
+    let restore_pairs = archive_recovery_undo_pairs(&config.storage_root, &run_id, &intent.plan)?;
+    let mut undo_run_id = None;
+    if !dry_run {
+        let restore_run_id = format!(
+            "archive-recover-undo-{}",
+            chrono::Utc::now().format("%Y%m%d_%H%M%S_%f")
+        );
+        let ctx = archive_recovery_run_context(&config.storage_root, &restore_run_id)?;
+        undo_run_id = Some(restore_run_id.clone());
+        let undo_intent = ArchiveRecoveryUndoIntent {
+            schema_version: "archive-recovery-undo-intent-v1".to_string(),
+            run_id: restore_run_id.clone(),
+            source_run_id: run_id.clone(),
+            source_plan_sha256: intent.plan_sha256.clone(),
+            expected_original_paths: expected_original_paths.iter().cloned().collect(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let evidence_dir = ctx.run_dir.join("recovery-evidence");
+        doctor::mutate::mutate(
+            &ctx,
+            &evidence_dir.join("intent.json"),
+            doctor::mutate::Op::WriteFile {
+                content: serde_json::to_vec_pretty(&undo_intent).map_err(|error| {
+                    CliError::Other(format!("cannot encode recovery undo intent: {error}"))
+                })?,
+                mode: 0o600,
+            },
+        )
+        .map_err(|error| CliError::Other(format!("cannot seal recovery undo intent: {error}")))?;
+
+        let mut restored = 0usize;
+        for (source, destination, expected_sha256, mode) in &restore_pairs {
+            // Revalidate immediately before the chokepoint. mutate() also
+            // records its output hash. The sealed source is copied, never
+            // moved, so the admitted recovery receipt remains verifiable.
+            archive_recovery_require_regular_exact(source, expected_sha256)?;
+            let content = std::fs::read(source)?;
+            let result = doctor::mutate::mutate(
+                &ctx,
+                destination,
+                doctor::mutate::Op::WriteFile {
+                    content,
+                    mode: mode.unwrap_or(0o600),
+                },
+            );
+            let result = match result {
+                Ok(result) if result.after_hash == *expected_sha256 => result,
+                Ok(_) => {
+                    return Err(archive_recovery_partial_failure(
+                        &ctx,
+                        &restore_run_id,
+                        &intent.plan_sha256,
+                        "undo-restore-hash",
+                        restored,
+                        "recovery undo observed bytes different from the sealed evidence",
+                    ));
+                }
+                Err(error) => {
+                    return Err(archive_recovery_partial_failure(
+                        &ctx,
+                        &restore_run_id,
+                        &intent.plan_sha256,
+                        "undo-restore",
+                        restored,
+                        format!("recovery undo could not restore evidence: {error}"),
+                    ));
+                }
+            };
+            if !result.ok
+                || archive_recovery_require_regular_exact(destination, expected_sha256).is_err()
+                || !archive_recovery_mode_matches(destination, *mode).is_ok_and(|matches| matches)
+            {
+                return Err(archive_recovery_partial_failure(
+                    &ctx,
+                    &restore_run_id,
+                    &intent.plan_sha256,
+                    "undo-restore-readback",
+                    restored,
+                    "recovery undo destination failed exact byte readback",
+                ));
+            }
+            restored += 1;
+        }
+
+        if !matches!(
+            doctor::manifest::verify_run_manifest_default(
+                &doctor::runs::doctor_root(&config.storage_root)
+                    .join("runs")
+                    .join(&run_id),
+                &run_id,
+            ),
+            doctor::manifest::ManifestVerdict::Verified
+        ) {
+            return Err(archive_recovery_partial_failure(
+                &ctx,
+                &restore_run_id,
+                &intent.plan_sha256,
+                "undo-source-receipt-readback",
+                restored,
+                "recovery undo changed the original sealed recovery receipt",
+            ));
+        }
+
+        let git_receipt = archive_recovery_no_tracked_tree_change_receipt(
+            &config.storage_root,
+            &intent.plan,
+            &expected_original_paths,
+        )
+        .map_err(|error| {
+            archive_recovery_partial_failure(
+                &ctx,
+                &restore_run_id,
+                &intent.plan_sha256,
+                "undo-post-restore-git-verification",
+                restored,
+                error,
+            )
+        })?;
+        let undo_terminal = ArchiveRecoveryUndoTerminalReceipt {
+            schema_version: "archive-recovery-undo-terminal-v1".to_string(),
+            run_id: restore_run_id.clone(),
+            source_run_id: run_id.clone(),
+            source_plan_sha256: intent.plan_sha256.clone(),
+            status: "restored".to_string(),
+            git_receipt,
+            evidence_restored: restored,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        doctor::mutate::mutate(
+            &ctx,
+            &evidence_dir.join("terminal.json"),
+            doctor::mutate::Op::WriteFile {
+                content: serde_json::to_vec_pretty(&undo_terminal).map_err(|error| {
+                    CliError::Other(format!("cannot encode recovery undo terminal: {error}"))
+                })?,
+                mode: 0o600,
+            },
+        )
+        .map_err(|error| {
+            archive_recovery_partial_failure(
+                &ctx,
+                &restore_run_id,
+                &intent.plan_sha256,
+                "undo-terminal-receipt",
+                restored,
+                format!("cannot write recovery undo terminal: {error}"),
+            )
+        })?;
+        let witness = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": "archive-recovery-undo-witness-v1",
+            "source_run_id": run_id.clone(),
+            "source_plan_sha256": intent.plan_sha256.clone(),
+            "terminal": &undo_terminal,
+            "original_receipt_preserved": true,
+            "db_writes": 0,
+            "provider_writes": 0,
+            "service_writes": 0,
+            "note": "No message bodies, human keys, database URLs, provider credentials, or absolute paths are emitted."
+        }))
+        .map_err(|error| {
+            archive_recovery_partial_failure(
+                &ctx,
+                &restore_run_id,
+                &intent.plan_sha256,
+                "undo-witness-encode",
+                restored,
+                format!("cannot encode recovery undo witness: {error}"),
+            )
+        })?;
+        doctor::mutate::mutate(
+            &ctx,
+            &evidence_dir.join("witness.json"),
+            doctor::mutate::Op::WriteFile {
+                content: witness,
+                mode: 0o600,
+            },
+        )
+        .map_err(|error| {
+            archive_recovery_partial_failure(
+                &ctx,
+                &restore_run_id,
+                &intent.plan_sha256,
+                "undo-witness-write",
+                restored,
+                format!("cannot write recovery undo witness: {error}"),
+            )
+        })?;
+        doctor::manifest::seal_run_manifest_default(&ctx.run_dir, &restore_run_id).map_err(
+            |error| {
+                archive_recovery_partial_failure(
+                    &ctx,
+                    &restore_run_id,
+                    &intent.plan_sha256,
+                    "undo-manifest-seal",
+                    restored,
+                    format!(
+                        "recovery undo restored evidence but could not seal its terminal manifest: {error}"
+                    ),
+                )
+            },
+        )?;
+    }
+    let output = serde_json::json!({
+        "status": if dry_run { "preview" } else { "restored" },
+        "source_run_id": run_id,
+        "undo_run_id": undo_run_id,
+        "evidence_to_restore": restore_pairs.len(),
+        "evidence_restored": if dry_run { 0 } else { restore_pairs.len() },
+        "git_receipt": terminal.git_receipt,
+        "original_receipt_preserved": true,
+        "message_bodies_emitted": false,
+        "absolute_paths_emitted": false,
+    });
+    if json {
+        ftui_runtime::ftui_println!(
+            "{}",
+            serde_json::to_string(&output).map_err(|error| CliError::Other(error.to_string()))?
+        );
+    } else {
+        ftui_runtime::ftui_println!(
+            "Archive recovery undo {}: {} action(s) {}",
+            if dry_run { "preview" } else { "completed" },
+            restore_pairs.len(),
+            if dry_run {
+                "would be restored"
+            } else {
+                "restored"
+            },
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod archive_recovery_tests {
+    use super::*;
+
+    fn candidate(
+        path: &str,
+        project_identity_match: bool,
+        db_message_project_match: bool,
+        git_head_tracks_exact_bytes: bool,
+        complete_frontmatter: bool,
+    ) -> ArchiveRecoveryCandidate {
+        ArchiveRecoveryCandidate {
+            path: path.to_string(),
+            source_path: PathBuf::from(path),
+            project_slug: "fixture".to_string(),
+            sha256: archive_recovery_sha256(path.as_bytes()),
+            git_parent_blob: None,
+            bytes: 1,
+            mode: Some(0o600),
+            evidence: ArchiveRecoveryEvidence {
+                project_identity_match,
+                db_message_project_match,
+                git_head_tracks_exact_bytes,
+                complete_frontmatter,
+                canonical_message_layout: true,
+                nonempty_bytes: true,
+            },
+        }
+    }
+
+    #[test]
+    fn recovery_prefers_db_correlated_complete_candidate_over_lexical_path() {
+        // Regression: the old normalizer sorted paths and therefore kept the
+        // lexically first, incomplete artifact. The path deliberately sorts
+        // first but is not part of the selected project or DB message row.
+        let incomplete_lexical_first = candidate(
+            "/archive/projects/ahead/messages/2026/04/a__7.md",
+            false,
+            false,
+            false,
+            false,
+        );
+        let db_correlated = candidate(
+            "/archive/projects/canonical/messages/2026/08/z__7.md",
+            true,
+            true,
+            true,
+            true,
+        );
+        let group = archive_recovery_select_group(7, &[incomplete_lexical_first, db_correlated])
+            .expect("unique evidence winner");
+        assert_eq!(
+            group.winner.path,
+            "/archive/projects/canonical/messages/2026/08/z__7.md"
+        );
+        assert_eq!(group.evidence_preserved.len(), 1);
+
+        let reversed = archive_recovery_select_group(
+            7,
+            &[
+                candidate(
+                    "/archive/projects/canonical/messages/2026/08/z__7.md",
+                    true,
+                    true,
+                    true,
+                    true,
+                ),
+                candidate(
+                    "/archive/projects/ahead/messages/2026/04/a__7.md",
+                    false,
+                    false,
+                    false,
+                    false,
+                ),
+            ],
+        )
+        .expect("input ordering cannot change a unique evidence winner");
+        assert_eq!(
+            reversed.winner.path,
+            "/archive/projects/canonical/messages/2026/08/z__7.md"
+        );
+    }
+
+    #[test]
+    fn recovery_refuses_equal_evidence_even_when_paths_are_deterministic() {
+        let left = candidate(
+            "/archive/projects/canonical/messages/2026/08/a__7.md",
+            true,
+            true,
+            true,
+            true,
+        );
+        let right = candidate(
+            "/archive/projects/canonical/messages/2026/08/b__7.md",
+            true,
+            true,
+            true,
+            true,
+        );
+        let err = archive_recovery_select_group(7, &[left, right]).expect_err("tie must refuse");
+        assert!(err.to_string().contains("ambiguous top evidence vector"));
+    }
+
+    #[test]
+    fn recovery_refuses_candidate_without_selected_project_db_correlation() {
+        let only_other_project = candidate(
+            "/archive/projects/other/messages/2026/08/a__7.md",
+            false,
+            false,
+            true,
+            true,
+        );
+        let err = archive_recovery_select_group(7, &[only_other_project])
+            .expect_err("unscoped winner must refuse");
+        assert!(err.to_string().contains("selected canonical project"));
+    }
+
+    #[test]
+    fn recovery_frontmatter_requires_recipients_and_created_timestamp() {
+        let incomplete = serde_json::json!({
+            "id": 7,
+            "from": "ArchiveOnly",
+            "subject": "incomplete"
+        });
+        let complete = serde_json::json!({
+            "id": 7,
+            "from": "Canonical",
+            "to": ["Reviewer"],
+            "subject": "complete",
+            "created_ts": 1
+        });
+        assert!(!archive_recovery_frontmatter_complete(&incomplete));
+        assert!(archive_recovery_frontmatter_complete(&complete));
+    }
+
+    #[test]
+    fn recovery_plan_digest_is_deterministic_and_never_contains_message_bodies() {
+        let plan = ArchiveRecoveryPlan {
+            schema_version: "archive-recovery-plan-v1".to_string(),
+            canonical_identity_sha256: archive_recovery_sha256(b"/canonical"),
+            canonical_project_slug: "canonical".to_string(),
+            message_ids: vec![7],
+            authorized_cross_project_evidence: Vec::new(),
+            expected_git_head: Some("0123456789012345678901234567890123456789".to_string()),
+            expected_git_tree: Some("abcdef0123456789abcdef0123456789abcdef01".to_string()),
+            expected_git_index_sha256: Some(archive_recovery_sha256(b"fixture-index")),
+            groups: vec![ArchiveRecoveryGroup {
+                message_id: 7,
+                winner: candidate("/archive/canonical.md", true, true, true, true),
+                evidence_preserved: vec![candidate(
+                    "/archive/loser.md",
+                    false,
+                    false,
+                    false,
+                    false,
+                )],
+            }],
+        };
+        let one = archive_recovery_plan_digest(&plan).expect("digest");
+        let two = archive_recovery_plan_digest(&plan).expect("repeat digest");
+        assert_eq!(one, two);
+        let serialized = serde_json::to_string(&plan).expect("serialize plan");
+        assert!(!serialized.contains("body_md"));
+        assert!(!serialized.contains("provider"));
+    }
+
+    #[test]
+    fn recovery_rejects_contradictory_or_unbound_flag_combinations_before_config() {
+        let identity = "/tmp/canonical".to_string();
+        let contradictory = handle_doctor_archive_recover(
+            true,
+            true,
+            true,
+            identity.clone(),
+            vec![7],
+            Vec::new(),
+            None,
+        )
+        .expect_err("preview must never accept --yes");
+        assert!(contradictory.to_string().contains("contradictory"));
+        let missing_digest =
+            handle_doctor_archive_recover(false, true, true, identity, vec![7], Vec::new(), None)
+                .expect_err("apply must require an exact preview digest");
+        assert!(missing_digest.to_string().contains("requires"));
+    }
+
+    #[test]
+    fn recovery_run_prefix_blocks_generic_undo_even_when_intent_is_partial_or_missing() {
+        let temp = tempfile::tempdir().expect("temp target");
+        assert!(archive_recovery_run_is_marked(
+            temp.path(),
+            "archive-recover-20260828_120000_000000000"
+        ));
+        assert!(archive_recovery_run_is_marked(
+            temp.path(),
+            "archive-recover-undo-20260828_120000_000000000"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_regular_file_guard_refuses_symlinked_evidence() {
+        let temp = tempfile::tempdir().expect("temp evidence");
+        let regular = temp.path().join("regular.md");
+        let link = temp.path().join("link.md");
+        std::fs::write(&regular, b"evidence\n").expect("regular evidence");
+        std::os::unix::fs::symlink(&regular, &link).expect("symlink evidence");
+        let sha256 = archive_recovery_file_sha256(&regular).expect("regular hash");
+        assert!(archive_recovery_require_regular_exact(&regular, &sha256).is_ok());
+        assert!(archive_recovery_require_regular_exact(&link, &sha256).is_err());
+    }
+
+    #[test]
+    fn recovery_temp_store_preview_is_zero_write_and_apply_undo_preserves_bytes() {
+        let temp = tempfile::tempdir().expect("temp store");
+        let storage_root = temp.path().join("storage");
+        let db_path = temp.path().join("storage.sqlite3");
+        let canonical_identity = temp.path().join("canonical-project");
+        std::fs::create_dir_all(&canonical_identity).expect("canonical identity directory");
+        let canonical_dir = storage_root.join("projects/canonical/messages/2026/08");
+        let competing_dir = storage_root.join("projects/ahead/messages/2026/04");
+        std::fs::create_dir_all(&canonical_dir).expect("canonical archive directory");
+        std::fs::create_dir_all(&competing_dir).expect("competing archive directory");
+        git2::Repository::init(&storage_root).expect("initialize isolated mailbox repository");
+        std::fs::write(
+            storage_root.join("projects/canonical/project.json"),
+            format!(
+                r#"{{"slug":"canonical","human_key":"{}"}}"#,
+                canonical_identity.display()
+            ),
+        )
+        .expect("canonical metadata");
+        std::fs::write(
+            storage_root.join("projects/ahead/project.json"),
+            r#"{"slug":"ahead","human_key":"/other-project"}"#,
+        )
+        .expect("competing metadata");
+        let canonical = canonical_dir.join("2026-08-26T16-32-21Z__canonical__7.md");
+        let loser = competing_dir.join("2026-04-01T12-00-00Z__incomplete__7.md");
+        std::fs::write(
+            &canonical,
+            concat!(
+                "---json\n",
+                "{\"id\":7,\"from\":\"Canonical\",\"to\":[\"Reviewer\"],",
+                "\"subject\":\"complete\",\"created_ts\":1}\n---\ncanonical body\n"
+            ),
+        )
+        .expect("canonical message");
+        std::fs::write(
+            &loser,
+            "---json\n{\"id\":7,\"from\":\"ArchiveOnly\"}\n---\n",
+        )
+        .expect("incomplete competing message");
+        std::fs::write(storage_root.join(".gitignore"), ".mailbox.activity.lock\n")
+            .expect("ignore the retained mailbox activity lock");
+        let connection =
+            mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().into_owned())
+                .expect("seed database");
+        for statement in [
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL)",
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL)",
+            &format!(
+                "INSERT INTO projects (id, slug, human_key) VALUES (1, 'canonical', '{}')",
+                canonical_identity.display()
+            ),
+            "INSERT INTO messages (id, project_id) VALUES (7, 1)",
+        ] {
+            connection.execute_raw(statement).expect("seed statement");
+        }
+        // Admit the canonical winner and project metadata, deliberately
+        // leaving only the conflicting loser untracked.
+        let repo = git2::Repository::open(&storage_root).expect("open fixture repository");
+        let mut index = repo.index().expect("fixture index");
+        index
+            .add_path(Path::new("projects/canonical/project.json"))
+            .expect("stage canonical project metadata");
+        index
+            .add_path(Path::new("projects/ahead/project.json"))
+            .expect("stage competing project metadata");
+        index
+            .add_path(Path::new(
+                "projects/canonical/messages/2026/08/2026-08-26T16-32-21Z__canonical__7.md",
+            ))
+            .expect("stage canonical winner only");
+        index
+            .add_path(Path::new(".gitignore"))
+            .expect("stage mailbox activity-lock ignore rule");
+        let tree_id = index.write_tree().expect("fixture tree");
+        let tree = repo.find_tree(tree_id).expect("fixture tree object");
+        let signature = git2::Signature::now("Archive Recovery Test", "test@example.invalid")
+            .expect("fixture signature");
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "fixture archive",
+            &tree,
+            &[],
+        )
+        .expect("initial fixture commit");
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let canonical_before = archive_recovery_file_sha256(&canonical).expect("canonical hash");
+        let loser_before = archive_recovery_file_sha256(&loser).expect("loser hash");
+        let db_before = archive_recovery_file_sha256(&db_path).expect("database hash");
+        let wal_path = db_path.with_extension("sqlite3-wal");
+        let shm_path = db_path.with_extension("sqlite3-shm");
+        let wal_before = wal_path.exists();
+        let shm_before = shm_path.exists();
+        let storage_mtime = std::fs::metadata(&storage_root)
+            .expect("storage metadata")
+            .modified()
+            .expect("storage mtime");
+        let loser_relative = loser
+            .strip_prefix(&storage_root)
+            .expect("relative loser")
+            .to_path_buf();
+
+        let denied = archive_recovery_plan(
+            &storage_root,
+            &database_url,
+            &canonical_identity.display().to_string(),
+            &[7],
+            &[],
+        )
+        .expect_err("cross-project evidence requires an exact explicit allowlist");
+        assert!(denied.to_string().contains("preserve-conflict-path"));
+
+        let mut plan = archive_recovery_plan(
+            &storage_root,
+            &database_url,
+            &canonical_identity.display().to_string(),
+            &[7],
+            &[loser_relative],
+        )
+        .expect("zero-write recovery preview");
+        assert_eq!(
+            plan.groups[0].winner.path,
+            "projects/canonical/messages/2026/08/2026-08-26T16-32-21Z__canonical__7.md"
+        );
+        assert_eq!(
+            archive_recovery_file_sha256(&canonical).unwrap(),
+            canonical_before
+        );
+        assert_eq!(archive_recovery_file_sha256(&loser).unwrap(), loser_before);
+        assert_eq!(archive_recovery_file_sha256(&db_path).unwrap(), db_before);
+        assert_eq!(
+            wal_path.exists(),
+            wal_before,
+            "preview created a WAL sidecar"
+        );
+        assert_eq!(
+            shm_path.exists(),
+            shm_before,
+            "preview created an SHM sidecar"
+        );
+        assert_eq!(
+            std::fs::metadata(&storage_root)
+                .unwrap()
+                .modified()
+                .unwrap(),
+            storage_mtime
+        );
+        assert!(
+            !storage_root.join(".doctor").exists(),
+            "preview created a run dir"
+        );
+        assert!(
+            !storage_root.join("doctor").exists(),
+            "preview created an evidence dir"
+        );
+
+        // Exercise the public handler with a process-scoped temporary mailbox.
+        // The capture asserts the JSON contract as well as the filesystem
+        // contract, while avoiding any access to the shared store.
+        use ftui_runtime::stdio_capture::StdioCapture;
+        let storage_root_text = storage_root.display().to_string();
+        let external_doctor_root = temp.path().join("external-preview-doctor");
+        let external_doctor_root_text = external_doctor_root.display().to_string();
+        let _capture_lock = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let preview_capture = StdioCapture::install().expect("install preview capture");
+        let preview_result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &database_url),
+                ("STORAGE_ROOT", &storage_root_text),
+                ("AM_DOCTOR_BACKUPS_DIR", &external_doctor_root_text),
+            ],
+            || {
+                handle_doctor_archive_recover(
+                    true,
+                    false,
+                    true,
+                    canonical_identity.display().to_string(),
+                    vec![7],
+                    vec![loser_relative.clone()],
+                    None,
+                )
+            },
+        );
+        let preview_stdout = preview_capture.drain_to_string();
+        assert!(
+            preview_result.is_ok(),
+            "handler preview failed: {preview_result:?}"
+        );
+        let preview_json = extract_json_blocks(&preview_stdout)
+            .into_iter()
+            .filter_map(|block| serde_json::from_str::<serde_json::Value>(block).ok())
+            .find(|value| value.get("status") == Some(&serde_json::json!("preview")))
+            .expect("handler must emit preview JSON");
+        let mut plan_digest = archive_recovery_plan_digest(&plan).expect("plan digest");
+        assert_eq!(
+            preview_json["plan_sha256"],
+            serde_json::Value::String(plan_digest.clone())
+        );
+        assert!(
+            preview_json
+                .to_string()
+                .contains("projects/canonical/messages")
+        );
+        assert!(!preview_json.to_string().contains(&storage_root_text));
+        assert!(
+            !external_doctor_root.exists(),
+            "external-root preview must not create evidence artifacts"
+        );
+
+        let stale_result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &database_url),
+                ("STORAGE_ROOT", &storage_root_text),
+                ("AM_DOCTOR_BACKUPS_DIR", ""),
+            ],
+            || {
+                handle_doctor_archive_recover(
+                    false,
+                    true,
+                    true,
+                    canonical_identity.display().to_string(),
+                    vec![7],
+                    vec![loser_relative.clone()],
+                    Some("0".repeat(64)),
+                )
+            },
+        );
+        assert!(stale_result.is_err(), "stale digest must be refused");
+        assert!(
+            !storage_root.join(".doctor/runs").exists(),
+            "stale plan must not create a normal recovery run"
+        );
+
+        let unignored_result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &database_url),
+                ("STORAGE_ROOT", &storage_root_text),
+                ("AM_DOCTOR_BACKUPS_DIR", ""),
+            ],
+            || {
+                handle_doctor_archive_recover(
+                    false,
+                    true,
+                    true,
+                    canonical_identity.display().to_string(),
+                    vec![7],
+                    vec![loser_relative.clone()],
+                    Some(plan_digest.clone()),
+                )
+            },
+        );
+        assert!(
+            unignored_result.is_err(),
+            "unignored evidence root must refuse"
+        );
+        assert!(
+            !storage_root.join(".doctor/runs").exists(),
+            "unignored apply must not create a recovery run"
+        );
+        assert!(
+            loser.exists(),
+            "unignored apply must preserve the source evidence"
+        );
+        let pre_ignore_plan_digest = plan_digest.clone();
+        std::fs::write(
+            storage_root.join(".gitignore"),
+            ".mailbox.activity.lock\n.doctor/\n",
+        )
+        .expect("fixture must explicitly ignore doctor artifacts");
+        let mut ignore_index = repo.index().expect("fixture ignore index");
+        ignore_index
+            .add_path(Path::new(".gitignore"))
+            .expect("stage fixture ignore only");
+        let ignore_tree = repo
+            .find_tree(ignore_index.write_tree().expect("ignore tree"))
+            .expect("ignore tree object");
+        let parent = repo
+            .head()
+            .and_then(|head| head.peel_to_commit())
+            .expect("ignore parent");
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "fixture ignore doctor root",
+            &ignore_tree,
+            &[&parent],
+        )
+        .expect("commit fixture ignore");
+        plan = archive_recovery_plan(
+            &storage_root,
+            &database_url,
+            &canonical_identity.display().to_string(),
+            &[7],
+            &[loser_relative.clone()],
+        )
+        .expect("fresh plan after fixture Git admission");
+        plan_digest = archive_recovery_plan_digest(&plan).expect("fresh plan digest");
+        assert_ne!(
+            pre_ignore_plan_digest, plan_digest,
+            "HEAD/tree/index drift must change the reviewed plan digest"
+        );
+        let stale_head_result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &database_url),
+                ("STORAGE_ROOT", &storage_root_text),
+            ],
+            || {
+                handle_doctor_archive_recover(
+                    false,
+                    true,
+                    true,
+                    canonical_identity.display().to_string(),
+                    vec![7],
+                    vec![loser_relative.clone()],
+                    Some(pre_ignore_plan_digest.clone()),
+                )
+            },
+        );
+        assert!(stale_head_result.is_err(), "HEAD drift must refuse apply");
+        assert!(
+            !storage_root.join(".doctor/runs").exists(),
+            "stale HEAD must refuse before creating a run"
+        );
+
+        let unrelated = storage_root.join("projects/unrelated-recovery-state.tmp");
+        let preserved_unrelated = temp.path().join("preserved-unrelated-recovery-state.tmp");
+        std::fs::write(&unrelated, b"unrelated\n").expect("plant unrelated untracked state");
+        let dirty_result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &database_url),
+                ("STORAGE_ROOT", &storage_root_text),
+            ],
+            || {
+                handle_doctor_archive_recover(
+                    false,
+                    true,
+                    true,
+                    canonical_identity.display().to_string(),
+                    vec![7],
+                    vec![loser_relative.clone()],
+                    Some(plan_digest.clone()),
+                )
+            },
+        );
+        assert!(dirty_result.is_err(), "unrelated Git status must refuse");
+        std::fs::rename(&unrelated, &preserved_unrelated)
+            .expect("preserve unrelated fixture outside mailbox before retry");
+
+        let competing_mailbox_lock =
+            acquire_doctor_mailbox_activity_lock_for_storage_root(&storage_root, false)
+                .expect("acquire competing fixture mailbox lock");
+        let lock_result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &database_url),
+                ("STORAGE_ROOT", &storage_root_text),
+            ],
+            || {
+                handle_doctor_archive_recover(
+                    false,
+                    true,
+                    true,
+                    canonical_identity.display().to_string(),
+                    vec![7],
+                    vec![loser_relative.clone()],
+                    Some(plan_digest.clone()),
+                )
+            },
+        );
+        assert!(
+            lock_result.is_err(),
+            "a live mailbox owner must refuse apply"
+        );
+        drop(competing_mailbox_lock);
+
+        let apply_capture = StdioCapture::install().expect("install apply capture");
+        let apply_result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &database_url),
+                ("STORAGE_ROOT", &storage_root_text),
+            ],
+            || {
+                handle_doctor_archive_recover(
+                    false,
+                    true,
+                    true,
+                    canonical_identity.display().to_string(),
+                    vec![7],
+                    vec![loser_relative.clone()],
+                    Some(plan_digest.clone()),
+                )
+            },
+        );
+        let apply_stdout = apply_capture.drain_to_string();
+        assert!(
+            apply_result.is_ok(),
+            "handler apply failed: {apply_result:?}"
+        );
+        let apply_json = extract_json_blocks(&apply_stdout)
+            .into_iter()
+            .filter_map(|block| serde_json::from_str::<serde_json::Value>(block).ok())
+            .find(|value| value.get("status") == Some(&serde_json::json!("applied")))
+            .expect("handler must emit apply JSON");
+        let witness_relative = apply_json["witness_path"]
+            .as_str()
+            .expect("apply JSON must include a relative witness path");
+        let output_run_id = apply_json["run_id"]
+            .as_str()
+            .expect("apply JSON must include the normal undo run id");
+        assert!(!Path::new(witness_relative).is_absolute());
+        assert!(storage_root.join(witness_relative).is_file());
+        let run_dirs = std::fs::read_dir(storage_root.join(".doctor/runs"))
+            .expect("handler must create a normal undo run")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read recovery run");
+        assert_eq!(run_dirs.len(), 1, "exactly one handler recovery run");
+        let run_id = run_dirs[0].file_name().to_string_lossy().to_string();
+        assert_eq!(output_run_id, run_id);
+        let destination = storage_root
+            .join(".doctor/runs")
+            .join(&run_id)
+            .join("recovery-evidence")
+            .join("losers")
+            .join(&plan.groups[0].evidence_preserved[0].path);
+        assert!(!loser.exists(), "loser should move, never be deleted");
+        assert_eq!(
+            archive_recovery_file_sha256(&canonical).unwrap(),
+            canonical_before
+        );
+        assert_eq!(
+            archive_recovery_file_sha256(&destination).unwrap(),
+            loser_before
+        );
+        assert_eq!(archive_recovery_file_sha256(&db_path).unwrap(), db_before);
+        let fresh_checkout = temp.path().join("fresh-mailbox-checkout");
+        git2::Repository::clone(storage_root.to_string_lossy().as_ref(), &fresh_checkout)
+            .expect("fresh checkout of admitted mailbox Git state");
+        assert!(
+            fresh_checkout
+                .join("projects/canonical/messages/2026/08/2026-08-26T16-32-21Z__canonical__7.md")
+                .is_file()
+        );
+        assert!(
+            !fresh_checkout.join(&loser_relative).exists(),
+            "untracked conflict must never resurrect in a fresh checkout"
+        );
+        assert!(archive_recovery_run_is_marked(&storage_root, &run_id));
+
+        let terminal_path = storage_root
+            .join(".doctor/runs")
+            .join(&run_id)
+            .join("recovery-evidence/terminal.json");
+        let terminal_before_tamper = std::fs::read(&terminal_path).expect("sealed terminal bytes");
+        std::fs::write(&terminal_path, b"{}\n").expect("tamper isolated receipt fixture");
+        assert!(
+            archive_recovery_read_sealed_run(&storage_root, &run_id).is_err(),
+            "receipt tampering must refuse undo"
+        );
+        std::fs::write(&terminal_path, &terminal_before_tamper)
+            .expect("restore isolated receipt fixture exactly");
+        assert!(matches!(
+            doctor::manifest::verify_run_manifest_default(
+                &storage_root.join(".doctor/runs").join(&run_id),
+                &run_id,
+            ),
+            doctor::manifest::ManifestVerdict::Verified
+        ));
+
+        let undo_preview = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &database_url),
+                ("STORAGE_ROOT", &storage_root_text),
+            ],
+            || handle_doctor_archive_recover_undo(run_id.clone(), true, false, true),
+        );
+        assert!(undo_preview.is_ok(), "undo preview: {undo_preview:?}");
+        assert!(!loser.exists(), "undo preview must remain zero-write");
+
+        let undo_apply = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &database_url),
+                ("STORAGE_ROOT", &storage_root_text),
+            ],
+            || handle_doctor_archive_recover_undo(run_id.clone(), false, true, true),
+        );
+        assert!(undo_apply.is_ok(), "dedicated undo apply: {undo_apply:?}");
+        assert_eq!(
+            archive_recovery_file_sha256(&canonical).unwrap(),
+            canonical_before
+        );
+        assert_eq!(archive_recovery_file_sha256(&loser).unwrap(), loser_before);
+        assert_eq!(
+            archive_recovery_file_sha256(&destination).unwrap(),
+            loser_before,
+            "dedicated undo must preserve the original sealed evidence bytes"
+        );
+        assert_eq!(archive_recovery_file_sha256(&db_path).unwrap(), db_before);
+        assert!(matches!(
+            doctor::manifest::verify_run_manifest_default(
+                &storage_root.join(".doctor/runs").join(&run_id),
+                &run_id,
+            ),
+            doctor::manifest::ManifestVerdict::Verified
+        ));
+
+        let external_preview_capture =
+            StdioCapture::install().expect("install external preview capture");
+        let external_preview = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &database_url),
+                ("STORAGE_ROOT", &storage_root_text),
+                ("AM_DOCTOR_BACKUPS_DIR", &external_doctor_root_text),
+            ],
+            || {
+                handle_doctor_archive_recover(
+                    true,
+                    false,
+                    true,
+                    canonical_identity.display().to_string(),
+                    vec![7],
+                    vec![loser_relative.clone()],
+                    None,
+                )
+            },
+        );
+        let external_preview_stdout = external_preview_capture.drain_to_string();
+        assert!(
+            external_preview.is_ok(),
+            "external preview: {external_preview:?}"
+        );
+        let external_digest = extract_json_blocks(&external_preview_stdout)
+            .into_iter()
+            .filter_map(|block| serde_json::from_str::<serde_json::Value>(block).ok())
+            .find_map(|value| value["plan_sha256"].as_str().map(str::to_string))
+            .expect("external preview plan digest");
+        assert!(
+            !external_doctor_root.exists(),
+            "external preview must remain zero-write"
+        );
+
+        let external_apply_capture =
+            StdioCapture::install().expect("install external apply capture");
+        let external_apply = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &database_url),
+                ("STORAGE_ROOT", &storage_root_text),
+                ("AM_DOCTOR_BACKUPS_DIR", &external_doctor_root_text),
+            ],
+            || {
+                handle_doctor_archive_recover(
+                    false,
+                    true,
+                    true,
+                    canonical_identity.display().to_string(),
+                    vec![7],
+                    vec![loser_relative.clone()],
+                    Some(external_digest.clone()),
+                )
+            },
+        );
+        let external_apply_stdout = external_apply_capture.drain_to_string();
+        assert!(external_apply.is_ok(), "external apply: {external_apply:?}");
+        let external_apply_json = extract_json_blocks(&external_apply_stdout)
+            .into_iter()
+            .filter_map(|block| serde_json::from_str::<serde_json::Value>(block).ok())
+            .find(|value| value.get("status") == Some(&serde_json::json!("applied")))
+            .expect("external apply JSON");
+        let external_run_id = external_apply_json["run_id"]
+            .as_str()
+            .expect("external recovery run id")
+            .to_string();
+        assert!(
+            external_apply_json["witness_path"]
+                .as_str()
+                .is_some_and(|path| path.starts_with("DOCTOR_ROOT/"))
+        );
+        let external_evidence = external_doctor_root
+            .join("runs")
+            .join(&external_run_id)
+            .join("recovery-evidence/losers")
+            .join(&loser_relative);
+        assert_eq!(
+            archive_recovery_file_sha256(&external_evidence).unwrap(),
+            loser_before
+        );
+        assert!(!loser.exists());
+
+        let external_undo = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &database_url),
+                ("STORAGE_ROOT", &storage_root_text),
+                ("AM_DOCTOR_BACKUPS_DIR", &external_doctor_root_text),
+            ],
+            || handle_doctor_archive_recover_undo(external_run_id.clone(), false, true, true),
+        );
+        assert!(external_undo.is_ok(), "external undo: {external_undo:?}");
+        assert_eq!(archive_recovery_file_sha256(&loser).unwrap(), loser_before);
+        assert_eq!(
+            archive_recovery_file_sha256(&external_evidence).unwrap(),
+            loser_before,
+            "external sealed evidence must remain intact after restore"
+        );
+        assert!(matches!(
+            doctor::manifest::verify_run_manifest_default(
+                &external_doctor_root.join("runs").join(&external_run_id),
+                &external_run_id,
+            ),
+            doctor::manifest::ManifestVerdict::Verified
+        ));
+
+        let mut tracked_loser_index = repo.index().expect("tracked-loser index");
+        tracked_loser_index
+            .add_path(&loser_relative)
+            .expect("stage tracked-loser fixture");
+        let tracked_loser_tree = repo
+            .find_tree(
+                tracked_loser_index
+                    .write_tree()
+                    .expect("tracked-loser tree"),
+            )
+            .expect("tracked-loser tree object");
+        let tracked_loser_parent = repo
+            .head()
+            .and_then(|head| head.peel_to_commit())
+            .expect("tracked-loser parent");
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "fixture tracked conflict",
+            &tracked_loser_tree,
+            &[&tracked_loser_parent],
+        )
+        .expect("commit tracked-loser fixture");
+        let tracked_loser_result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &database_url),
+                ("STORAGE_ROOT", &storage_root_text),
+                ("AM_DOCTOR_BACKUPS_DIR", &external_doctor_root_text),
+            ],
+            || {
+                handle_doctor_archive_recover(
+                    true,
+                    false,
+                    true,
+                    canonical_identity.display().to_string(),
+                    vec![7],
+                    vec![loser_relative.clone()],
+                    None,
+                )
+            },
+        );
+        let tracked_loser_error = tracked_loser_result.expect_err("tracked loser must refuse");
+        assert!(
+            tracked_loser_error
+                .to_string()
+                .contains("TRACKED_CONFLICT_REQUIRES_SEPARATE_EXACT_GIT_RECOVERY")
+        );
+    }
 }
 
 #[cfg(test)]

@@ -96,6 +96,22 @@ pub fn scaffold_run_dir(target: &Path, run_id: &str) -> std::io::Result<PathBuf>
     Ok(run_dir)
 }
 
+/// Create a new run directory exactly once. Unlike [`scaffold_run_dir`], this
+/// refuses an existing id so non-idempotent recovery workflows cannot append
+/// evidence to an older run after a timestamp collision or hostile precreate.
+pub fn scaffold_fresh_run_dir(target: &Path, run_id: &str) -> std::io::Result<PathBuf> {
+    let root = doctor_root(target);
+    ensure_dir_without_symlink(&root)?;
+    let runs_dir = root.join("runs");
+    ensure_dir_without_symlink(&runs_dir)?;
+    let run_dir = runs_dir.join(run_id);
+    fs::create_dir(&run_dir)?;
+    ensure_existing_dir_tree_without_symlink(&run_dir)?;
+    ensure_dir_without_symlink(&run_dir.join("backups"))?;
+    open_actions_log(&run_dir)?;
+    Ok(run_dir)
+}
+
 /// Open a run's `actions.jsonl` for append without following symlinks.
 pub fn open_actions_log(run_dir: &Path) -> std::io::Result<File> {
     ensure_existing_dir_without_symlink(run_dir)?;
@@ -665,6 +681,24 @@ mod tests {
         let run_id = "2026-05-09T16-30-15Z__abc123";
         let _a = scaffold_run_dir(td.path(), run_id).expect("first");
         let _b = scaffold_run_dir(td.path(), run_id).expect("second — should not error");
+    }
+
+    #[test]
+    fn fresh_scaffold_refuses_run_id_reuse_without_changing_existing_evidence() {
+        let td = TempDir::new().expect("tempdir");
+        let run_id = "archive-recover-20260828_120000_000000000";
+        let run_dir = scaffold_fresh_run_dir(td.path(), run_id).expect("first fresh run");
+        fs::write(run_dir.join("retained-evidence.txt"), b"retain exactly\n")
+            .expect("retained evidence fixture");
+
+        let error = scaffold_fresh_run_dir(td.path(), run_id)
+            .expect_err("a non-idempotent recovery run id must never be reused");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read(run_dir.join("retained-evidence.txt")).unwrap(),
+            b"retain exactly\n"
+        );
     }
 
     #[test]
