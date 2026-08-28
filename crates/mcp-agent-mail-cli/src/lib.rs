@@ -83225,6 +83225,7 @@ fn historical_artifact_partial_failure(
         "db_writes": 0,
         "provider_writes": 0,
         "service_writes": 0,
+        "audit_writes": 0,
     });
     let receipt = doctor::mutate::mutate(
         ctx,
@@ -83235,9 +83236,14 @@ fn historical_artifact_partial_failure(
         },
     );
     match receipt {
-        Ok(_) => CliError::Other(format!(
-            "{primary}; a sealed partial historical-reconciliation receipt requires review"
-        )),
+        Ok(_) => match doctor::manifest::seal_run_manifest_default(&ctx.run_dir, run_id) {
+            Ok(_) => CliError::Other(format!(
+                "{primary}; a sealed partial historical-reconciliation receipt requires review"
+            )),
+            Err(seal_error) => CliError::Other(format!(
+                "{primary}; partial receipt was written but its manifest seal failed: {seal_error}"
+            )),
+        },
         Err(receipt_error) => CliError::Other(format!(
             "{primary}; partial receipt also failed: {receipt_error}"
         )),
@@ -83975,10 +83981,14 @@ mod historical_artifact_reconcile_tests {
             format!(
                 "INSERT INTO projects (id, slug, human_key) VALUES (1, 'canonical', '{escaped_identity}')"
             ),
+            "INSERT INTO projects (id, slug, human_key) VALUES (2, 'other-project', '/other/project')".to_string(),
             "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, registration_token, retired_at) VALUES (1, 1, 'WhiteDeer', 'codex', 'gpt-test', 'historical fixture', 1700000000000000, 1700000100000000, 'auto', 'auto', 0, 'super-secret-token', NULL)".to_string(),
+            "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, registration_token, retired_at) VALUES (2, 2, 'BlueLake', 'codex', 'gpt-test', 'foreign fixture', 1700000000000000, 1700000100000000, 'auto', 'auto', 0, NULL, NULL)".to_string(),
             "INSERT INTO agent_deregistrations (agent_id, deregistered_at) VALUES (1, 1700000500000000)".to_string(),
             "INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) VALUES (41, 1, 1, 'src/exact.rs', 1, 'historical fixture', 1700000200000000, 1700000300000000, NULL)".to_string(),
             "INSERT INTO file_reservation_releases (reservation_id, released_ts) VALUES (41, 1700000400000000)".to_string(),
+            "INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) VALUES (43, 2, 2, 'src/foreign.rs', 1, 'cross-project refusal', 1700000200000000, 1700000300000000, NULL)".to_string(),
+            "INSERT INTO file_reservation_releases (reservation_id, released_ts) VALUES (43, 1700000400000000)".to_string(),
             format!(
                 "INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) VALUES (42, 1, 1, 'src/active.rs', 1, 'active refusal', 1700000200000000, {}, NULL)",
                 mcp_agent_mail_db::now_micros() + 3_600_000_000
@@ -84292,6 +84302,18 @@ mod historical_artifact_reconcile_tests {
             sqlite_family_snapshot(&fixture.db_path),
             sqlite_family_before
         );
+        let cross_project_error =
+            historical_artifact_plan(&fixture.storage_root, &database_url, &identity, &[], &[43])
+                .expect_err("foreign-project reservation must refuse");
+        assert!(
+            cross_project_error
+                .to_string()
+                .contains("canonical project; found 0")
+        );
+        assert_eq!(
+            sqlite_family_snapshot(&fixture.db_path),
+            sqlite_family_before
+        );
 
         let plan = historical_artifact_plan(
             &fixture.storage_root,
@@ -84466,6 +84488,15 @@ mod historical_artifact_reconcile_tests {
         let reservation_text = std::fs::read_to_string(&stable_path).expect("reservation readback");
         assert!(reservation_text.contains("released_ts"));
         assert!(reservation_text.contains("a1b2c3d4"));
+        let exact_noop = historical_artifact_plan(
+            &fixture.storage_root,
+            &database_url,
+            &identity,
+            &["WhiteDeer".to_string()],
+            &[41],
+        )
+        .expect_err("already exact artifacts must refuse a no-op receipt");
+        assert!(exact_noop.to_string().contains("already exact"));
 
         let applied_repo = git2::Repository::open(&fixture.storage_root).expect("applied repo");
         let applied_head = applied_repo
@@ -84652,6 +84683,103 @@ mod historical_artifact_reconcile_tests {
         )
         .expect_err("divergent existing artifact must refuse");
         assert!(divergent.to_string().contains("diverges"));
+    }
+
+    #[test]
+    fn historical_apply_refuses_contended_mailbox_locks_before_writes() {
+        let fixture = historical_fixture();
+        let identity = fixture.canonical_identity.display().to_string();
+        let database_url = fixture.database_url();
+        let plan = historical_artifact_plan(
+            &fixture.storage_root,
+            &database_url,
+            &identity,
+            &["WhiteDeer".to_string()],
+            &[41],
+        )
+        .expect("lock-contention plan");
+        let digest = historical_artifact_plan_digest(&plan).expect("lock-contention digest");
+        let sqlite_before = sqlite_family_snapshot(&fixture.db_path);
+        let git_before = archive_recovery_git_status_snapshot(&fixture.storage_root)
+            .expect("lock-contention status");
+        let held_locks =
+            acquire_cli_mailbox_mutation_locks(&database_url, Some(fixture.storage_root.as_path()))
+                .expect("hold isolated mailbox locks");
+        let error = call_with_fixture_env(&fixture, || {
+            handle_doctor_historical_artifact_reconcile(
+                false,
+                true,
+                true,
+                identity,
+                vec!["WhiteDeer".to_string()],
+                vec![41],
+                Some(digest),
+            )
+        })
+        .expect_err("second exclusive mailbox lock must refuse");
+        drop(held_locks);
+        assert!(
+            error.to_string().contains("lock") || error.to_string().contains("busy"),
+            "unexpected lock refusal: {error}"
+        );
+        assert!(!fixture.doctor_root.exists());
+        assert_eq!(sqlite_family_snapshot(&fixture.db_path), sqlite_before);
+        assert_eq!(
+            archive_recovery_git_status_snapshot(&fixture.storage_root)
+                .expect("status after lock refusal"),
+            git_before
+        );
+        for action in plan.actions {
+            assert!(!fixture.storage_root.join(action.path).exists());
+        }
+    }
+
+    #[test]
+    fn historical_partial_failure_is_external_sealed_and_zero_write() {
+        let fixture = historical_fixture();
+        let run_id = "historical-artifact-reconcile-partial-fixture";
+        let db_before = sqlite_family_snapshot(&fixture.db_path);
+        let git_before = archive_recovery_git_status_snapshot(&fixture.storage_root)
+            .expect("partial status before");
+        let ctx = historical_artifact_run_context(&fixture.storage_root, run_id)
+            .expect("partial run context");
+        let error = historical_artifact_partial_failure(
+            &ctx,
+            run_id,
+            &"a".repeat(64),
+            "forced-test-phase",
+            2,
+            "forced fixture failure",
+        );
+        assert!(error.to_string().contains("sealed partial"));
+        let partial_path = fixture
+            .doctor_root
+            .join("runs")
+            .join(run_id)
+            .join("recovery-evidence/partial.json");
+        let partial: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&partial_path).expect("read partial receipt"))
+                .expect("parse partial receipt");
+        assert_eq!(partial["phase"], "forced-test-phase");
+        assert_eq!(partial["completed_actions"], 2);
+        assert_eq!(partial["db_writes"], 0);
+        assert_eq!(partial["provider_writes"], 0);
+        assert_eq!(partial["service_writes"], 0);
+        assert_eq!(partial["audit_writes"], 0);
+        assert!(!partial.to_string().contains("forced fixture failure"));
+        assert!(matches!(
+            doctor::manifest::verify_run_manifest_default(
+                &fixture.doctor_root.join("runs").join(run_id),
+                run_id,
+            ),
+            doctor::manifest::ManifestVerdict::Verified
+        ));
+        assert_eq!(sqlite_family_snapshot(&fixture.db_path), db_before);
+        assert_eq!(
+            archive_recovery_git_status_snapshot(&fixture.storage_root)
+                .expect("partial status after"),
+            git_before
+        );
     }
 
     #[test]
