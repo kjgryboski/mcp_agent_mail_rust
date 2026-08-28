@@ -81933,6 +81933,8 @@ struct HistoricalArtifactTerminalReceipt {
     db_writes: u8,
     provider_writes: u8,
     service_writes: u8,
+    #[serde(default)]
+    audit_writes: u8,
     created_at: String,
 }
 
@@ -81960,6 +81962,8 @@ struct HistoricalArtifactUndoTerminalReceipt {
     db_writes: u8,
     provider_writes: u8,
     service_writes: u8,
+    #[serde(default)]
+    audit_writes: u8,
     created_at: String,
 }
 
@@ -82022,6 +82026,27 @@ fn historical_artifact_safe_component(kind: &str, value: &str) -> CliResult<()> 
     Ok(())
 }
 
+#[cfg(windows)]
+fn historical_windows_attributes_are_reparse(attributes: u32) -> bool {
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+fn historical_metadata_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        historical_windows_attributes_are_reparse(metadata.file_attributes())
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 fn historical_artifact_require_safe_parent_prefix(root: &Path, target: &Path) -> CliResult<()> {
     let parent = target.parent().ok_or_else(|| {
         CliError::InvalidArgument("historical artifact target has no parent".to_string())
@@ -82032,7 +82057,8 @@ fn historical_artifact_require_safe_parent_prefix(root: &Path, target: &Path) ->
         )
     })?;
     let root_metadata = std::fs::symlink_metadata(root)?;
-    if root_metadata.file_type().is_symlink() || !root_metadata.file_type().is_dir() {
+    if historical_metadata_is_link_or_reparse(&root_metadata) || !root_metadata.file_type().is_dir()
+    {
         return Err(CliError::InvalidArgument(
             "canonical project archive root must be one real directory".to_string(),
         ));
@@ -82055,8 +82081,9 @@ fn historical_artifact_require_safe_parent_prefix(root: &Path, target: &Path) ->
             continue;
         }
         match std::fs::symlink_metadata(&cursor) {
-            Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
-            }
+            Ok(metadata)
+                if metadata.file_type().is_dir()
+                    && !historical_metadata_is_link_or_reparse(&metadata) => {}
             Ok(_) => {
                 return Err(CliError::InvalidArgument(
                     "historical artifact parent chain contains a non-directory or symlink"
@@ -82094,6 +82121,8 @@ fn historical_artifact_mode_matches(path: &Path, expected: u32) -> CliResult<boo
     }
     #[cfg(not(unix))]
     {
+        // Non-Unix filesystems do not expose a portable POSIX mode. Exact
+        // bytes plus the regular-file/reparse-point checks remain mandatory.
         let _ = (path, expected);
         Ok(true)
     }
@@ -82127,7 +82156,10 @@ fn historical_artifact_inspect_target(
                 content,
             });
         }
-        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+        Ok(metadata)
+            if metadata.file_type().is_file()
+                && !historical_metadata_is_link_or_reparse(&metadata) =>
+        {
             let observed_sha256 = archive_recovery_file_sha256(target)?;
             let mode = archive_recovery_file_mode(target)?;
             if observed_sha256 != content_sha256
@@ -82422,6 +82454,38 @@ fn historical_artifact_plan(
             )));
         }
         let agent = matches[0];
+        let agent_id = agent.id.ok_or_else(|| {
+            CliError::InvalidArgument(format!(
+                "agent {agent_name} lacks a durable SQLite identity"
+            ))
+        })?;
+        let deregistration_rows = opened
+            .conn
+            .query_sync(
+                &format!(
+                    "SELECT deregistered_at FROM agent_deregistrations WHERE agent_id = {agent_id}"
+                ),
+                &[],
+            )
+            .map_err(|error| {
+                CliError::Other(format!(
+                    "cannot read agent {agent_name} deregistration authority: {error}"
+                ))
+            })?;
+        if deregistration_rows.len() > 1 {
+            return Err(CliError::InvalidArgument(format!(
+                "agent {agent_name} has ambiguous deregistration authority"
+            )));
+        }
+        let deregistered_at = deregistration_rows
+            .first()
+            .map(|row| row.get_named::<i64>("deregistered_at"))
+            .transpose()
+            .map_err(|error| {
+                CliError::Other(format!(
+                    "cannot decode agent {agent_name} deregistration authority: {error}"
+                ))
+            })?;
         let profile = serde_json::json!({
             "name": agent.name,
             "program": agent.program,
@@ -82433,12 +82497,13 @@ fn historical_artifact_plan(
             "contact_policy": agent.contact_policy,
             "reaper_exempt": agent.reaper_exempt != 0,
             "retired_at": agent.retired_at.map(mcp_agent_mail_db::micros_to_iso),
-            "deregistered_at": serde_json::Value::Null,
+            "deregistered_at": deregistered_at.map(mcp_agent_mail_db::micros_to_iso),
         });
         let authority = serde_json::json!({
-            "id": agent.id,
+            "id": agent_id,
             "project_id": agent.project_id,
             "profile": profile,
+            "deregistered_at_micros": deregistered_at,
         });
         let db_row_sha256 = archive_recovery_sha256(
             &serde_json::to_vec(&authority).map_err(|error| CliError::Other(error.to_string()))?,
@@ -82823,6 +82888,25 @@ fn historical_require_plan_git_snapshot(
     historical_artifact_require_index_at_head(&repository)
 }
 
+fn historical_require_commit_readback(
+    expected_head: &str,
+    expected_tree: &str,
+    observed_head: Option<&str>,
+    observed_tree: Option<&str>,
+) -> CliResult<()> {
+    if observed_head != Some(expected_head) {
+        return Err(CliError::Other(
+            "strict Git commit HEAD readback differs from its exact receipt".to_string(),
+        ));
+    }
+    if observed_tree != Some(expected_tree) {
+        return Err(CliError::Other(
+            "strict Git commit tree readback differs from its receipt".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn historical_strict_allowlist_commit(
     storage_root: &Path,
@@ -83001,6 +83085,39 @@ fn historical_strict_allowlist_commit(
     transaction
         .commit()
         .map_err(|error| CliError::Other(format!("cannot advance strict Git ref: {error}")))?;
+    drop(transaction);
+
+    // Re-lock the admitted ref before aligning the real index. If another Git
+    // writer advanced HEAD after our first transaction, refuse before touching
+    // the index rather than manufacturing a mismatched HEAD/index pair.
+    let mut readback_transaction = repository.transaction().map_err(|error| {
+        CliError::Other(format!(
+            "cannot start strict Git readback transaction: {error}"
+        ))
+    })?;
+    readback_transaction.lock_ref(&refname).map_err(|error| {
+        CliError::Other(format!(
+            "cannot lock strict Git ref for exact readback: {error}"
+        ))
+    })?;
+    let locked_commit = repository
+        .head()
+        .and_then(|reference| reference.peel_to_commit())
+        .map_err(|error| {
+            CliError::Other(format!(
+                "cannot resolve strict Git HEAD for exact readback: {error}"
+            ))
+        })?;
+    let commit_oid_text = commit_oid.to_string();
+    let tree_oid_text = tree_oid.to_string();
+    let locked_head_text = locked_commit.id().to_string();
+    let locked_tree_text = locked_commit.tree_id().to_string();
+    historical_require_commit_readback(
+        &commit_oid_text,
+        &tree_oid_text,
+        Some(&locked_head_text),
+        Some(&locked_tree_text),
+    )?;
 
     let mut real_index = repository
         .index()
@@ -83038,13 +83155,14 @@ fn historical_strict_allowlist_commit(
             "strict Git commit changed status outside the reviewed allowlist".to_string(),
         ));
     }
-    let (_, observed_tree, observed_index) = archive_recovery_git_snapshot(storage_root)?;
-    let tree_oid_text = tree_oid.to_string();
-    if observed_tree.as_deref() != Some(tree_oid_text.as_str()) {
-        return Err(CliError::Other(
-            "strict Git commit tree readback differs from its receipt".to_string(),
-        ));
-    }
+    let (observed_head, observed_tree, observed_index) =
+        archive_recovery_git_snapshot(storage_root)?;
+    historical_require_commit_readback(
+        &commit_oid_text,
+        &tree_oid_text,
+        observed_head.as_deref(),
+        observed_tree.as_deref(),
+    )?;
     let commit_index_sha256 = observed_index.ok_or_else(|| {
         CliError::Other("strict Git commit cannot read back its index digest".to_string())
     })?;
@@ -83056,8 +83174,8 @@ fn historical_strict_allowlist_commit(
         },
         parent_head: expected_head.to_string(),
         parent_tree: expected_tree.to_string(),
-        commit_head: commit_oid.to_string(),
-        commit_tree: tree_oid.to_string(),
+        commit_head: commit_oid_text,
+        commit_tree: tree_oid_text,
         parent_index_sha256: expected_index_sha256.to_string(),
         commit_index_sha256,
         allowed_paths: paths,
@@ -83332,6 +83450,7 @@ fn handle_doctor_historical_artifact_reconcile(
             db_writes: 0,
             provider_writes: 0,
             service_writes: 0,
+            audit_writes: 0,
             created_at: chrono::Utc::now().to_rfc3339(),
         };
         doctor::mutate::mutate(
@@ -83490,6 +83609,7 @@ fn historical_artifact_read_sealed_run(
         || terminal.db_writes != 0
         || terminal.provider_writes != 0
         || terminal.service_writes != 0
+        || terminal.audit_writes != 0
     {
         return Err(CliError::InvalidArgument(
             "historical reconciliation receipts are internally inconsistent".to_string(),
@@ -83670,6 +83790,7 @@ fn handle_doctor_historical_artifact_reconcile_undo(
             db_writes: 0,
             provider_writes: 0,
             service_writes: 0,
+            audit_writes: 0,
             created_at: chrono::Utc::now().to_rfc3339(),
         };
         doctor::mutate::mutate(
@@ -83702,6 +83823,7 @@ fn handle_doctor_historical_artifact_reconcile_undo(
             "db_writes": 0,
             "provider_writes": 0,
             "service_writes": 0,
+            "audit_writes": 0,
             "note": "Created bytes are retained inside the sealed undo run; no file deletion or broad Git cleanup occurred."
         });
         doctor::mutate::mutate(
@@ -83749,6 +83871,7 @@ fn handle_doctor_historical_artifact_reconcile_undo(
         "db_writes": 0,
         "provider_writes": 0,
         "service_writes": 0,
+        "audit_writes": 0,
         "absolute_paths_emitted": false,
     });
     if json {
@@ -83840,6 +83963,7 @@ mod historical_artifact_reconcile_tests {
         let statements = [
             "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL)",
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, program TEXT NOT NULL, model TEXT NOT NULL, task_description TEXT NOT NULL, inception_ts INTEGER NOT NULL, last_active_ts INTEGER NOT NULL, attachments_policy TEXT NOT NULL, contact_policy TEXT NOT NULL, reaper_exempt INTEGER NOT NULL, registration_token TEXT, retired_at INTEGER)",
+            "CREATE TABLE agent_deregistrations (agent_id INTEGER PRIMARY KEY, deregistered_at INTEGER NOT NULL)",
             "CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, path_pattern TEXT NOT NULL, exclusive INTEGER NOT NULL, reason TEXT NOT NULL, created_ts INTEGER NOT NULL, expires_ts INTEGER NOT NULL, released_ts INTEGER)",
             "CREATE TABLE file_reservation_releases (reservation_id INTEGER PRIMARY KEY, released_ts INTEGER NOT NULL)",
             "CREATE TABLE db_identity (singleton INTEGER PRIMARY KEY, generation_id TEXT NOT NULL)",
@@ -83854,6 +83978,7 @@ mod historical_artifact_reconcile_tests {
                 "INSERT INTO projects (id, slug, human_key) VALUES (1, 'canonical', '{escaped_identity}')"
             ),
             "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, registration_token, retired_at) VALUES (1, 1, 'WhiteDeer', 'codex', 'gpt-test', 'historical fixture', 1700000000000000, 1700000100000000, 'auto', 'auto', 0, 'super-secret-token', NULL)".to_string(),
+            "INSERT INTO agent_deregistrations (agent_id, deregistered_at) VALUES (1, 1700000500000000)".to_string(),
             "INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) VALUES (41, 1, 1, 'src/exact.rs', 1, 'historical fixture', 1700000200000000, 1700000300000000, NULL)".to_string(),
             "INSERT INTO file_reservation_releases (reservation_id, released_ts) VALUES (41, 1700000400000000)".to_string(),
             format!(
@@ -83938,8 +84063,36 @@ mod historical_artifact_reconcile_tests {
         (result, output)
     }
 
+    fn sqlite_family_snapshot(db_path: &Path) -> Vec<(String, Option<(u64, String)>)> {
+        ["", "-wal", "-shm"]
+            .into_iter()
+            .map(|suffix| {
+                let path = if suffix.is_empty() {
+                    db_path.to_path_buf()
+                } else {
+                    let mut name = db_path
+                        .file_name()
+                        .expect("fixture DB filename")
+                        .to_os_string();
+                    name.push(suffix);
+                    db_path.with_file_name(name)
+                };
+                let state = match std::fs::symlink_metadata(&path) {
+                    Ok(metadata) => Some((
+                        metadata.len(),
+                        archive_recovery_file_sha256(&path).expect("SQLite family hash"),
+                    )),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => panic!("cannot inspect {}: {error}", path.display()),
+                };
+                (suffix.to_string(), state)
+            })
+            .collect()
+    }
+
     #[test]
     fn historical_plan_digest_is_ordered_redacted_and_content_bound() {
+        let private_identity = "/private/mailbox/canonical-project";
         let action = HistoricalArtifactAction {
             kind: HistoricalArtifactKind::AgentProfile,
             selector: HistoricalArtifactSelector::Agent {
@@ -83955,7 +84108,7 @@ mod historical_artifact_reconcile_tests {
         };
         let plan = HistoricalArtifactPlan {
             schema_version: "historical-artifact-reconcile-plan-v1".to_string(),
-            canonical_identity_sha256: archive_recovery_sha256(b"/canonical"),
+            canonical_identity_sha256: archive_recovery_sha256(private_identity.as_bytes()),
             canonical_project_slug: "canonical".to_string(),
             selected_agents: vec!["WhiteDeer".to_string()],
             selected_reservation_ids: Vec::new(),
@@ -83975,8 +84128,40 @@ mod historical_artifact_reconcile_tests {
         );
         let serialized = serde_json::to_string(&plan).expect("serialized redacted plan");
         assert!(!serialized.contains("secret payload"));
-        assert!(!serialized.contains("/canonical"));
+        assert!(!serialized.contains(private_identity));
         assert!(serialized.contains("content_sha256"));
+    }
+
+    #[test]
+    fn historical_commit_readback_refuses_a_concurrent_head_advance() {
+        let expected_head = "1".repeat(40);
+        let expected_tree = "2".repeat(40);
+        assert!(
+            historical_require_commit_readback(
+                &expected_head,
+                &expected_tree,
+                Some(&expected_head),
+                Some(&expected_tree),
+            )
+            .is_ok()
+        );
+        let advanced_head = "3".repeat(40);
+        let error = historical_require_commit_readback(
+            &expected_head,
+            &expected_tree,
+            Some(&advanced_head),
+            Some(&expected_tree),
+        )
+        .expect_err("concurrent HEAD advance must invalidate exact receipt");
+        assert!(error.to_string().contains("HEAD readback"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn historical_windows_reparse_attribute_is_refused() {
+        assert!(!historical_windows_attributes_are_reparse(0));
+        assert!(historical_windows_attributes_are_reparse(0x0400));
+        assert!(historical_windows_attributes_are_reparse(0x0400 | 0x0010));
     }
 
     #[test]
@@ -84086,6 +84271,7 @@ mod historical_artifact_reconcile_tests {
         let database_url = fixture.database_url();
         let identity = fixture.canonical_identity.display().to_string();
         let db_before = archive_recovery_file_sha256(&fixture.db_path).expect("DB before hash");
+        let sqlite_family_before = sqlite_family_snapshot(&fixture.db_path);
         let git_before =
             archive_recovery_git_snapshot(&fixture.storage_root).expect("Git before snapshot");
         let status_before = archive_recovery_git_status_snapshot(&fixture.storage_root)
@@ -84103,6 +84289,10 @@ mod historical_artifact_reconcile_tests {
         assert_eq!(
             archive_recovery_file_sha256(&fixture.db_path).expect("DB after active refusal"),
             db_before
+        );
+        assert_eq!(
+            sqlite_family_snapshot(&fixture.db_path),
+            sqlite_family_before
         );
 
         let plan = historical_artifact_plan(
@@ -84170,6 +84360,17 @@ mod historical_artifact_reconcile_tests {
             archive_recovery_git_snapshot(&fixture.storage_root).expect("Git after preview"),
             git_before
         );
+        assert_eq!(
+            archive_recovery_git_status_snapshot(&fixture.storage_root)
+                .expect("status after preview")
+                .expect("Git status after preview"),
+            status_before
+        );
+        assert_eq!(
+            sqlite_family_snapshot(&fixture.db_path),
+            sqlite_family_before,
+            "preview changed the SQLite main/WAL/SHM family"
+        );
 
         let unrelated = fixture.storage_root.join("projects/unrelated-pending.txt");
         std::fs::write(&unrelated, b"unrelated state\n").expect("unrelated dirty fixture");
@@ -84225,10 +84426,15 @@ mod historical_artifact_reconcile_tests {
         assert_eq!(applied["db_writes"], 0);
         assert_eq!(applied["provider_writes"], 0);
         assert_eq!(applied["service_writes"], 0);
+        assert_eq!(applied["audit_writes"], 0);
         assert!(unrelated.is_file(), "unrelated dirt was not preserved");
         assert_eq!(
             archive_recovery_file_sha256(&fixture.db_path).expect("DB after apply"),
             db_before
+        );
+        assert_eq!(
+            sqlite_family_snapshot(&fixture.db_path),
+            sqlite_family_before
         );
         let profile_path = fixture
             .storage_root
@@ -84252,6 +84458,13 @@ mod historical_artifact_reconcile_tests {
         let profile_text = std::fs::read_to_string(&profile_path).expect("profile readback");
         assert!(!profile_text.contains("registration_token"));
         assert!(!profile_text.contains("super-secret-token"));
+        let profile_json: serde_json::Value =
+            serde_json::from_str(&profile_text).expect("profile JSON readback");
+        assert_eq!(
+            profile_json["deregistered_at"],
+            serde_json::json!(mcp_agent_mail_db::micros_to_iso(1_700_000_500_000_000)),
+            "profile must preserve durable deregistration authority"
+        );
         let reservation_text = std::fs::read_to_string(&stable_path).expect("reservation readback");
         assert!(reservation_text.contains("released_ts"));
         assert!(reservation_text.contains("a1b2c3d4"));
@@ -84261,6 +84474,7 @@ mod historical_artifact_reconcile_tests {
             .head()
             .and_then(|head| head.peel_to_commit())
             .expect("applied head");
+        let applied_head_id = applied_head.id().to_string();
         let applied_parent = applied_head.parent(0).expect("applied parent");
         let applied_diff = applied_repo
             .diff_tree_to_tree(
@@ -84334,6 +84548,49 @@ mod historical_artifact_reconcile_tests {
             .to_string();
         assert_eq!(undone["artifacts_preserved"], 3);
         assert_eq!(undone["db_writes"], 0);
+        assert_eq!(undone["provider_writes"], 0);
+        assert_eq!(undone["service_writes"], 0);
+        assert_eq!(undone["audit_writes"], 0);
+        let undo_receipt: HistoricalArtifactGitReceipt =
+            serde_json::from_value(undone["git_receipt"].clone()).expect("undo Git receipt JSON");
+        assert_eq!(undo_receipt.operation, "delete");
+        assert_eq!(undo_receipt.parent_head, applied_head_id);
+        assert_eq!(
+            undo_receipt
+                .allowed_paths
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            expected_paths
+        );
+        let undo_repo = git2::Repository::open(&fixture.storage_root).expect("undo repo");
+        let undo_head = undo_repo
+            .head()
+            .and_then(|head| head.peel_to_commit())
+            .expect("undo head");
+        assert_eq!(undo_head.id().to_string(), undo_receipt.commit_head);
+        assert_eq!(undo_head.tree_id().to_string(), undo_receipt.commit_tree);
+        let undo_parent = undo_head.parent(0).expect("undo parent");
+        let undo_diff = undo_repo
+            .diff_tree_to_tree(
+                Some(&undo_parent.tree().expect("undo parent tree")),
+                Some(&undo_head.tree().expect("undo tree")),
+                None,
+            )
+            .expect("undo diff");
+        assert!(
+            undo_diff
+                .deltas()
+                .all(|delta| delta.status() == git2::Delta::Deleted),
+            "undo commit contained a non-deletion delta"
+        );
+        let undo_paths = undo_diff
+            .deltas()
+            .filter_map(|delta| delta.old_file().path())
+            .filter_map(Path::to_str)
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(undo_paths, expected_paths);
         for action in &dirty_plan.actions {
             let live = fixture.storage_root.join(Path::new(&action.path));
             assert!(!live.exists(), "undo left live artifact: {}", action.path);
@@ -84354,6 +84611,10 @@ mod historical_artifact_reconcile_tests {
         assert_eq!(
             archive_recovery_file_sha256(&fixture.db_path).expect("DB after undo"),
             db_before
+        );
+        assert_eq!(
+            sqlite_family_snapshot(&fixture.db_path),
+            sqlite_family_before
         );
         assert_eq!(
             archive_recovery_git_status_snapshot(&fixture.storage_root)
