@@ -84741,22 +84741,25 @@ mod historical_artifact_reconcile_tests {
         let db_before = sqlite_family_snapshot(&fixture.db_path);
         let git_before = archive_recovery_git_status_snapshot(&fixture.storage_root)
             .expect("partial status before");
-        let ctx = historical_artifact_run_context(&fixture.storage_root, run_id)
-            .expect("partial run context");
-        let error = historical_artifact_partial_failure(
-            &ctx,
-            run_id,
-            &"a".repeat(64),
-            "forced-test-phase",
-            2,
-            "forced fixture failure",
+        let (error, run_dir) = call_with_fixture_env(&fixture, || {
+            let ctx = historical_artifact_run_context(&fixture.storage_root, run_id)
+                .expect("partial run context");
+            let run_dir = ctx.run_dir.clone();
+            let error = historical_artifact_partial_failure(
+                &ctx,
+                run_id,
+                &"a".repeat(64),
+                "forced-test-phase",
+                2,
+                "forced fixture failure",
+            );
+            (error, run_dir)
+        });
+        assert!(
+            error.to_string().contains("sealed partial"),
+            "unexpected partial error: {error}"
         );
-        assert!(error.to_string().contains("sealed partial"));
-        let partial_path = fixture
-            .doctor_root
-            .join("runs")
-            .join(run_id)
-            .join("recovery-evidence/partial.json");
+        let partial_path = run_dir.join("recovery-evidence/partial.json");
         let partial: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&partial_path).expect("read partial receipt"))
                 .expect("parse partial receipt");
@@ -84767,13 +84770,11 @@ mod historical_artifact_reconcile_tests {
         assert_eq!(partial["service_writes"], 0);
         assert_eq!(partial["audit_writes"], 0);
         assert!(!partial.to_string().contains("forced fixture failure"));
-        assert!(matches!(
-            doctor::manifest::verify_run_manifest_default(
-                &fixture.doctor_root.join("runs").join(run_id),
-                run_id,
-            ),
-            doctor::manifest::ManifestVerdict::Verified
-        ));
+        let verdict = doctor::manifest::verify_run_manifest_default(&run_dir, run_id);
+        assert!(
+            matches!(verdict, doctor::manifest::ManifestVerdict::Verified),
+            "partial manifest verdict: {verdict:?}"
+        );
         assert_eq!(sqlite_family_snapshot(&fixture.db_path), db_before);
         assert_eq!(
             archive_recovery_git_status_snapshot(&fixture.storage_root)
