@@ -81896,6 +81896,7 @@ mod archive_recovery_tests {
         index
             .add_path(Path::new(".gitignore"))
             .expect("stage mailbox activity-lock ignore rule");
+        index.write().expect("persist fixture index");
         let tree_id = index.write_tree().expect("fixture tree");
         let tree = repo.find_tree(tree_id).expect("fixture tree object");
         let signature = git2::Signature::now("Archive Recovery Test", "test@example.invalid")
@@ -82099,6 +82100,7 @@ mod archive_recovery_tests {
         ignore_index
             .add_path(Path::new(".gitignore"))
             .expect("stage fixture ignore only");
+        ignore_index.write().expect("persist fixture ignore index");
         let ignore_tree = repo
             .find_tree(ignore_index.write_tree().expect("ignore tree"))
             .expect("ignore tree object");
@@ -82463,6 +82465,9 @@ mod archive_recovery_tests {
         tracked_loser_index
             .add_path(&loser_relative)
             .expect("stage tracked-loser fixture");
+        tracked_loser_index
+            .write()
+            .expect("persist tracked-loser fixture index");
         let tracked_loser_tree = repo
             .find_tree(
                 tracked_loser_index
