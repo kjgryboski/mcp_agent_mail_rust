@@ -82011,6 +82011,7 @@ mod archive_recovery_tests {
             },
         );
         let preview_stdout = preview_capture.drain_to_string();
+        drop(preview_capture);
         assert!(
             preview_result.is_ok(),
             "handler preview failed: {preview_result:?}"
@@ -82222,6 +82223,7 @@ mod archive_recovery_tests {
             },
         );
         let apply_stdout = apply_capture.drain_to_string();
+        drop(apply_capture);
         assert!(
             apply_result.is_ok(),
             "handler apply failed: {apply_result:?}"
@@ -82377,6 +82379,7 @@ mod archive_recovery_tests {
             },
         );
         let external_preview_stdout = external_preview_capture.drain_to_string();
+        drop(external_preview_capture);
         assert!(
             external_preview.is_ok(),
             "external preview: {external_preview:?}"
@@ -82412,6 +82415,7 @@ mod archive_recovery_tests {
             },
         );
         let external_apply_stdout = external_apply_capture.drain_to_string();
+        drop(external_apply_capture);
         assert!(external_apply.is_ok(), "external apply: {external_apply:?}");
         let external_apply_json = extract_json_blocks(&external_apply_stdout)
             .into_iter()
