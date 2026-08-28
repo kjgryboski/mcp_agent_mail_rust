@@ -79809,7 +79809,19 @@ struct ArchiveRecoveryPlan {
     expected_git_head: Option<String>,
     expected_git_tree: Option<String>,
     expected_git_index_sha256: Option<String>,
+    /// A redacted commitment to the *complete* pre-action Git status.  The
+    /// status paths themselves stay process-local because a shared mailbox can
+    /// contain unrelated project evidence.  Apply recomputes this exact
+    /// commitment under the mailbox lock and post-apply proves that the only
+    /// removed entries are the explicitly selected untracked losers.
+    expected_git_status: Option<ArchiveRecoveryGitStatusSnapshot>,
     groups: Vec<ArchiveRecoveryGroup>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ArchiveRecoveryGitStatusSnapshot {
+    entry_count: usize,
+    sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -79893,6 +79905,8 @@ enum ArchiveRecoveryGitReceipt {
         head: String,
         tree: String,
         index_sha256: String,
+        pre_status: ArchiveRecoveryGitStatusSnapshot,
+        post_status: ArchiveRecoveryGitStatusSnapshot,
     },
 }
 
@@ -80324,6 +80338,7 @@ fn archive_recovery_plan(
     }
     let (expected_git_head, expected_git_tree, expected_git_index_sha256) =
         archive_recovery_git_snapshot(storage_root)?;
+    let expected_git_status = archive_recovery_git_status_snapshot(storage_root)?;
     Ok(ArchiveRecoveryPlan {
         schema_version: "archive-recovery-plan-v1".to_string(),
         canonical_identity_sha256: archive_recovery_sha256(canonical_identity.as_bytes()),
@@ -80333,6 +80348,7 @@ fn archive_recovery_plan(
         expected_git_head,
         expected_git_tree,
         expected_git_index_sha256,
+        expected_git_status,
         groups,
     })
 }
@@ -80658,17 +80674,18 @@ fn archive_recovery_require_safe_doctor_root(
 }
 
 /// Validate the immutable Git portion of an admitted plan without staging or
-/// writing.  This deliberately rejects *any* dirty index/worktree state: an
-/// exact-path recovery must never accidentally absorb an operator's changes.
+/// writing. The companion status-map check permits reviewed unrelated dirt,
+/// but this immutable snapshot still prevents ref/tree/index drift.
 fn archive_recovery_no_tracked_tree_change_receipt(
     storage_root: &Path,
     plan: &ArchiveRecoveryPlan,
-    expected_untracked_paths: &BTreeSet<String>,
+    expected_post_status: &BTreeMap<String, u32>,
 ) -> CliResult<ArchiveRecoveryGitReceipt> {
-    let (Some(expected_head), Some(expected_tree), Some(expected_index)) = (
+    let (Some(expected_head), Some(expected_tree), Some(expected_index), Some(pre_status)) = (
         plan.expected_git_head.as_ref(),
         plan.expected_git_tree.as_ref(),
         plan.expected_git_index_sha256.as_ref(),
+        plan.expected_git_status.as_ref(),
     ) else {
         return Err(CliError::InvalidArgument(
             "untracked-only recovery requires an admitted canonical Git snapshot".to_string(),
@@ -80679,13 +80696,36 @@ fn archive_recovery_no_tracked_tree_change_receipt(
             "cannot reopen canonical mailbox Git worktree: {error}"
         ))
     })?;
-    let observed = archive_recovery_git_status_paths(&repository)?;
-    if observed != *expected_untracked_paths {
+    let observed = archive_recovery_git_status_entries(&repository)?;
+    if observed != *expected_post_status {
         return Err(CliError::Other(
-            "archive recovery Git status differs from its exact approved untracked evidence set"
+            "archive recovery changed Git status outside its explicitly selected untracked evidence paths"
                 .to_string(),
         ));
     }
+    archive_recovery_require_admitted_git_snapshot(storage_root, plan)?;
+    Ok(ArchiveRecoveryGitReceipt::NoTrackedTreeChange {
+        head: expected_head.clone(),
+        tree: expected_tree.clone(),
+        index_sha256: expected_index.clone(),
+        pre_status: pre_status.clone(),
+        post_status: archive_recovery_git_status_snapshot_from_entries(&observed)?,
+    })
+}
+
+fn archive_recovery_require_admitted_git_snapshot(
+    storage_root: &Path,
+    plan: &ArchiveRecoveryPlan,
+) -> CliResult<()> {
+    let (Some(expected_head), Some(expected_tree), Some(expected_index)) = (
+        plan.expected_git_head.as_ref(),
+        plan.expected_git_tree.as_ref(),
+        plan.expected_git_index_sha256.as_ref(),
+    ) else {
+        return Err(CliError::InvalidArgument(
+            "untracked-only recovery requires an admitted canonical Git snapshot".to_string(),
+        ));
+    };
     let (head, tree, index) = archive_recovery_git_snapshot(storage_root)?;
     if head.as_deref() != Some(expected_head)
         || tree.as_deref() != Some(expected_tree)
@@ -80696,48 +80736,80 @@ fn archive_recovery_no_tracked_tree_change_receipt(
                 .to_string(),
         ));
     }
-    Ok(ArchiveRecoveryGitReceipt::NoTrackedTreeChange {
-        head: expected_head.clone(),
-        tree: expected_tree.clone(),
-        index_sha256: expected_index.clone(),
-    })
+    Ok(())
 }
 
-fn archive_recovery_git_status_paths(repository: &git2::Repository) -> CliResult<BTreeSet<String>> {
+fn archive_recovery_require_git_status_snapshot(
+    storage_root: &Path,
+    expected: &ArchiveRecoveryGitStatusSnapshot,
+    phase: &str,
+) -> CliResult<()> {
+    let observed = archive_recovery_git_status_snapshot(storage_root)?.ok_or_else(|| {
+        CliError::InvalidArgument(
+            "untracked-only recovery requires a canonical mailbox Git worktree".to_string(),
+        )
+    })?;
+    if &observed != expected {
+        return Err(CliError::InvalidArgument(format!(
+            "archive recovery Git status differs from the sealed {phase} status commitment"
+        )));
+    }
+    Ok(())
+}
+
+/// The complete status map is intentionally process-local.  Receipts carry
+/// only a deterministic digest and count, so shared-store unrelated paths are
+/// protected from accidental mutation without being disclosed to callers.
+fn archive_recovery_git_status_entries(
+    repository: &git2::Repository,
+) -> CliResult<BTreeMap<String, u32>> {
     let mut options = git2::StatusOptions::new();
     options.include_untracked(true).recurse_untracked_dirs(true);
-    let mut paths = BTreeSet::new();
+    let mut entries = BTreeMap::new();
     for entry in repository
         .statuses(Some(&mut options))
         .map_err(|error| CliError::Other(error.to_string()))?
         .iter()
     {
-        let status = entry.status();
-        if status.is_index_new()
-            || status.is_index_modified()
-            || status.is_index_deleted()
-            || status.is_index_renamed()
-            || status.is_index_typechange()
-            || !status.is_wt_new()
-        {
-            return Err(CliError::InvalidArgument(
-                "archive recovery refuses staged or modified mailbox Git state".to_string(),
-            ));
-        }
         let path = entry.path().map_err(|_| {
             CliError::InvalidArgument(
                 "archive recovery encountered an unaddressable mailbox Git status path".to_string(),
             )
         })?;
-        paths.insert(path.replace('\\', "/"));
+        entries.insert(path.replace('\\', "/"), entry.status().bits());
     }
-    Ok(paths)
+    Ok(entries)
+}
+
+fn archive_recovery_git_status_snapshot_from_entries(
+    entries: &BTreeMap<String, u32>,
+) -> CliResult<ArchiveRecoveryGitStatusSnapshot> {
+    let bytes = serde_json::to_vec(entries).map_err(|error| {
+        CliError::Other(format!(
+            "failed to serialize redacted Git status commitment: {error}"
+        ))
+    })?;
+    Ok(ArchiveRecoveryGitStatusSnapshot {
+        entry_count: entries.len(),
+        sha256: archive_recovery_sha256(&bytes),
+    })
+}
+
+fn archive_recovery_git_status_snapshot(
+    storage_root: &Path,
+) -> CliResult<Option<ArchiveRecoveryGitStatusSnapshot>> {
+    let Ok(repository) = git2::Repository::open(storage_root) else {
+        return Ok(None);
+    };
+    Ok(Some(archive_recovery_git_status_snapshot_from_entries(
+        &archive_recovery_git_status_entries(&repository)?,
+    )?))
 }
 
 fn archive_recovery_require_untracked_only_plan(
     storage_root: &Path,
     plan: &ArchiveRecoveryPlan,
-) -> CliResult<BTreeSet<String>> {
+) -> CliResult<BTreeMap<String, u32>> {
     for group in &plan.groups {
         if !group.winner.evidence.git_head_tracks_exact_bytes
             || group.winner.git_parent_blob.is_none()
@@ -80762,20 +80834,52 @@ fn archive_recovery_require_untracked_only_plan(
             "cannot open canonical mailbox Git worktree: {error}"
         ))
     })?;
-    let expected_untracked_paths = plan
+    let selected_losers = plan
         .groups
         .iter()
         .flat_map(|group| group.evidence_preserved.iter())
         .map(|loser| loser.path.replace('\\', "/"))
         .collect::<BTreeSet<_>>();
-    let observed = archive_recovery_git_status_paths(&repository)?;
-    if observed != expected_untracked_paths {
+    let observed = archive_recovery_git_status_entries(&repository)?;
+    let observed_snapshot = archive_recovery_git_status_snapshot_from_entries(&observed)?;
+    if plan.expected_git_status.as_ref() != Some(&observed_snapshot) {
         return Err(CliError::InvalidArgument(
-            "archive recovery requires mailbox Git status to equal exactly the reviewed untracked evidence paths"
+            "archive recovery Git status differs from the exact reviewed pre-action status"
                 .to_string(),
         ));
     }
-    Ok(expected_untracked_paths)
+    for group in &plan.groups {
+        if observed.contains_key(&group.winner.path) {
+            return Err(CliError::InvalidArgument(
+                "selected recovery winner has Git status and is not a clean exact HEAD artifact"
+                    .to_string(),
+            ));
+        }
+    }
+    for loser in plan
+        .groups
+        .iter()
+        .flat_map(|group| group.evidence_preserved.iter())
+    {
+        if observed.get(&loser.path) != Some(&git2::Status::WT_NEW.bits()) {
+            return Err(CliError::InvalidArgument(
+                "selected recovery loser must be an exact untracked regular file".to_string(),
+            ));
+        }
+        archive_recovery_require_regular_exact(&loser.source_path, &loser.sha256)?;
+    }
+    if selected_losers.len()
+        != plan
+            .groups
+            .iter()
+            .map(|group| group.evidence_preserved.len())
+            .sum::<usize>()
+    {
+        return Err(CliError::InvalidArgument(
+            "archive recovery selected the same untracked path more than once".to_string(),
+        ));
+    }
+    Ok(observed)
 }
 
 fn handle_doctor_archive_recover(
@@ -80878,8 +80982,20 @@ fn handle_doctor_archive_recover(
     };
     if !dry_run {
         archive_recovery_preflight_apply(&config.storage_root, &run_id, &output.plan)?;
-        let _expected_untracked_paths =
+        let pre_status =
             archive_recovery_require_untracked_only_plan(&config.storage_root, &output.plan)?;
+        let selected_losers = output
+            .plan
+            .groups
+            .iter()
+            .flat_map(|group| group.evidence_preserved.iter())
+            .map(|loser| loser.path.replace('\\', "/"))
+            .collect::<BTreeSet<_>>();
+        let expected_post_status = pre_status
+            .iter()
+            .filter(|(path, _)| !selected_losers.contains(*path))
+            .map(|(path, status)| (path.clone(), *status))
+            .collect::<BTreeMap<_, _>>();
         let ctx = archive_recovery_run_context(&config.storage_root, &run_id)?;
         output.run_id = Some(run_id.clone());
         let intent = ArchiveRecoveryIntent {
@@ -80993,7 +81109,7 @@ fn handle_doctor_archive_recover(
         let git_receipt = match archive_recovery_no_tracked_tree_change_receipt(
             &config.storage_root,
             &output.plan,
-            &BTreeSet::new(),
+            &expected_post_status,
         ) {
             Ok(receipt) => receipt,
             Err(error) => {
@@ -81206,9 +81322,21 @@ fn archive_recovery_read_sealed_run(
             head,
             tree,
             index_sha256,
+            pre_status,
+            post_status,
         } if Some(head) == intent.plan.expected_git_head.as_ref()
             && Some(tree) == intent.plan.expected_git_tree.as_ref()
-            && Some(index_sha256) == intent.plan.expected_git_index_sha256.as_ref() => {}
+            && Some(index_sha256) == intent.plan.expected_git_index_sha256.as_ref()
+            && Some(pre_status) == intent.plan.expected_git_status.as_ref()
+            && post_status.entry_count
+                == pre_status.entry_count.saturating_sub(
+                    intent
+                        .plan
+                        .groups
+                        .iter()
+                        .map(|group| group.evidence_preserved.len())
+                        .sum::<usize>(),
+                ) => {}
         ArchiveRecoveryGitReceipt::NoTrackedTreeChange { .. } => {
             return Err(CliError::InvalidArgument(
                 "archive recovery Git receipt does not match the admitted plan".to_string(),
@@ -81364,12 +81492,17 @@ fn handle_doctor_archive_recover_undo(
         .flat_map(|group| group.evidence_preserved.iter())
         .map(|candidate| candidate.path.replace('\\', "/"))
         .collect::<BTreeSet<_>>();
-    // A bounded recovery is deliberately untracked-only. Before undo, the
-    // admitted recovery state must be clean and identical to its receipt.
-    let _pre_undo_receipt = archive_recovery_no_tracked_tree_change_receipt(
+    // Before undo, require the exact status that the sealed recovery terminal
+    // recorded (the original full status minus only selected losers). This
+    // permits unrelated shared-store dirt, but refuses any drift since apply.
+    let sealed_post_status = match &terminal.git_receipt {
+        ArchiveRecoveryGitReceipt::NoTrackedTreeChange { post_status, .. } => post_status,
+    };
+    archive_recovery_require_admitted_git_snapshot(&config.storage_root, &intent.plan)?;
+    archive_recovery_require_git_status_snapshot(
         &config.storage_root,
-        &intent.plan,
-        &BTreeSet::new(),
+        sealed_post_status,
+        "post-apply",
     )?;
     let restore_pairs = archive_recovery_undo_pairs(&config.storage_root, &run_id, &intent.plan)?;
     let mut undo_run_id = None;
@@ -81480,11 +81613,38 @@ fn handle_doctor_archive_recover_undo(
             ));
         }
 
-        let git_receipt = archive_recovery_no_tracked_tree_change_receipt(
-            &config.storage_root,
-            &intent.plan,
-            &expected_original_paths,
-        )
+        let git_receipt = (|| -> CliResult<ArchiveRecoveryGitReceipt> {
+            archive_recovery_require_admitted_git_snapshot(&config.storage_root, &intent.plan)?;
+            let original_status = intent.plan.expected_git_status.as_ref().ok_or_else(|| {
+                CliError::InvalidArgument(
+                    "sealed recovery plan lacks its original Git status commitment".to_string(),
+                )
+            })?;
+            archive_recovery_require_git_status_snapshot(
+                &config.storage_root,
+                original_status,
+                "pre-apply",
+            )?;
+            Ok(ArchiveRecoveryGitReceipt::NoTrackedTreeChange {
+                head: intent
+                    .plan
+                    .expected_git_head
+                    .clone()
+                    .expect("validated above"),
+                tree: intent
+                    .plan
+                    .expected_git_tree
+                    .clone()
+                    .expect("validated above"),
+                index_sha256: intent
+                    .plan
+                    .expected_git_index_sha256
+                    .clone()
+                    .expect("validated above"),
+                pre_status: sealed_post_status.clone(),
+                post_status: original_status.clone(),
+            })
+        })()
         .map_err(|error| {
             archive_recovery_partial_failure(
                 &ctx,
@@ -81799,6 +81959,10 @@ mod archive_recovery_tests {
             expected_git_head: Some("0123456789012345678901234567890123456789".to_string()),
             expected_git_tree: Some("abcdef0123456789abcdef0123456789abcdef01".to_string()),
             expected_git_index_sha256: Some(archive_recovery_sha256(b"fixture-index")),
+            expected_git_status: Some(ArchiveRecoveryGitStatusSnapshot {
+                entry_count: 3,
+                sha256: archive_recovery_sha256(b"redacted-status"),
+            }),
             groups: vec![ArchiveRecoveryGroup {
                 message_id: 7,
                 winner: candidate("/archive/canonical.md", true, true, true, true),
@@ -81817,6 +81981,43 @@ mod archive_recovery_tests {
         let serialized = serde_json::to_string(&plan).expect("serialize plan");
         assert!(!serialized.contains("body_md"));
         assert!(!serialized.contains("provider"));
+    }
+
+    #[test]
+    fn recovery_status_commitment_is_deterministic_and_path_redacted() {
+        let mut first = BTreeMap::new();
+        first.insert(
+            "projects/other/private-pending.md".to_string(),
+            git2::Status::WT_NEW.bits(),
+        );
+        first.insert(
+            "projects/another/modified.md".to_string(),
+            git2::Status::WT_MODIFIED.bits(),
+        );
+        let one = archive_recovery_git_status_snapshot_from_entries(&first)
+            .expect("first status commitment");
+        let two = archive_recovery_git_status_snapshot_from_entries(&first)
+            .expect("repeat status commitment");
+        assert_eq!(one, two);
+        assert_eq!(one.entry_count, 2);
+        assert!(
+            !serde_json::to_string(&one)
+                .expect("serialize redacted status commitment")
+                .contains("private-pending"),
+            "the plan/receipt may bind unrelated paths but must never disclose them"
+        );
+
+        let mut changed = first;
+        changed.insert(
+            "projects/third/new.md".to_string(),
+            git2::Status::WT_NEW.bits(),
+        );
+        assert_ne!(
+            one,
+            archive_recovery_git_status_snapshot_from_entries(&changed)
+                .expect("changed status commitment"),
+            "a newly dirty unrelated path must invalidate an admitted recovery plan"
+        );
     }
 
     #[test]
@@ -82219,9 +82420,61 @@ mod archive_recovery_tests {
         );
 
         let unrelated = storage_root.join("projects/unrelated-recovery-state.tmp");
-        let preserved_unrelated = temp.path().join("preserved-unrelated-recovery-state.tmp");
         std::fs::write(&unrelated, b"unrelated\n").expect("plant unrelated untracked state");
-        let dirty_result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+        // A real shared mailbox can contain unrelated pending archive work.
+        // The reviewed plan commits to that full state, but it must not force a
+        // broad cleanup in order to preserve one selected loser.
+        plan = archive_recovery_plan(
+            &storage_root,
+            &database_url,
+            &canonical_identity.display().to_string(),
+            &[7],
+            &[loser_relative.clone()],
+        )
+        .expect("plan permits unrelated Git status");
+        plan_digest = archive_recovery_plan_digest(&plan).expect("dirty-store plan digest");
+        let redacted_plan = serde_json::to_string(&plan).expect("serialize dirty-store plan");
+        assert!(
+            !redacted_plan.contains("unrelated-recovery-state"),
+            "shared-store unrelated Git paths must never appear in preview JSON"
+        );
+        assert!(
+            plan.expected_git_status
+                .as_ref()
+                .is_some_and(|status| status.entry_count >= 2),
+            "redacted status commitment must bind both the selected loser and unrelated dirt"
+        );
+        let preview_with_unrelated =
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[
+                    ("DATABASE_URL", &database_url),
+                    ("STORAGE_ROOT", &storage_root_text),
+                ],
+                || {
+                    handle_doctor_archive_recover(
+                        true,
+                        false,
+                        true,
+                        canonical_identity.display().to_string(),
+                        vec![7],
+                        vec![loser_relative.clone()],
+                        None,
+                    )
+                },
+            );
+        assert!(
+            preview_with_unrelated.is_ok(),
+            "preview must be zero-write and permit unrelated Git status: {preview_with_unrelated:?}"
+        );
+        assert!(
+            !storage_root.join(".doctor/runs").exists(),
+            "preview with unrelated Git status must not create recovery artifacts"
+        );
+
+        let drift = storage_root.join("projects/unrelated-status-drift.tmp");
+        let preserved_drift = temp.path().join("preserved-unrelated-status-drift.tmp");
+        std::fs::write(&drift, b"drift\n").expect("mutate unrelated Git status after preview");
+        let stale_status_result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[
                 ("DATABASE_URL", &database_url),
                 ("STORAGE_ROOT", &storage_root_text),
@@ -82238,9 +82491,20 @@ mod archive_recovery_tests {
                 )
             },
         );
-        assert!(dirty_result.is_err(), "unrelated Git status must refuse");
-        std::fs::rename(&unrelated, &preserved_unrelated)
-            .expect("preserve unrelated fixture outside mailbox before retry");
+        assert!(
+            stale_status_result.is_err(),
+            "changed unrelated Git status must refuse apply"
+        );
+        assert!(
+            loser.exists(),
+            "stale status refusal must preserve selected loser"
+        );
+        assert!(
+            unrelated.exists(),
+            "stale status refusal must preserve unrelated evidence"
+        );
+        std::fs::rename(&drift, &preserved_drift)
+            .expect("preserve unrelated status-drift fixture before exact reviewed retry");
 
         let competing_mailbox_lock =
             acquire_doctor_mailbox_activity_lock_for_storage_root(&storage_root, false)
@@ -82319,6 +82583,15 @@ mod archive_recovery_tests {
         assert!(
             apply_result.is_ok(),
             "handler apply failed: {apply_result:?}"
+        );
+        assert!(
+            unrelated.exists(),
+            "apply must preserve unrelated pre-action Git status exactly"
+        );
+        assert_eq!(
+            std::fs::read(&unrelated).expect("read preserved unrelated evidence"),
+            b"unrelated\n",
+            "apply must never mutate unrelated evidence bytes"
         );
         let apply_json = extract_json_blocks(&apply_stdout)
             .into_iter()
