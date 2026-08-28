@@ -81550,6 +81550,49 @@ fn handle_doctor_archive_recover_undo(
 mod archive_recovery_tests {
     use super::*;
 
+    fn extract_json_delimited(s: &str, open: char, close: char) -> Option<&str> {
+        let start = s.find(open)?;
+        let mut depth = 0i32;
+        let mut in_string = false;
+        let mut escape = false;
+        for (offset, character) in s[start..].char_indices() {
+            if escape {
+                escape = false;
+                continue;
+            }
+            match character {
+                '\\' if in_string => escape = true,
+                '"' => in_string = !in_string,
+                value if value == open && !in_string => depth += 1,
+                value if value == close && !in_string => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&s[start..start + offset + 1]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn extract_json_blocks(mut input: &str) -> Vec<&str> {
+        let mut blocks = Vec::new();
+        while let Some(start) = input.find('{') {
+            let candidate = &input[start..];
+            let Some(block) = extract_json_delimited(candidate, '{', '}') else {
+                break;
+            };
+            blocks.push(block);
+            let consumed = start + block.len();
+            if consumed >= input.len() {
+                break;
+            }
+            input = &input[consumed..];
+        }
+        blocks
+    }
+
     fn candidate(
         path: &str,
         project_identity_match: bool,
