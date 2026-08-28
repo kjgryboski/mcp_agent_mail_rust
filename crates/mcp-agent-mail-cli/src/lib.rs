@@ -81941,7 +81941,7 @@ mod archive_recovery_tests {
             &database_url,
             &canonical_identity.display().to_string(),
             &[7],
-            &[loser_relative],
+            &[loser_relative.clone()],
         )
         .expect("zero-write recovery preview");
         assert_eq!(
