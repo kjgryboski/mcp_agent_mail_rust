@@ -80691,7 +80691,7 @@ fn archive_recovery_git_status_paths(repository: &git2::Repository) -> CliResult
                 "archive recovery refuses staged or modified mailbox Git state".to_string(),
             ));
         }
-        let path = entry.path().ok_or_else(|| {
+        let path = entry.path().map_err(|_| {
             CliError::InvalidArgument(
                 "archive recovery encountered an unaddressable mailbox Git status path".to_string(),
             )
