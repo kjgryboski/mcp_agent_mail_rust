@@ -82683,6 +82683,68 @@ mod archive_recovery_tests {
         );
         drop(competing_undo_sqlite_lock);
 
+        // A shared mailbox can acquire unrelated pending work after recovery
+        // applies. Both preview and apply must refuse that drift before they
+        // create an undo run or restore any selected loser bytes.
+        let post_apply_drift = storage_root.join("projects/unrelated-post-apply-drift.tmp");
+        let preserved_post_apply_drift =
+            temp.path().join("preserved-unrelated-post-apply-drift.tmp");
+        std::fs::write(&post_apply_drift, b"post-apply drift\n")
+            .expect("plant unrelated Git status after successful apply");
+        let run_count_before_drifted_undo = std::fs::read_dir(storage_root.join(".doctor/runs"))
+            .expect("read recovery runs before drifted undo")
+            .count();
+
+        let drifted_undo_preview = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &database_url),
+                ("STORAGE_ROOT", &storage_root_text),
+            ],
+            || handle_doctor_archive_recover_undo(run_id.clone(), true, false, true),
+        );
+        assert!(
+            drifted_undo_preview.is_err(),
+            "undo preview must refuse unrelated post-apply Git status drift"
+        );
+        assert!(
+            !loser.exists(),
+            "drifted undo preview must restore no evidence"
+        );
+        assert!(
+            destination.is_file(),
+            "sealed loser evidence must remain available"
+        );
+
+        let drifted_undo_apply = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &database_url),
+                ("STORAGE_ROOT", &storage_root_text),
+            ],
+            || handle_doctor_archive_recover_undo(run_id.clone(), false, true, true),
+        );
+        assert!(
+            drifted_undo_apply.is_err(),
+            "undo apply must refuse unrelated post-apply Git status drift"
+        );
+        assert!(
+            !loser.exists(),
+            "drifted undo apply must restore no evidence"
+        );
+        assert_eq!(
+            std::fs::read_dir(storage_root.join(".doctor/runs"))
+                .expect("read recovery runs after drifted undo")
+                .count(),
+            run_count_before_drifted_undo,
+            "drift refusal must create no undo run"
+        );
+        assert_eq!(
+            std::fs::read(&post_apply_drift).expect("read unrelated post-apply evidence"),
+            b"post-apply drift\n",
+            "drift refusal must not mutate unrelated evidence"
+        );
+        std::fs::rename(&post_apply_drift, &preserved_post_apply_drift)
+            .expect("preserve unrelated post-apply drift outside the mailbox before retry");
+
         // Regression: undo must re-establish the root-level ignore contract
         // before creating its run or restoring a byte. A narrow/removed rule
         // cannot be detected only after partial restoration.
