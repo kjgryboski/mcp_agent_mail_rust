@@ -1,0 +1,227 @@
+name: search-repair-arm64-build
+
+on:
+  push:
+    branches:
+      - codex/search-repair-20260902
+
+permissions:
+  contents: read
+
+concurrency:
+  group: search-repair-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FRANKENSEARCH_COMMIT: 3bbfd8c664062f8304e7a790c51794671f9214dc
+  FAST_CMAES_COMMIT: 3bf11b7601b54a08ffabb55821289ecb235a504d
+  BEADS_RUST_COMMIT: ba6ff75da25529c8cad8395352f5c5fc2162ee95
+
+jobs:
+  build-and-qualify:
+    runs-on: macos-14
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out exact repair commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Check out pinned sibling dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          checkout_pinned() {
+            local repo_url="$1"
+            local destination="$2"
+            local expected_commit="$3"
+            local actual_commit
+
+            git init --quiet "$destination"
+            git -C "$destination" remote add origin "$repo_url"
+            git -C "$destination" fetch --quiet --depth 1 origin "$expected_commit"
+            git -C "$destination" checkout --quiet --detach FETCH_HEAD
+            actual_commit="$(git -C "$destination" rev-parse HEAD)"
+            if [[ "$actual_commit" != "$expected_commit" ]]; then
+              echo "Expected $destination at $expected_commit, found $actual_commit" >&2
+              exit 1
+            fi
+          }
+
+          checkout_pinned https://github.com/Dicklesworthstone/frankensearch ../frankensearch "$FRANKENSEARCH_COMMIT"
+          checkout_pinned https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes "$FAST_CMAES_COMMIT"
+          checkout_pinned https://github.com/Dicklesworthstone/beads_rust ../beads_rust "$BEADS_RUST_COMMIT"
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # pinned 2026-08-05
+        with:
+          toolchain: nightly-2026-08-25
+          components: rustfmt, clippy
+          targets: aarch64-apple-darwin
+
+      - name: Verify source and toolchain identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          rustc --version --verbose
+          cargo --version --verbose
+          cargo fmt --check
+
+      - name: Run focused search regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --release --target aarch64-apple-darwin \
+            -p mcp-agent-mail-db --no-default-features --features portable \
+            gh296_ -- --nocapture
+          cargo test --locked --release --target aarch64-apple-darwin \
+            -p mcp-agent-mail-share --no-default-features --features portable \
+            gh297_ -- --nocapture
+          cargo test --locked --release --target aarch64-apple-darwin \
+            -p mcp-agent-mail-cli --no-default-features --features portable \
+            gh297_ -- --nocapture
+
+      - name: Run focused compiler and lint gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --locked --release --target aarch64-apple-darwin \
+            -p mcp-agent-mail-db -p mcp-agent-mail-share -p mcp-agent-mail-cli \
+            --no-default-features --features portable --all-targets
+          cargo clippy --locked --release --target aarch64-apple-darwin \
+            -p mcp-agent-mail-db -p mcp-agent-mail-share -p mcp-agent-mail-cli \
+            --no-default-features --features portable --all-targets -- -D warnings
+
+      - name: Build release-compatible portable binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --target aarch64-apple-darwin \
+            -p mcp-agent-mail -p mcp-agent-mail-cli \
+            --no-default-features --features portable
+
+      - name: Prove repeated MCP search and snapshot-marker safety end to end
+        shell: bash
+        run: |
+          set -euo pipefail
+          repair_root="$(mktemp -d "$RUNNER_TEMP/agent-mail-search-repair.XXXXXX")"
+          storage_root="$repair_root/storage"
+          project_root="$repair_root/project"
+          database_path="$storage_root/storage.sqlite3"
+          state_path="$storage_root/search_index/backfill_state.json"
+          server_log="$repair_root/server.log"
+          binary="$GITHUB_WORKSPACE/target/aarch64-apple-darwin/release/am"
+          port=18777
+          mkdir -p "$storage_root" "$project_root"
+
+          export STORAGE_ROOT="$storage_root"
+          export DATABASE_URL="sqlite:///$database_path"
+          export HTTP_HOST=127.0.0.1
+          export HTTP_PORT="$port"
+          export HTTP_PATH=/mcp/
+          export AM_STARTUP_SEARCH_BACKFILL_DELAY_SECS=1
+
+          "$binary" serve-http --no-tui --no-auth --host 127.0.0.1 --port "$port" --path /mcp/ \
+            >"$server_log" 2>&1 &
+          server_pid=$!
+          finish() {
+            status=$?
+            set +e
+            kill "$server_pid" 2>/dev/null
+            wait "$server_pid" 2>/dev/null
+            if [[ "$status" -ne 0 ]]; then
+              echo "=== Agent Mail isolated server log (failure) ===" >&2
+              tail -n 200 "$server_log" >&2
+            fi
+            exit "$status"
+          }
+          trap finish EXIT
+
+          curl --silent --show-error --fail --retry 30 --retry-delay 1 --retry-connrefused \
+            --max-time 2 "http://127.0.0.1:$port/health" >/dev/null
+          echo "[e2e] server ready; allowing startup backfill to win the historical race"
+          sleep 3
+
+          rpc() {
+            curl --silent --show-error --fail --max-time 25 \
+              -X POST "http://127.0.0.1:$port/mcp/" \
+              -H 'Content-Type: application/json' \
+              -H 'Accept: application/json, text/event-stream' \
+              -d "$1"
+          }
+          rpc_ok() {
+            local payload="$1"
+            local label="$2"
+            local response
+            response="$(rpc "$payload")"
+            echo "$response" | jq -e '.error == null and .result != null' >/dev/null
+            echo "[e2e] $label: ok"
+          }
+          search_ok() {
+            local id="$1"
+            local label="$2"
+            local payload response decoded
+            payload="$(jq -nc --argjson id "$id" --arg project "$project_root" \
+              '{jsonrpc:"2.0",id:$id,method:"tools/call",params:{name:"search_messages",arguments:{project_key:$project,query:"zebra",limit:5}}}')"
+            response="$(rpc "$payload")"
+            decoded="$(echo "$response" | jq -c '.result.content[0].text | fromjson')"
+            echo "$decoded" | jq -e '(.result | length) == 1 and (.diagnostics // null) == null' >/dev/null
+            echo "[e2e] $label: result_count=$(echo "$decoded" | jq '.result | length') diagnostics=null"
+          }
+
+          rpc_ok "$(jq -nc --arg project "$project_root" \
+            '{jsonrpc:"2.0",id:1,method:"tools/call",params:{name:"ensure_project",arguments:{human_key:$project}}}')" \
+            "ensure project"
+          rpc_ok "$(jq -nc --arg project "$project_root" \
+            '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"register_agent",arguments:{project_key:$project,program:"repair-e2e",model:"test",name:"GreenLake"}}}')" \
+            "register sender"
+          rpc_ok "$(jq -nc --arg project "$project_root" \
+            '{jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"register_agent",arguments:{project_key:$project,program:"repair-e2e",model:"test",name:"BlueDog"}}}')" \
+            "register recipient"
+          rpc_ok "$(jq -nc --arg project "$project_root" \
+            '{jsonrpc:"2.0",id:4,method:"tools/call",params:{name:"send_message",arguments:{project_key:$project,sender_name:"GreenLake",to:["BlueDog"],subject:"zebra quantum handshake",body_md:"zebra quantum handshake body"}}}')" \
+            "send searchable message"
+
+          search_ok 5 "first MCP search after startup backfill"
+          search_ok 6 "second consecutive MCP search"
+
+          test -f "$state_path"
+          jq -e --arg db "$database_path" '.db_path == $db' "$state_path" >/dev/null
+          marker_before="$(shasum -a 256 "$state_path" | awk '{print $1}')"
+          echo "[e2e] canonical marker before CLI search: $marker_before"
+
+          AM_INTERFACE_MODE=cli "$binary" robot search zebra --project "$project_root" --json \
+            >"$repair_root/robot-search.json"
+          echo "[e2e] robot search: ok"
+
+          marker_after="$(shasum -a 256 "$state_path" | awk '{print $1}')"
+          test "$marker_after" = "$marker_before"
+          jq -e --arg db "$database_path" '.db_path == $db' "$state_path" >/dev/null
+          echo "[e2e] canonical marker after CLI search unchanged: $marker_after"
+          search_ok 7 "MCP search after CLI snapshot search"
+
+      - name: Verify binary surfaces and provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p repair-artifact
+          cp target/aarch64-apple-darwin/release/am repair-artifact/
+          cp target/aarch64-apple-darwin/release/mcp-agent-mail repair-artifact/
+          file repair-artifact/am repair-artifact/mcp-agent-mail
+          test "$(repair-artifact/am --version)" = "am 0.3.32"
+          test "$(repair-artifact/mcp-agent-mail --version)" = "mcp-agent-mail 0.3.32"
+          printf '%s\n' "$GITHUB_SHA" > repair-artifact/SOURCE_COMMIT
+          (cd repair-artifact && shasum -a 256 am mcp-agent-mail > SHA256SUMS)
+          cat repair-artifact/SOURCE_COMMIT repair-artifact/SHA256SUMS
+
+      - name: Upload qualified arm64 repair binaries
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: agent-mail-search-repair-aarch64-apple-darwin
+          path: repair-artifact/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
