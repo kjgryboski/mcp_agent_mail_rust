@@ -75,6 +75,24 @@ jobs:
             crates/mcp-agent-mail-db/src/search_v3.rs \
             crates/mcp-agent-mail-server/src/lib.rs
 
+      - name: Resolve and retain the exact dependency graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo metadata --format-version 1 --filter-platform aarch64-apple-darwin \
+            >"$RUNNER_TEMP/cargo-metadata.json"
+          git diff -- Cargo.lock
+          shasum -a 256 Cargo.lock
+
+      - name: Upload resolved lockfile for exact-head reconciliation
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: agent-mail-search-repair-resolved-lock-${{ github.run_id }}
+          path: Cargo.lock
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
       - name: Run focused search regressions
         shell: bash
         run: |
