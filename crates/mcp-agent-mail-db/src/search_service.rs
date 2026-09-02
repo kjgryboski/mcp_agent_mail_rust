@@ -1080,13 +1080,10 @@ fn sqlite_file_lexical_backfill_fingerprint(db_path: &str) -> Option<LexicalBack
         return None;
     }
     let metadata = std::fs::metadata(db_path).ok()?;
-    #[cfg(unix)]
-    let (device_id, inode) = {
-        use std::os::unix::fs::MetadataExt as _;
-        (Some(metadata.dev()), Some(metadata.ino()))
-    };
-    #[cfg(not(unix))]
-    let (device_id, inode) = (None, None);
+    let (device_id, inode) = crate::pool::stable_sqlite_file_identity(Path::new(db_path))
+        .map_or((None, None), |(device_id, inode)| {
+            (Some(device_id), Some(inode))
+        });
     let modified_micros = metadata
         .modified()
         .ok()
@@ -1340,7 +1337,33 @@ fn sqlite_key_from_database_url(database_url: &str) -> Option<String> {
 }
 
 fn sqlite_key_for_pool(pool: &DbPool) -> String {
-    pool.sqlite_identity_key()
+    let pool_key = pool.sqlite_identity_key();
+    if pool.sqlite_path() == ":memory:" {
+        return pool_key;
+    }
+
+    // GH#296: file-backed read surfaces intentionally open short-lived,
+    // query-only pools. `DbPool::sqlite_identity_key()` includes the pool's
+    // cache generation, so using it here made two consecutive requests for
+    // the same live file look like different databases to the process-global
+    // lexical bridge. Scope search state by the stable file identity instead:
+    // the normalized path namespace prevents cross-path aliasing, while the
+    // filesystem-volume/file-index pair changes when recovery replaces the
+    // database at that path. Keep the generation-bearing key as the
+    // conservative fallback when a stable file identity is unavailable.
+    let Some((device_id, inode)) =
+        crate::pool::stable_sqlite_file_identity(Path::new(pool.sqlite_path()))
+    else {
+        return pool_key;
+    };
+    let Some((path_namespace, generation)) = pool_key.rsplit_once('@') else {
+        return pool_key;
+    };
+    if generation.parse::<u64>().is_err() {
+        return pool_key;
+    }
+
+    format!("{path_namespace}@file:{device_id}:{inode}")
 }
 
 fn has_run_lexical_backfill(sqlite_key: &str) -> Result<bool, DbError> {
@@ -1390,17 +1413,17 @@ pub fn note_startup_lexical_backfill_completed(database_url: &str) -> Result<(),
     record_lexical_bootstrap_success(&sqlite_key)
 }
 
-/// Record startup lexical backfill completion under the live pool's identity.
+/// Record startup lexical backfill completion under the live database's search identity.
 ///
 /// GH#261: the URL-based [`note_startup_lexical_backfill_completed`] derives a
 /// *bare path* key, while `lexical_backfill_health` and
-/// `ensure_lexical_bridge_initialized` compare against
-/// `pool.sqlite_identity_key()` (`path@generation`). Those strings can never be
-/// equal, so a daemon whose startup backfill completed before its first search
-/// marked its own (only) database as "a different database" and silently served
-/// the plain-SQL fallback for its entire lifetime. Callers that have (or can
-/// resolve) the live pool must use this variant so completion is recorded under
-/// exactly the identity the health probe checks.
+/// `ensure_lexical_bridge_initialized` compare against the pool-derived search
+/// key. Those strings can never be equal, so a daemon whose startup backfill
+/// completed before its first search marked its own (only) database as "a
+/// different database" and silently served the plain-SQL fallback for its
+/// entire lifetime. Callers that have (or can resolve) a pool must use this
+/// variant so completion is recorded under exactly the stable file identity
+/// the health probe checks across short-lived query-only pools (GH#296).
 pub fn note_startup_lexical_backfill_completed_for_pool(pool: &DbPool) -> Result<(), DbError> {
     if pool.sqlite_path() == ":memory:" {
         return Ok(());
@@ -5690,6 +5713,143 @@ mod tests {
         let clone = pool.clone();
 
         assert_eq!(sqlite_key_for_pool(&pool), sqlite_key_for_pool(&clone));
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn gh296_search_identity_is_stable_across_short_lived_pools_for_same_file() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let db_path = root.path().join("mail.sqlite3");
+        std::fs::write(&db_path, b"same live database").expect("write database fixture");
+
+        let first = temp_file_pool(root.path(), "mail.sqlite3");
+        let second = temp_file_pool(root.path(), "mail.sqlite3");
+
+        assert_ne!(
+            first.sqlite_identity_key(),
+            second.sqlite_identity_key(),
+            "precondition: independent pools must carry different cache generations"
+        );
+        assert_eq!(
+            sqlite_key_for_pool(&first),
+            sqlite_key_for_pool(&second),
+            "search identity must remain stable across sequential request pools for one live file"
+        );
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn gh296_second_pool_reuses_lexical_binding_without_fallback_or_rebuild() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+        let root = tempfile::tempdir().expect("tempdir");
+        let first = temp_file_pool(root.path(), "mail.sqlite3");
+        write_backfill_health_state(root.path(), first.sqlite_path(), 3, 9, 3, 9);
+        let first_key = sqlite_key_for_pool(&first);
+        record_lexical_bootstrap_success(&first_key).expect("record first request bootstrap");
+
+        let second = temp_file_pool(root.path(), "mail.sqlite3");
+        assert_ne!(first.sqlite_identity_key(), second.sqlite_identity_key());
+        let second_key = sqlite_key_for_pool(&second);
+        let health = lexical_backfill_health(&second);
+
+        assert_eq!(health.db_identity, first_key);
+        assert_eq!(health.state, "fresh");
+        assert!(
+            !lexical_index_is_foreign_to_pool(&second),
+            "the second request must stay on the lexical path instead of the GH#162 SQL fallback"
+        );
+        assert!(
+            matches!(
+                lexical_bootstrap_state()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&second_key),
+                Some(Ok(()))
+            ),
+            "the second request must reuse the successful bootstrap state"
+        );
+        assert_eq!(
+            lexical_active_db_key()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_deref(),
+            Some(first_key.as_str()),
+            "the second request must retain the active bridge binding"
+        );
+        assert!(
+            has_run_lexical_backfill(&second_key).expect("second request backfill marker"),
+            "the second request must reuse the first request's backfill marker instead of rebuilding"
+        );
+        assert!(
+            !health
+                .stale_reason
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("process-global lexical bridge"),
+            "a second request pool for the same live file must not be classified as foreign: {:?}",
+            health.stale_reason
+        );
+        reset_lexical_bootstrap_tracking();
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn gh296_same_path_replacement_remains_foreign_with_equal_counts() {
+        let _guard = SEARCH_BOOTSTRAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_lexical_bootstrap_tracking();
+        let root = tempfile::tempdir().expect("tempdir");
+        let db_path = root.path().join("mail.sqlite3");
+        let preserved_path = root.path().join("mail.sqlite3.previous");
+        let first = temp_file_pool(root.path(), "mail.sqlite3");
+        write_backfill_health_state(root.path(), first.sqlite_path(), 3, 9, 3, 9);
+        let first_key = sqlite_key_for_pool(&first);
+        record_lexical_bootstrap_success(&first_key).expect("record first database bootstrap");
+        let original_bytes = std::fs::read(&db_path).expect("read first database fixture");
+
+        std::fs::rename(&db_path, &preserved_path).expect("preserve first database generation");
+        std::fs::write(&db_path, original_bytes)
+            .expect("write byte-identical replacement database");
+        let replacement = temp_file_pool(root.path(), "mail.sqlite3");
+        let health = lexical_backfill_health(&replacement);
+
+        assert_ne!(
+            first_key,
+            sqlite_key_for_pool(&replacement),
+            "same-path replacement must receive a different search identity"
+        );
+        assert_eq!(health.source_messages, Some(3));
+        assert_eq!(health.indexed_messages, 3);
+        assert_eq!(health.state, "stale");
+        assert!(
+            health
+                .stale_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("database identity changed")),
+            "a byte-identical same-path replacement must remain foreign even when count and max-id match: {:?}",
+            health.stale_reason
+        );
+        reset_lexical_bootstrap_tracking();
+    }
+
+    #[test]
+    fn gh296_unavailable_file_identity_falls_back_to_pool_generation() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let first = temp_file_pool(root.path(), "missing.sqlite3");
+        let second = temp_file_pool(root.path(), "missing.sqlite3");
+
+        assert!(!std::path::Path::new(first.sqlite_path()).exists());
+        assert_eq!(sqlite_key_for_pool(&first), first.sqlite_identity_key());
+        assert_eq!(sqlite_key_for_pool(&second), second.sqlite_identity_key());
+        assert_ne!(
+            sqlite_key_for_pool(&first),
+            sqlite_key_for_pool(&second),
+            "an unprovable file identity must fail closed instead of collapsing distinct pools"
+        );
     }
 
     #[test]

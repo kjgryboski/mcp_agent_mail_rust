@@ -5107,6 +5107,39 @@ fn sqlite_identity_cache_namespace(path: &Path) -> String {
     }
 }
 
+/// Return the stable filesystem identity pair for an existing SQLite file.
+///
+/// The pair is device/inode on Unix and volume-serial/file-index on Windows.
+/// Callers must fail safely when this returns `None`: unsupported platforms,
+/// missing paths, and files whose identity cannot be inspected must never be
+/// treated as equivalent merely because their path strings match.
+pub(crate) fn stable_sqlite_file_identity(path: &Path) -> Option<(u64, u64)> {
+    stable_sqlite_file_identity_impl(path)
+}
+
+#[cfg(unix)]
+fn stable_sqlite_file_identity_impl(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(windows)]
+fn stable_sqlite_file_identity_impl(path: &Path) -> Option<(u64, u64)> {
+    // Stable std does not expose volume_serial_number/file_index yet.
+    // winapi-util obtains both from GetFileInformationByHandle without
+    // requiring unsafe code in this crate.
+    let handle = winapi_util::Handle::from_path_any(path).ok()?;
+    let information = winapi_util::file::information(&handle).ok()?;
+    Some((information.volume_serial_number(), information.file_index()))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn stable_sqlite_file_identity_impl(_path: &Path) -> Option<(u64, u64)> {
+    None
+}
+
 fn absolute_lexical_authority_path(path: &Path, field: &'static str) -> DbResult<PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()

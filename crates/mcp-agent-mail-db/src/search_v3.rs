@@ -666,13 +666,10 @@ fn sqlite_file_backfill_fingerprint(db_path: &str) -> Option<BackfillDbFingerpri
         return None;
     }
     let metadata = std::fs::metadata(db_path).ok()?;
-    #[cfg(unix)]
-    let (device_id, inode) = {
-        use std::os::unix::fs::MetadataExt as _;
-        (Some(metadata.dev()), Some(metadata.ino()))
-    };
-    #[cfg(not(unix))]
-    let (device_id, inode) = (None, None);
+    let (device_id, inode) = crate::pool::stable_sqlite_file_identity(Path::new(db_path))
+        .map_or((None, None), |(device_id, inode)| {
+            (Some(device_id), Some(inode))
+        });
     let modified_micros = metadata
         .modified()
         .ok()

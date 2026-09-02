@@ -1052,15 +1052,13 @@ impl Drop for StartupSearchBackfillResetGuard {
 }
 
 fn record_startup_search_backfill_completion(config: &mcp_agent_mail_core::Config) {
-    // GH#261: record completion under the SAME identity the health probe and
-    // query gate compare against — the live pool's `sqlite_identity_key()`
-    // ("path@generation"). Recording the bare URL-derived path marked the
-    // daemon's own (and only) database as "active for a different database"
-    // forever, permanently degrading every search to the plain-SQL fallback
-    // whenever the startup backfill completed before the first search (the
-    // common boot order for an always-on daemon). Resolve — or create — the
-    // same env-shaped pool the request handlers use so the recorded key
-    // carries the matching cache generation.
+    // GH#261/GH#296: record completion under the SAME stable file identity the
+    // health probe and query gate compare against. Recording the bare
+    // URL-derived path — or a short-lived pool's private cache generation —
+    // marked the daemon's own database as "active for a different database"
+    // and permanently degraded later request pools to the plain-SQL fallback.
+    // The DB layer derives a stable search identity from the normalized path
+    // plus file identity, while still changing it after same-path replacement.
     if !mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
         let mut db_config = DbPoolConfig::from_env();
         db_config.database_url = config.database_url.clone();
