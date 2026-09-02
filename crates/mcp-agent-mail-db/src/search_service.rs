@@ -5104,7 +5104,11 @@ mod tests {
             .with_ephemeral_search_index();
 
         let chosen = direct_surface_index_dir(&pool).expect("snapshot index authority");
-        assert_eq!(chosen, snapshot_dir.path().join("search_index"));
+        let expected_snapshot_index = std::path::Path::new(pool.sqlite_path())
+            .parent()
+            .expect("snapshot database parent")
+            .join("search_index");
+        assert_eq!(chosen, expected_snapshot_index);
         assert_ne!(chosen, shared_index);
         assert!(
             !chosen.exists(),
@@ -5191,13 +5195,14 @@ mod tests {
                 Outcome::Ok(agent) => agent,
                 other => panic!("register sender failed: {other:?}"),
             };
-            let message = match crate::queries::create_message_with_recipients(
+            let message = match crate::queries::create_message_with_recipients_topic(
                 &cx,
                 &pool,
                 project_id,
                 sender.id.unwrap_or(0),
                 "zebra private snapshot",
                 "zebra private snapshot body",
+                None,
                 Some("gh297-private-topic"),
                 "normal",
                 false,
