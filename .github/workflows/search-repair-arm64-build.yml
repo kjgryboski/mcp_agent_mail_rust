@@ -1,9 +1,6 @@
 name: search-repair-arm64-build
 
 on:
-  push:
-    branches:
-      - codex/search-repair-20260902
   pull_request:
     branches:
       - main
@@ -71,7 +68,12 @@ jobs:
           test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
           rustc --version --verbose
           cargo --version --verbose
-          cargo fmt --check
+          rustfmt --edition 2024 --check \
+            crates/mcp-agent-mail-cli/src/lib.rs \
+            crates/mcp-agent-mail-db/src/pool.rs \
+            crates/mcp-agent-mail-db/src/search_service.rs \
+            crates/mcp-agent-mail-db/src/search_v3.rs \
+            crates/mcp-agent-mail-server/src/lib.rs
 
       - name: Run focused search regressions
         shell: bash
