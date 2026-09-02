@@ -14842,6 +14842,16 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             // safe-remediation contract so an agent knows what is safe to do.
             let mut db_error_message: Option<String> = None;
 
+            // Stage and inspect the private file-family copy before opening the
+            // FrankenSQLite connectivity connection below. On classic POSIX
+            // fcntl locking, closing any second descriptor for the same inode
+            // from this process can release locks held by the first descriptor.
+            // Preserve the historical output order by pushing this precomputed
+            // assessment only after the connectivity probe.
+            let db_file_sanity = summarize_db_file_sanity_probe(&config.database_url);
+            let db_file_sanity_unhealthy = db_file_sanity.unhealthy;
+            let db_file_sanity_degraded = db_file_sanity.degraded;
+
             // 1. DB connectivity probe
             let db_start = std::time::Instant::now();
             let db_ok = match crate::open_db_sync_read_only_with_database_url_and_path(
@@ -14887,10 +14897,9 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 probe.latency_ms = (db_ms * 100.0).round() / 100.0;
             }
 
-            // 1b. Live sqlite file sanity probe (non-mutating).
-            let db_file_sanity = summarize_db_file_sanity_probe(&config.database_url);
-            let db_file_sanity_unhealthy = db_file_sanity.unhealthy;
-            let db_file_sanity_degraded = db_file_sanity.degraded;
+            // 1b. Live sqlite file sanity probe (non-mutating). The work was
+            // completed before `db_conn` existed; only its result is appended
+            // here so existing probe ordering remains stable.
             probes.push(db_file_sanity.probe);
 
             // 1c. Core schema presence probe.
