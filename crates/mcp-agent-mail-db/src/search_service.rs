@@ -964,7 +964,23 @@ fn sanitize_search_index_owner(value: &str) -> String {
 }
 
 fn direct_surface_index_dir(pool: &DbPool) -> Result<PathBuf, DbError> {
-    pool.validated_sqlite_path("lexical search database selection")?;
+    let sqlite_path = pool.validated_sqlite_path("lexical search database selection")?;
+    if !pool.uses_shared_search_index() {
+        // Snapshot pools inherit the canonical storage root for read-side
+        // project/archive context, but that root must never confer write
+        // authority over the live search index. Keep every search sidecar in
+        // the caller-owned snapshot directory instead.
+        let parent = sqlite_path
+            .parent()
+            .ok_or_else(|| DbError::InvalidArgument {
+                field: "database_url",
+                message: format!(
+                    "ephemeral search snapshot has no parent directory: {}",
+                    sqlite_path.display()
+                ),
+            })?;
+        return Ok(parent.join("search_index"));
+    }
     let shared = pool
         .validated_storage_root("lexical search index selection")?
         .join("search_index");
@@ -4900,6 +4916,61 @@ mod tests {
         assert_eq!(
             direct_surface_index_dir(&pool).expect("select shared index authority"),
             root.path().join("search_index")
+        );
+    }
+
+    #[test]
+    fn gh297_ephemeral_snapshot_pool_cannot_select_shared_marker_authority() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let storage_root = root.path().join("canonical-mailbox");
+        let shared_index = storage_root.join("search_index");
+        std::fs::create_dir_all(&shared_index).expect("shared search index");
+        let shared_marker = shared_index.join("backfill_state.json");
+        let canonical_marker_before = r#"{"db_path":"canonical.sqlite3"}"#;
+        std::fs::write(&shared_marker, canonical_marker_before).expect("canonical marker");
+        std::fs::write(shared_index.join("meta.json"), "{}").expect("shared index metadata");
+
+        let snapshot_dir = tempfile::tempdir().expect("snapshot tempdir");
+        let snapshot_path = snapshot_dir.path().join("mailbox.sqlite3");
+        let config = crate::DbPoolConfig {
+            database_url: format!("sqlite:///{}", snapshot_path.display()),
+            storage_root: Some(storage_root),
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::DbPool::new(&config)
+            .expect("snapshot pool")
+            .with_ephemeral_search_index();
+
+        let chosen = direct_surface_index_dir(&pool).expect("snapshot index authority");
+        assert_eq!(chosen, snapshot_dir.path().join("search_index"));
+        assert_ne!(chosen, shared_index);
+        std::fs::create_dir_all(&chosen).expect("snapshot-local index directory");
+        std::fs::write(
+            chosen.join("backfill_state.json"),
+            serde_json::json!({ "db_path": snapshot_path }).to_string(),
+        )
+        .expect("snapshot-local marker");
+
+        let canonical_marker: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(shared_marker).expect("canonical marker remains readable"),
+        )
+        .expect("canonical marker JSON");
+        assert_eq!(
+            canonical_marker,
+            serde_json::from_str::<serde_json::Value>(canonical_marker_before)
+                .expect("original canonical marker JSON"),
+            "snapshot indexing must not modify the canonical marker"
+        );
+        assert_eq!(canonical_marker["db_path"], "canonical.sqlite3");
+        let snapshot_path_text = snapshot_path.display().to_string();
+        assert_ne!(
+            canonical_marker["db_path"].as_str(),
+            Some(snapshot_path_text.as_str()),
+            "canonical marker db_path must never become the temporary snapshot path"
         );
     }
 

@@ -2847,6 +2847,11 @@ pub struct DbPool {
     sqlite_identity: Option<PathBuf>,
     sqlite_path: String,
     storage_root: PathBuf,
+    /// Whether Search V3 may use the mailbox's canonical shared index.
+    ///
+    /// Caller-owned snapshot pools disable this so their temporary database
+    /// identity can never be written into the live mailbox's backfill marker.
+    use_shared_search_index: bool,
     /// Per-transaction ceiling for raw ATC experience rows in the isolated
     /// telemetry sidecar. Captured when the pool is created so the hot write
     /// path does not reparse process configuration for every experience.
@@ -3166,6 +3171,7 @@ impl DbPool {
             sqlite_identity: authority.sqlite_identity,
             sqlite_path: authority.sqlite_path,
             storage_root: authority.storage_root,
+            use_shared_search_index: true,
             atc_experience_max_rows,
             init_sql,
             journal_size_limit_state,
@@ -3222,6 +3228,7 @@ impl DbPool {
             sqlite_identity: authority.sqlite_identity,
             sqlite_path: authority.sqlite_path,
             storage_root: authority.storage_root,
+            use_shared_search_index: true,
             atc_experience_max_rows,
             init_sql,
             journal_size_limit_state,
@@ -3259,6 +3266,22 @@ impl DbPool {
     /// read snapshots.
     pub fn new_query_only(config: &DbPoolConfig) -> DbResult<Self> {
         Self::new_with_options(config, true, true)
+    }
+
+    /// Mark this pool as backed by a caller-owned ephemeral SQLite snapshot.
+    ///
+    /// Search V3 keeps its lexical index and `backfill_state.json` beside the
+    /// snapshot instead of selecting `storage_root/search_index`. This must be
+    /// applied before the pool is used for search.
+    #[must_use]
+    pub const fn with_ephemeral_search_index(mut self) -> Self {
+        self.use_shared_search_index = false;
+        self
+    }
+
+    #[must_use]
+    pub(crate) const fn uses_shared_search_index(&self) -> bool {
+        self.use_shared_search_index
     }
 
     #[must_use]
