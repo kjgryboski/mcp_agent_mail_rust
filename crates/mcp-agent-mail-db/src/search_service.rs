@@ -6255,16 +6255,32 @@ mod tests {
             .build()
             .expect("build runtime");
 
-        let (first_key, replacement_source_key) = runtime.block_on(async {
-            let cx = Cx::for_testing();
-            acquire_and_release_for_identity(&cx, &first, "first").await;
-            acquire_and_release_for_identity(&cx, &replacement_source, "replacement source").await;
-            (
-                sqlite_key_for_pool(&first),
-                sqlite_key_for_pool(&replacement_source),
-            )
-        });
-        assert_ne!(first_key, replacement_source_key);
+        let (first_key, first_generation, replacement_source_generation) =
+            runtime.block_on(async {
+                let cx = Cx::for_testing();
+                acquire_and_release_for_identity(&cx, &first, "first").await;
+                acquire_and_release_for_identity(&cx, &replacement_source, "replacement source")
+                    .await;
+                (
+                    sqlite_key_for_pool(&first),
+                    first
+                        .search_database_generation_id()
+                        .expect("first persisted generation"),
+                    replacement_source
+                        .search_database_generation_id()
+                        .expect("replacement source persisted generation"),
+                )
+            });
+        assert_ne!(first_generation, replacement_source_generation);
+        // The primary file is only a self-contained logical database after its WAL has
+        // been checkpointed. Full search keys cannot be compared across the two source
+        // paths because each key deliberately retains its normalized path namespace.
+        first
+            .wal_checkpoint()
+            .expect("checkpoint original database before in-place replacement");
+        replacement_source
+            .wal_checkpoint()
+            .expect("checkpoint replacement database before copying its primary file");
         drop(first);
         drop(replacement_source);
 
@@ -6284,10 +6300,16 @@ mod tests {
             let cx = Cx::for_testing();
             acquire_and_release_for_identity(&cx, &replacement, "replacement").await;
         });
+        let replacement_generation = replacement
+            .search_database_generation_id()
+            .expect("replacement persisted generation");
         assert_eq!(
-            sqlite_key_for_pool(&replacement),
-            replacement_source_key,
-            "same logical replacement database must retain its persisted generation token"
+            replacement_generation, replacement_source_generation,
+            "the checkpointed replacement file must retain its persisted generation token"
+        );
+        assert_ne!(
+            first_generation, replacement_generation,
+            "the replacement database must expose a new persisted generation"
         );
         assert_ne!(
             first_key,

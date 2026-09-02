@@ -104,19 +104,19 @@ jobs:
           set -euo pipefail
           cargo test --locked --release --target aarch64-apple-darwin \
             -p mcp-agent-mail-db --no-default-features --features portable \
-            gh296_ -- --nocapture
+            --lib gh296_ -- --nocapture --test-threads=1
           cargo test --locked --release --target aarch64-apple-darwin \
             -p mcp-agent-mail-db --no-default-features --features portable \
-            gh297_ -- --nocapture
+            --lib gh297_ -- --nocapture --test-threads=1
           cargo test --locked --release --target aarch64-apple-darwin \
             -p mcp-agent-mail-cli --no-default-features --features portable \
-            gh297_ -- --nocapture
+            --lib gh297_ -- --nocapture --test-threads=1
           cargo test --locked --release --target aarch64-apple-darwin \
             -p mcp-agent-mail-server --no-default-features --features portable \
-            gh297_ -- --nocapture
+            --lib gh297_ -- --nocapture --test-threads=1
           cargo test --locked --release --target aarch64-apple-darwin \
             -p mcp-agent-mail-tools --no-default-features --features portable \
-            gh297_ -- --nocapture
+            --lib gh297_ -- --nocapture --test-threads=1
 
       - name: Run focused compiler and lint gates
         shell: bash
