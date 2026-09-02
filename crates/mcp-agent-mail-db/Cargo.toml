@@ -62,9 +62,6 @@ indexmap.workspace = true
 # Async runtime
 asupersync.workspace = true
 
-[target.'cfg(windows)'.dependencies]
-winapi-util.workspace = true
-
 [features]
 default = ["hybrid", "s3fifo", "tantivy-engine"]
 # Portable build: everything except hybrid search. Used by CI release builds.

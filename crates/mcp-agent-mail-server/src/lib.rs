@@ -1081,8 +1081,9 @@ fn record_startup_search_backfill_completion(config: &mcp_agent_mail_core::Confi
                 tracing::warn!(
                     error = %error,
                     "[startup-search] could not resolve the live pool for lexical bootstrap \
-                     completion; falling back to database-url identity"
+                     completion; leaving bootstrap state lazy until the first proven request pool"
                 );
+                return;
             }
         }
     }
@@ -3337,6 +3338,14 @@ pub(crate) fn open_observability_db_pool(
     };
     let pool = mcp_agent_mail_db::create_pool(&cfg)
         .map_err(|e| format!("failed to initialize DB pool: {e}"))?;
+    let pool = if snapshot_dir.is_some() {
+        // Archive reconstruction is a caller-owned private snapshot. It may
+        // inherit the canonical storage root for archive context, but it must
+        // never acquire authority over the live search index or its marker.
+        pool.with_ephemeral_search_index()
+    } else {
+        pool
+    };
     Ok(ObservabilityDbPool {
         pool,
         _snapshot_dir: snapshot_dir,
@@ -29562,7 +29571,7 @@ first body
     }
 
     #[test]
-    fn dashboard_open_connection_uses_archive_snapshot_when_live_db_is_stale() {
+    fn gh297_dashboard_open_connection_uses_archive_snapshot_when_live_db_is_stale() {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage_root = dir.path().join("storage");
         let db_path = dir.path().join("dashboard-stale.sqlite3");
@@ -29616,6 +29625,30 @@ first body
             .query_sync("SELECT COUNT(*) AS c FROM messages", &[])
             .expect("query snapshot messages");
         assert_eq!(rows[0].get_named::<i64>("c").unwrap_or(0), 1);
+        drop(observed);
+
+        let observed_pool = open_observability_db_pool(
+            &database_url,
+            &storage_root,
+            "GH#297 archive-backed observability pool",
+        )
+        .expect("open archive-backed observability pool");
+        let snapshot_index = observed_pool
+            ._snapshot_dir
+            .as_ref()
+            .expect("fixture must exercise the private archive-snapshot pool")
+            .path()
+            .join("search_index");
+        let search_health =
+            mcp_agent_mail_db::search_service::lexical_backfill_health(observed_pool.pool());
+        assert_eq!(
+            search_health.state, "sql_only_snapshot",
+            "archive-backed observability search must be explicitly SQL-only"
+        );
+        assert!(
+            !snapshot_index.exists(),
+            "archive-backed observability must not create a lexical index beside the snapshot"
+        );
     }
 
     #[test]

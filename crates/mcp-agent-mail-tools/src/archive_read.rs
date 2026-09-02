@@ -754,7 +754,8 @@ fn build_snapshot(
         warmup_connections: 0,
         ..Default::default()
     })
-    .map_err(AcquireError::failed)?;
+    .map_err(AcquireError::failed)?
+    .with_ephemeral_search_index();
     Ok(Arc::new(SharedSnapshot {
         pool,
         _directory: directory,
@@ -1605,7 +1606,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_cold_readers_share_one_immutable_query_only_snapshot() {
+    fn gh297_concurrent_cold_readers_share_one_immutable_sql_only_snapshot() {
         let _guard = TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1651,6 +1652,10 @@ mod tests {
         assert_eq!(slot.reconstructions_max_active.load(Ordering::Acquire), 1);
 
         let snapshot = &snapshots[0];
+        assert!(
+            snapshot.pool.is_sql_only_search(),
+            "published archive snapshots must never initialize a process-global search bridge"
+        );
         let family_before = snapshot_family(snapshot.path());
         let cx = Cx::for_testing();
         let runtime = RuntimeBuilder::current_thread()

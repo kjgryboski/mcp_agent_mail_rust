@@ -5726,6 +5726,39 @@ pub fn db_generation_id_conn(conn: &crate::DbConn) -> Option<String> {
     }
 }
 
+/// Ensure and return the durable database-generation token on an existing
+/// writable connection.
+///
+/// Startup initialization calls this only after the canonical schema and
+/// migrations have completed. Reusing that already-open connection avoids an
+/// extra SQLite handle (important for FrankenSQLite's process-wide fcntl lock
+/// ownership) and makes the schema's "minted on database creation" contract
+/// true before any short-lived read/search pool can observe the file.
+///
+/// # Errors
+///
+/// Returns [`DbError`] when the identity table is unavailable, token creation
+/// fails, or the durable row cannot be read after an idempotent insert.
+pub fn ensure_db_generation_id_conn(conn: &crate::DbConn) -> Result<String, DbError> {
+    if let Some(generation) = db_generation_id_conn(conn) {
+        return Ok(generation);
+    }
+
+    let token = mcp_agent_mail_core::setup::generate_token()
+        .map_err(|error| DbError::Sqlite(format!("generate database identity: {error}")))?;
+    conn.execute_sync(
+        "INSERT OR IGNORE INTO db_identity (singleton, generation_id) VALUES (0, ?)",
+        &[Value::Text(token)],
+    )
+    .map_err(|error| DbError::Sqlite(format!("persist database identity: {error}")))?;
+
+    db_generation_id_conn(conn).ok_or_else(|| {
+        DbError::Sqlite(
+            "database identity remained unavailable after durable initialization".to_string(),
+        )
+    })
+}
+
 // =============================================================================
 // Agent Queries
 // =============================================================================

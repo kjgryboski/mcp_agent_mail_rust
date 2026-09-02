@@ -2850,8 +2850,19 @@ pub struct DbPool {
     /// Whether Search V3 may use the mailbox's canonical shared index.
     ///
     /// Caller-owned snapshot pools disable this so their temporary database
-    /// identity can never be written into the live mailbox's backfill marker.
+    /// identity can never initialize, switch, or write through the
+    /// process-global lexical bridge used by the live mailbox.
     use_shared_search_index: bool,
+    /// Durable logical generation observed from this database's `db_identity`
+    /// singleton through an already-pooled connection.
+    ///
+    /// Short-lived read pools for the same file share Search V3 state only
+    /// after proving that persisted generation token. A path, inode, or
+    /// low-resolution platform file identifier is not sufficient: each can be
+    /// reused after an in-place replacement. Wrappers of the same underlying
+    /// pool share this cell so startup and request surfaces agree without
+    /// opening a second SQLite handle merely to discover identity.
+    search_database_generation_id: Arc<OnceLock<String>>,
     /// Per-transaction ceiling for raw ATC experience rows in the isolated
     /// telemetry sidecar. Captured when the pool is created so the hot write
     /// path does not reparse process configuration for every experience.
@@ -2933,6 +2944,11 @@ static NEXT_POOL_CACHE_GENERATION: AtomicU64 = AtomicU64::new(1);
 type JournalSizeLimitEntry = (Weak<Pool<DbConn>>, Arc<AtomicU64>);
 
 static JOURNAL_SIZE_LIMITS: OnceLock<Mutex<HashMap<usize, JournalSizeLimitEntry>>> =
+    OnceLock::new();
+
+type SearchDatabaseGenerationEntry = (Weak<Pool<DbConn>>, Arc<OnceLock<String>>);
+
+static SEARCH_DATABASE_GENERATIONS: OnceLock<Mutex<HashMap<usize, SearchDatabaseGenerationEntry>>> =
     OnceLock::new();
 
 const JOURNAL_SIZE_LIMIT_RUNTIME_OVERRIDE: u64 = 1 << 63;
@@ -3069,6 +3085,19 @@ fn shared_journal_size_limit(pool: &Arc<Pool<DbConn>>, configured_bytes: u64) ->
     state
 }
 
+fn shared_search_database_generation_id(pool: &Arc<Pool<DbConn>>) -> Arc<OnceLock<String>> {
+    let registry = SEARCH_DATABASE_GENERATIONS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = registry.lock().unwrap_or_else(PoisonError::into_inner);
+    guard.retain(|_, (weak, _)| weak.strong_count() > 0);
+    let key = Arc::as_ptr(pool) as usize;
+    if let Some((_, generation)) = guard.get(&key) {
+        return generation.clone();
+    }
+    let generation = Arc::new(OnceLock::new());
+    guard.insert(key, (Arc::downgrade(pool), generation.clone()));
+    generation
+}
+
 const fn journal_size_limit_bytes(state: u64) -> u64 {
     state & !JOURNAL_SIZE_LIMIT_RUNTIME_OVERRIDE
 }
@@ -3159,6 +3188,7 @@ impl DbPool {
             checked_journal_size_limit(journal_size_limit)?,
         );
         let stats_sampler = Arc::new(DbPoolStatsSampler::new());
+        let search_database_generation_id = shared_search_database_generation_id(&pool);
         let (message_id_allocator, cache_generation) = shared_message_id_allocator(
             &pool,
             authority.sqlite_identity.as_deref(),
@@ -3172,6 +3202,7 @@ impl DbPool {
             sqlite_path: authority.sqlite_path,
             storage_root: authority.storage_root,
             use_shared_search_index: true,
+            search_database_generation_id,
             atc_experience_max_rows,
             init_sql,
             journal_size_limit_state,
@@ -3213,6 +3244,7 @@ impl DbPool {
             .test_on_return(false);
 
         let pool = Arc::new(Pool::new(pool_config));
+        let search_database_generation_id = shared_search_database_generation_id(&pool);
         let journal_size_limit_state =
             shared_journal_size_limit(&pool, core_config.db_journal_size_limit_bytes);
         let init_sql = Self::connection_init_sql(config, query_only, configured_journal_size_limit);
@@ -3229,6 +3261,7 @@ impl DbPool {
             sqlite_path: authority.sqlite_path,
             storage_root: authority.storage_root,
             use_shared_search_index: true,
+            search_database_generation_id,
             atc_experience_max_rows,
             init_sql,
             journal_size_limit_state,
@@ -3270,9 +3303,11 @@ impl DbPool {
 
     /// Mark this pool as backed by a caller-owned ephemeral SQLite snapshot.
     ///
-    /// Search V3 keeps its lexical index and `backfill_state.json` beside the
-    /// snapshot instead of selecting `storage_root/search_index`. This must be
-    /// applied before the pool is used for search.
+    /// Snapshot search is forced through the relational SQL path. It must never
+    /// initialize or switch the process-global lexical bridge, because doing so
+    /// would displace the live daemon's binding even if the snapshot used a
+    /// private index directory. This must be applied before the pool is used
+    /// for search.
     #[must_use]
     pub const fn with_ephemeral_search_index(mut self) -> Self {
         self.use_shared_search_index = false;
@@ -3282,6 +3317,53 @@ impl DbPool {
     #[must_use]
     pub(crate) const fn uses_shared_search_index(&self) -> bool {
         self.use_shared_search_index
+    }
+
+    /// Whether this pool is an intentionally isolated SQL-only search source.
+    #[must_use]
+    pub const fn is_sql_only_search(&self) -> bool {
+        !self.use_shared_search_index
+    }
+
+    /// Return the durable logical database generation observed by this pool.
+    ///
+    /// `None` fails closed: callers must not collapse independent file pools
+    /// onto shared process-global search state until a valid persisted token
+    /// has been read from the pooled database connection itself.
+    #[must_use]
+    pub(crate) fn search_database_generation_id(&self) -> Option<&str> {
+        self.search_database_generation_id.get().map(String::as_str)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn observe_search_database_generation_id(&self, conn: &DbConn) -> Result<(), SqlError> {
+        let Some(generation) = crate::queries::db_generation_id_conn(conn) else {
+            return Ok(());
+        };
+        if generation.len() > 128 || !generation.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            tracing::warn!(
+                generation_length = generation.len(),
+                "ignoring malformed database generation identity for search isolation"
+            );
+            return Ok(());
+        }
+        if let Some(established) = self.search_database_generation_id.get() {
+            if established == &generation {
+                return Ok(());
+            }
+            return Err(SqlError::Custom(format!(
+                "database generation changed within one live pool (established {established}, observed {generation}); retiring the pool instead of mixing search/cache state"
+            )));
+        }
+        if let Err(racing_generation) = self.search_database_generation_id.set(generation)
+            && self.search_database_generation_id.get() != Some(&racing_generation)
+        {
+            return Err(SqlError::Custom(
+                "database generation changed during concurrent pool initialization; refusing mixed search/cache state"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -3713,6 +3795,21 @@ impl DbPool {
                     }
                 }
             }
+            other => other,
+        };
+
+        let out = match out {
+            Outcome::Ok(conn) => match self.observe_search_database_generation_id(&conn) {
+                Ok(()) => Outcome::Ok(conn),
+                Err(error) => {
+                    self.retire_runtime_state_after_recovery(&error.to_string());
+                    crate::close_db_conn(
+                        conn.detach(),
+                        "pool database-generation identity changed",
+                    );
+                    Outcome::Err(error)
+                }
+            },
             other => other,
         };
 
@@ -5132,10 +5229,10 @@ fn sqlite_identity_cache_namespace(path: &Path) -> String {
 
 /// Return the stable filesystem identity pair for an existing SQLite file.
 ///
-/// The pair is device/inode on Unix and volume-serial/file-index on Windows.
-/// Callers must fail safely when this returns `None`: unsupported platforms,
-/// missing paths, and files whose identity cannot be inspected must never be
-/// treated as equivalent merely because their path strings match.
+/// The pair is device/inode on Unix. Callers must fail safely when this returns
+/// `None`: unsupported platforms, missing paths, and files whose identity
+/// cannot be inspected must never be treated as equivalent merely because
+/// their path strings match.
 pub(crate) fn stable_sqlite_file_identity(path: &Path) -> Option<(u64, u64)> {
     stable_sqlite_file_identity_impl(path)
 }
@@ -5148,18 +5245,12 @@ fn stable_sqlite_file_identity_impl(path: &Path) -> Option<(u64, u64)> {
     Some((metadata.dev(), metadata.ino()))
 }
 
-#[cfg(windows)]
-fn stable_sqlite_file_identity_impl(path: &Path) -> Option<(u64, u64)> {
-    // Stable std does not expose volume_serial_number/file_index yet.
-    // winapi-util obtains both from GetFileInformationByHandle without
-    // requiring unsafe code in this crate.
-    let handle = winapi_util::Handle::from_path_any(path).ok()?;
-    let information = winapi_util::file::information(&handle).ok()?;
-    Some((information.volume_serial_number(), information.file_index()))
-}
-
-#[cfg(not(any(unix, windows)))]
+#[cfg(not(unix))]
 fn stable_sqlite_file_identity_impl(_path: &Path) -> Option<(u64, u64)> {
+    // Windows' 64-bit BY_HANDLE_FILE_INFORMATION index is not a durable
+    // identity after its comparison handle closes and can be reused after
+    // replacement. Until the pool retains a strong 128-bit identity witness,
+    // preserve the generation-bearing key and accept a conservative fallback.
     None
 }
 
@@ -5730,6 +5821,12 @@ async fn run_sqlite_init_once(
             }
             Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
             Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+
+        if let Err(err) = crate::queries::ensure_db_generation_id_conn(&runtime_conn) {
+            return Outcome::Err(SqlError::Custom(format!(
+                "sqlite init stage=ensure_database_generation_identity failed: {err}"
+            )));
         }
     }
 

@@ -13,6 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  REPAIR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
   FRANKENSEARCH_COMMIT: 3bbfd8c664062f8304e7a790c51794671f9214dc
   FAST_CMAES_COMMIT: 3bf11b7601b54a08ffabb55821289ecb235a504d
   BEADS_RUST_COMMIT: ba6ff75da25529c8cad8395352f5c5fc2162ee95
@@ -27,6 +28,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Check out pinned sibling dependencies
         shell: bash
@@ -65,23 +67,26 @@ jobs:
         run: |
           set -euo pipefail
           test "$(uname -m)" = arm64
-          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          test "$(git rev-parse HEAD)" = "$REPAIR_HEAD_SHA"
           rustc --version --verbose
           cargo --version --verbose
           rustfmt --edition 2024 --check \
             crates/mcp-agent-mail-cli/src/lib.rs \
+            crates/mcp-agent-mail-cli/src/robot.rs \
             crates/mcp-agent-mail-db/src/pool.rs \
+            crates/mcp-agent-mail-db/src/queries.rs \
             crates/mcp-agent-mail-db/src/search_service.rs \
             crates/mcp-agent-mail-db/src/search_v3.rs \
-            crates/mcp-agent-mail-server/src/lib.rs
+            crates/mcp-agent-mail-server/src/lib.rs \
+            crates/mcp-agent-mail-tools/src/archive_read.rs
 
       - name: Resolve and retain the exact dependency graph
         shell: bash
         run: |
           set -euo pipefail
-          cargo metadata --format-version 1 --filter-platform aarch64-apple-darwin \
+          cargo metadata --locked --format-version 1 --filter-platform aarch64-apple-darwin \
             >"$RUNNER_TEMP/cargo-metadata.json"
-          git diff -- Cargo.lock
+          git diff --exit-code -- Cargo.lock
           shasum -a 256 Cargo.lock
 
       - name: Upload resolved lockfile for exact-head reconciliation
@@ -101,10 +106,16 @@ jobs:
             -p mcp-agent-mail-db --no-default-features --features portable \
             gh296_ -- --nocapture
           cargo test --locked --release --target aarch64-apple-darwin \
-            -p mcp-agent-mail-share --no-default-features --features portable \
+            -p mcp-agent-mail-db --no-default-features --features portable \
             gh297_ -- --nocapture
           cargo test --locked --release --target aarch64-apple-darwin \
             -p mcp-agent-mail-cli --no-default-features --features portable \
+            gh297_ -- --nocapture
+          cargo test --locked --release --target aarch64-apple-darwin \
+            -p mcp-agent-mail-server --no-default-features --features portable \
+            gh297_ -- --nocapture
+          cargo test --locked --release --target aarch64-apple-darwin \
+            -p mcp-agent-mail-tools --no-default-features --features portable \
             gh297_ -- --nocapture
 
       - name: Run focused compiler and lint gates
@@ -113,9 +124,11 @@ jobs:
           set -euo pipefail
           cargo check --locked --release --target aarch64-apple-darwin \
             -p mcp-agent-mail-db -p mcp-agent-mail-share -p mcp-agent-mail-cli \
+            -p mcp-agent-mail-server -p mcp-agent-mail-tools \
             --no-default-features --features portable --all-targets
           cargo clippy --locked --release --target aarch64-apple-darwin \
             -p mcp-agent-mail-db -p mcp-agent-mail-share -p mcp-agent-mail-cli \
+            -p mcp-agent-mail-server -p mcp-agent-mail-tools \
             --no-default-features --features portable --all-targets -- -D warnings
 
       - name: Build release-compatible portable binaries
@@ -165,8 +178,19 @@ jobs:
 
           curl --silent --show-error --fail --retry 30 --retry-delay 1 --retry-connrefused \
             --max-time 2 "http://127.0.0.1:$port/health" >/dev/null
-          echo "[e2e] server ready; allowing startup backfill to win the historical race"
-          sleep 3
+          echo "[e2e] server ready; waiting for proven startup backfill completion"
+          for attempt in $(seq 1 60); do
+            if [[ -f "$state_path" ]]; then
+              break
+            fi
+            if (( attempt % 10 == 0 )); then
+              echo "[e2e] still waiting for startup marker ($attempt/60)"
+            fi
+            sleep 1
+          done
+          test -f "$state_path"
+          jq -e --arg db "$database_path" '.db_path == $db' "$state_path" >/dev/null
+          echo "[e2e] startup marker existed before the first tool request"
 
           rpc() {
             curl --silent --show-error --fail --max-time 25 \
@@ -216,10 +240,23 @@ jobs:
           marker_before="$(shasum -a 256 "$state_path" | awk '{print $1}')"
           echo "[e2e] canonical marker before CLI search: $marker_before"
 
-          AM_INTERFACE_MODE=cli "$binary" robot search zebra --project "$project_root" --json \
-            >"$repair_root/robot-search.json"
-          echo "[e2e] robot search: ok"
+          preserved_state="$repair_root/canonical-backfill-state.before-robot.json"
+          mv "$state_path" "$preserved_state"
+          test ! -e "$state_path"
+          echo "[e2e] removed canonical marker from authority path while retaining exact bytes"
 
+          AM_INTERFACE_MODE=cli HTTP_PORT=1 "$binary" robot search zebra \
+            --project "$project_root" --json \
+            >"$repair_root/robot-search.json"
+          jq -e '
+            .total_results == 1
+            and ([.results[] | select(.subject == "zebra quantum handshake")] | length) == 1
+            and .route.used_like_fallback == true
+          ' "$repair_root/robot-search.json" >/dev/null
+          test ! -e "$state_path"
+          echo "[e2e] private robot search returned the seeded result without recreating the canonical marker"
+
+          mv "$preserved_state" "$state_path"
           marker_after="$(shasum -a 256 "$state_path" | awk '{print $1}')"
           test "$marker_after" = "$marker_before"
           jq -e --arg db "$database_path" '.db_path == $db' "$state_path" >/dev/null
@@ -236,7 +273,7 @@ jobs:
           file repair-artifact/am repair-artifact/mcp-agent-mail
           test "$(repair-artifact/am --version)" = "am 0.3.32"
           test "$(repair-artifact/mcp-agent-mail --version)" = "mcp-agent-mail 0.3.32"
-          printf '%s\n' "$GITHUB_SHA" > repair-artifact/SOURCE_COMMIT
+          printf '%s\n' "$REPAIR_HEAD_SHA" > repair-artifact/SOURCE_COMMIT
           (cd repair-artifact && shasum -a 256 am mcp-agent-mail > SHA256SUMS)
           cat repair-artifact/SOURCE_COMMIT repair-artifact/SHA256SUMS
 

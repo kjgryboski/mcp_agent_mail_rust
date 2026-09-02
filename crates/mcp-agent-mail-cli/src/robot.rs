@@ -1131,6 +1131,27 @@ fn robot_search_index_health_from_config(
     pool_cfg.warmup_connections = 0;
     let pool = mcp_agent_mail_db::create_pool_without_startup_init(&pool_cfg)
         .map_err(|err| format!("db pool init failed: {err}"))?;
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .map_err(|err| format!("search health runtime init failed: {err}"))?;
+    let cx = asupersync::Cx::for_testing();
+    match runtime.block_on(pool.acquire(&cx)) {
+        asupersync::Outcome::Ok(conn) => drop(conn),
+        asupersync::Outcome::Err(err) => {
+            return Err(format!(
+                "search health database identity probe failed: {err}"
+            ));
+        }
+        asupersync::Outcome::Cancelled(_) => {
+            return Err("search health database identity probe was cancelled".to_string());
+        }
+        asupersync::Outcome::Panicked(panic) => {
+            return Err(format!(
+                "search health database identity probe panicked: {}",
+                panic.message()
+            ));
+        }
+    }
     Ok(mcp_agent_mail_db::search_service::lexical_backfill_health(
         &pool,
     ))
@@ -1138,7 +1159,7 @@ fn robot_search_index_health_from_config(
 
 fn search_index_probe_status(health: &LexicalBackfillHealth) -> &'static str {
     match health.state.as_str() {
-        "fresh" | "in_memory" => "ok",
+        "fresh" | "in_memory" | "sql_only_snapshot" => "ok",
         "delayed" | "partial" => "degraded",
         _ => "fail",
     }
