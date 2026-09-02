@@ -189,7 +189,11 @@ jobs:
             sleep 1
           done
           test -f "$state_path"
-          jq -e --arg db "$database_path" '.db_path == $db' "$state_path" >/dev/null
+          jq -e --arg db "$database_path" '
+            .schema_version == 2
+            and .db_path == $db
+            and (.db_generation_id | test("^[0-9A-Fa-f]{16,128}$"))
+          ' "$state_path" >/dev/null
           echo "[e2e] startup marker existed before the first tool request"
 
           rpc() {
@@ -236,7 +240,11 @@ jobs:
           search_ok 6 "second consecutive MCP search"
 
           test -f "$state_path"
-          jq -e --arg db "$database_path" '.db_path == $db' "$state_path" >/dev/null
+          jq -e --arg db "$database_path" '
+            .schema_version == 2
+            and .db_path == $db
+            and (.db_generation_id | test("^[0-9A-Fa-f]{16,128}$"))
+          ' "$state_path" >/dev/null
           marker_before="$(shasum -a 256 "$state_path" | awk '{print $1}')"
           echo "[e2e] canonical marker before CLI search: $marker_before"
 

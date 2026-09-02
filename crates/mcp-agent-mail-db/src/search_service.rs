@@ -1040,6 +1040,8 @@ struct LexicalBackfillStateFile {
     #[serde(default)]
     db_path: String,
     #[serde(default)]
+    db_generation_id: String,
+    #[serde(default)]
     db_fingerprint: Option<LexicalBackfillDbFingerprint>,
     #[serde(default)]
     db_stats: LexicalBackfillStateStats,
@@ -1085,7 +1087,7 @@ fn read_lexical_backfill_state_file(
         .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
     let state = serde_json::from_str::<LexicalBackfillStateFile>(&raw)
         .map_err(|err| format!("cannot parse {}: {err}", path.display()))?;
-    if state.schema_version != 1 {
+    if state.schema_version != 2 {
         return Err(format!(
             "unsupported backfill state schema version {} in {}",
             state.schema_version,
@@ -1285,6 +1287,16 @@ pub fn lexical_backfill_health(pool: &DbPool) -> LexicalBackfillHealth {
             state.db_path,
             pool.sqlite_path()
         ))
+    } else if pool
+        .search_database_generation_id()
+        .is_some_and(|generation| {
+            state.db_generation_id.is_empty() || state.db_generation_id != generation
+        })
+    {
+        Some(format!(
+            "backfill marker database generation does not match the current database {}",
+            pool.sqlite_path()
+        ))
     } else if let Some(reason) = fingerprint_stale_reason {
         Some(reason)
     } else if active_key
@@ -1311,6 +1323,7 @@ pub fn lexical_backfill_health(pool: &DbPool) -> LexicalBackfillHealth {
         None => "fresh",
         Some(reason) if reason.starts_with("backfill marker belongs") => "stale",
         Some(reason) if reason.starts_with("backfill marker database identity") => "stale",
+        Some(reason) if reason.starts_with("backfill marker database generation") => "stale",
         Some(reason) if reason.starts_with("process-global lexical bridge") => "stale",
         Some(_) => "partial",
     };
@@ -5477,8 +5490,9 @@ mod tests {
             },
         );
         let payload = serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "db_path": db_path,
+            "db_generation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "db_fingerprint": {
                 "len_bytes": db_fingerprint.len_bytes,
                 "modified_micros": db_fingerprint.modified_micros,

@@ -3335,6 +3335,62 @@ impl DbPool {
         self.search_database_generation_id.get().map(String::as_str)
     }
 
+    /// Observe and validate the durable search identity using a connection the
+    /// caller already owns.
+    ///
+    /// This is the synchronous, no-open path for read-only CLI surfaces that
+    /// already hold the authoritative database connection. It updates only
+    /// this pool wrapper's in-memory identity cell; it does not acquire from
+    /// the pool, initialize the schema, or write to SQLite.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the connection belongs to another SQLite
+    /// authority or reports a different generation from one already observed
+    /// by this pool.
+    #[allow(clippy::result_large_err)]
+    pub fn observe_search_database_generation_from_conn(
+        &self,
+        conn: &DbConn,
+    ) -> Result<(), SqlError> {
+        let rows = conn.query_sync("PRAGMA database_list", &[])?;
+        let observed_path = rows
+            .iter()
+            .find(|row| row.get_named::<String>("name").ok().as_deref() == Some("main"))
+            .and_then(|row| row.get_named::<String>("file").ok())
+            .ok_or_else(|| {
+                SqlError::Custom(
+                    "existing connection did not report its main SQLite authority".to_string(),
+                )
+            })?;
+        match self.sqlite_identity.as_deref() {
+            None if !observed_path.is_empty() => {
+                return Err(SqlError::Custom(format!(
+                    "existing connection belongs to file-backed SQLite authority {observed_path}, but the health pool is in-memory"
+                )));
+            }
+            Some(expected) => {
+                if observed_path.is_empty() {
+                    return Err(SqlError::Custom(format!(
+                        "existing connection is in-memory, but the health pool is bound to {}",
+                        expected.display()
+                    )));
+                }
+                let observed = normalize_sqlite_identity_path_buf(Path::new(&observed_path));
+                if observed != expected {
+                    return Err(SqlError::Custom(format!(
+                        "existing connection belongs to SQLite authority {}, but the health pool is bound to {}; refusing to mix search state",
+                        observed.display(),
+                        expected.display()
+                    )));
+                }
+            }
+            None => {}
+        }
+
+        self.observe_search_database_generation_id(conn)
+    }
+
     #[allow(clippy::result_large_err)]
     fn observe_search_database_generation_id(&self, conn: &DbConn) -> Result<(), SqlError> {
         let Some(generation) = crate::queries::db_generation_id_conn(conn) else {
@@ -16516,6 +16572,51 @@ mod tests {
         assert_eq!(
             fts_artifact_count, 0,
             "in-memory pool acquire should remove legacy message FTS artifacts after runtime follow-up migrations"
+        );
+    }
+
+    #[test]
+    fn search_generation_observation_reuses_existing_connection_without_pool_open() {
+        const GENERATION: &str = "0123456789abcdef0123456789abcdef";
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let db_path = directory.path().join("existing-search-generation.sqlite3");
+        let conn = DbConn::open_file(db_path.display().to_string())
+            .expect("open caller-owned database connection");
+        conn.execute_raw(
+            "CREATE TABLE db_identity (\
+                 singleton INTEGER PRIMARY KEY CHECK (singleton = 0), \
+                 generation_id TEXT NOT NULL\
+             ); \
+             INSERT INTO db_identity (singleton, generation_id) \
+             VALUES (0, '0123456789abcdef0123456789abcdef');",
+        )
+        .expect("seed durable database generation");
+
+        let pool = create_pool_without_startup_init(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(directory.path().join("archive")),
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("construct unopened health pool");
+        assert_eq!(
+            pool.pool.stats().total_connections,
+            0,
+            "health pool must remain unopened before identity observation"
+        );
+
+        pool.observe_search_database_generation_from_conn(&conn)
+            .expect("observe generation from caller-owned connection");
+
+        assert_eq!(pool.search_database_generation_id(), Some(GENERATION));
+        assert_eq!(
+            pool.pool.stats().total_connections,
+            0,
+            "identity observation must not acquire or create a pooled SQLite handle"
         );
     }
 

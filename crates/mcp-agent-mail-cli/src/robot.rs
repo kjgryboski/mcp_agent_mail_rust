@@ -1123,6 +1123,7 @@ pub struct RecoveryAdmissionSnapshot {
 
 fn robot_search_index_health_from_config(
     config: &mcp_agent_mail_core::Config,
+    conn: &DbConn,
 ) -> Result<LexicalBackfillHealth, String> {
     let mut pool_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     pool_cfg.database_url = config.database_url.clone();
@@ -1131,27 +1132,8 @@ fn robot_search_index_health_from_config(
     pool_cfg.warmup_connections = 0;
     let pool = mcp_agent_mail_db::create_pool_without_startup_init(&pool_cfg)
         .map_err(|err| format!("db pool init failed: {err}"))?;
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-        .build()
-        .map_err(|err| format!("search health runtime init failed: {err}"))?;
-    let cx = asupersync::Cx::for_testing();
-    match runtime.block_on(pool.acquire(&cx)) {
-        asupersync::Outcome::Ok(conn) => drop(conn),
-        asupersync::Outcome::Err(err) => {
-            return Err(format!(
-                "search health database identity probe failed: {err}"
-            ));
-        }
-        asupersync::Outcome::Cancelled(_) => {
-            return Err("search health database identity probe was cancelled".to_string());
-        }
-        asupersync::Outcome::Panicked(panic) => {
-            return Err(format!(
-                "search health database identity probe panicked: {}",
-                panic.message()
-            ));
-        }
-    }
+    pool.observe_search_database_generation_from_conn(conn)
+        .map_err(|err| format!("search health database identity probe failed: {err}"))?;
     Ok(mcp_agent_mail_db::search_service::lexical_backfill_health(
         &pool,
     ))
@@ -14199,7 +14181,9 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                         Some(&mut phase),
                     )?;
                     let config = mcp_agent_mail_core::Config::from_env();
-                    if let Ok(search_index) = robot_search_index_health_from_config(&config) {
+                    if let Ok(search_index) =
+                        robot_search_index_health_from_config(&config, scope.conn())
+                    {
                         enrich_status_with_search_index(&mut data, &mut actions, search_index);
                         phase.mark("search_index_health");
                     }
@@ -14922,7 +14906,10 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             probes.push(archive_db_parity.probe);
 
             // 1e. Search V3 lexical index/backfill state (read-only).
-            let search_index = robot_search_index_health_from_config(&config);
+            let search_index = db_conn.as_ref().map_or_else(
+                || Err("search health requires a live database connection".to_string()),
+                |conn| robot_search_index_health_from_config(&config, conn),
+            );
             let (search_index_snapshot, search_index_unhealthy, search_index_degraded) =
                 match search_index {
                     Ok(snapshot) => {
