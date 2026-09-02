@@ -773,6 +773,27 @@ fn verify_backfill_path_generation(db_path: &str, expected: &str) -> Result<(), 
     verify_backfill_db_generation(&verification_conn, expected)
 }
 
+fn verify_backfill_path_snapshot(
+    db_path: &str,
+    expected_generation: &str,
+    expected_watermark: MessageWatermark,
+) -> Result<(), String> {
+    let verification_conn = open_backfill_conn(db_path)?;
+    verify_backfill_db_generation(&verification_conn, expected_generation)?;
+    let observed_watermark = fetch_db_message_watermark(&verification_conn)?;
+    if observed_watermark == expected_watermark {
+        Ok(())
+    } else {
+        Err(format!(
+            "backfill: message watermark changed while indexing (expected sequence/max-id {}/{}, observed {}/{}); refusing to publish a stale lexical marker",
+            expected_watermark.sequence,
+            expected_watermark.max_id,
+            observed_watermark.sequence,
+            observed_watermark.max_id
+        ))
+    }
+}
+
 fn fetch_db_message_stats(conn: &DbConn) -> Result<MessageStats, String> {
     // Keep COUNT and MAX in separate scalar subqueries; FrankensQLite rejects
     // mixed aggregate/non-aggregate projections in one SELECT.
@@ -1233,38 +1254,6 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
         Some(read_backfill_db_generation(&conn)?)
     };
     let db_fingerprint = sqlite_file_backfill_fingerprint(db_path);
-    let initial_index_fingerprint = index_meta_fingerprint(&bridge);
-    if let (Some(fingerprint), Some(state)) = (db_fingerprint, read_backfill_state(&bridge))
-        && state.db_path == *db_path
-        && db_generation_id
-            .as_deref()
-            .is_some_and(|generation| state.db_generation_id == generation)
-        && state.db_fingerprint == fingerprint
-        && state.index_meta_fingerprint == initial_index_fingerprint
-    {
-        // Re-open by path after releasing the scanned handle. If the path was
-        // replaced during this decision window, its generation will differ
-        // and the stale marker cannot authorize a skip.
-        drop(conn);
-        verify_backfill_path_generation(
-            db_path,
-            db_generation_id
-                .as_deref()
-                .expect("file-backed skip requires a durable generation"),
-        )?;
-        tracing::info!(
-            db_count = state.db_stats.count,
-            db_max_id = state.db_stats.max_id,
-            index_count = state.index_stats.count,
-            index_max_id = state.index_stats.max_id,
-            "backfill: sqlite/index meta fingerprints unchanged, skipping"
-        );
-        refresh_index_health_metrics(&bridge);
-        return Ok((
-            0,
-            usize::try_from(state.db_stats.count).unwrap_or(usize::MAX),
-        ));
-    }
 
     if !backfill_table_exists(&conn, "messages")? {
         let index_stats = fetch_index_message_stats(&bridge)?;
@@ -1305,7 +1294,7 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
         let generation = db_generation_id
             .as_deref()
             .expect("file-backed skip requires a durable generation");
-        verify_backfill_path_generation(db_path, generation)?;
+        verify_backfill_path_snapshot(db_path, generation, message_watermark)?;
         if let Some(fingerprint) = db_fingerprint
             && state.db_fingerprint != fingerprint
         {
@@ -1361,7 +1350,7 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
         let generation = db_generation_id
             .as_deref()
             .expect("file-backed skip requires a durable generation");
-        verify_backfill_path_generation(db_path, generation)?;
+        verify_backfill_path_snapshot(db_path, generation, message_watermark)?;
         if let Some(fingerprint) = sqlite_file_backfill_fingerprint(db_path) {
             write_backfill_state(
                 &bridge,
@@ -1513,7 +1502,7 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
     // continued serving rows successfully.
     drop(conn);
     if let Some(generation) = db_generation_id.as_deref() {
-        verify_backfill_path_generation(db_path, generation)?;
+        verify_backfill_path_snapshot(db_path, generation, message_watermark)?;
     }
 
     refresh_index_health_metrics(&bridge);
