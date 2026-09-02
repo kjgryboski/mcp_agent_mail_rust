@@ -6265,10 +6265,12 @@ mod tests {
                     sqlite_key_for_pool(&first),
                     first
                         .search_database_generation_id()
-                        .expect("first persisted generation"),
+                        .expect("first persisted generation")
+                        .to_owned(),
                     replacement_source
                         .search_database_generation_id()
-                        .expect("replacement source persisted generation"),
+                        .expect("replacement source persisted generation")
+                        .to_owned(),
                 )
             });
         assert_ne!(first_generation, replacement_source_generation);
