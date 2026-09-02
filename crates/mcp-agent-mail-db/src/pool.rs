@@ -16576,7 +16576,7 @@ mod tests {
     }
 
     #[test]
-    fn search_generation_observation_reuses_existing_connection_without_pool_open() {
+    fn gh296_search_generation_observation_reuses_existing_connection_without_pool_open() {
         const GENERATION: &str = "0123456789abcdef0123456789abcdef";
 
         let directory = tempfile::tempdir().expect("tempdir");
