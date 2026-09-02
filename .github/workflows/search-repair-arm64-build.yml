@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - codex/search-repair-20260902
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: read
