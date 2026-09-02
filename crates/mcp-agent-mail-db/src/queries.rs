@@ -5739,7 +5739,7 @@ pub fn db_generation_id_conn(conn: &crate::DbConn) -> Option<String> {
 ///
 /// Returns [`DbError`] when the identity table is unavailable, token creation
 /// fails, or the durable row cannot be read after an idempotent insert.
-pub fn ensure_db_generation_id_conn(conn: &crate::DbConn) -> Result<String, DbError> {
+pub fn ensure_db_generation_id_conn(conn: &crate::DbConn) -> std::result::Result<String, DbError> {
     if let Some(generation) = db_generation_id_conn(conn) {
         return Ok(generation);
     }
