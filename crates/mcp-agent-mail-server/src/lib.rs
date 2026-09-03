@@ -29571,10 +29571,10 @@ first body
     }
 
     #[test]
-    fn gh297_dashboard_open_connection_uses_archive_snapshot_when_live_db_is_stale() {
+    fn gh297_archive_backed_observability_snapshot_is_private_and_sql_only() {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage_root = dir.path().join("storage");
-        let db_path = dir.path().join("dashboard-stale.sqlite3");
+        let db_path = dir.path().join("dashboard-missing.sqlite3");
         let project_dir = storage_root.join("projects").join("ahead-project");
         let agent_dir = project_dir.join("agents").join("Alice");
         let messages_dir = project_dir.join("messages").join("2026").join("03");
@@ -29608,31 +29608,9 @@ first body
         )
         .expect("write canonical message");
 
-        let live_writer =
-            DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open live db");
-        live_writer
-            .execute_raw("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;")
-            .expect("retain live FrankenSQLite namespace sidecars");
-        live_writer
-            .execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
-            .expect("init schema");
         assert!(
-            mcp_agent_mail_core::disk::sqlite_sidecar_path(&db_path, "-wal").is_file(),
-            "fixture must retain the live WAL sidecar required by guarded salvage"
-        );
-        let wal_cert_path = mcp_agent_mail_core::disk::sqlite_sidecar_path(&db_path, "-wal-cert");
-        assert!(
-            std::fs::metadata(&wal_cert_path)
-                .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0),
-            "fixture must retain materialized FrankenSQLite WAL-certificate authority"
-        );
-        assert!(
-            mcp_agent_mail_core::disk::sqlite_sidecar_path(&db_path, "-fsqlite-ns-gate").is_file(),
-            "fixture must retain the live namespace gate required by guarded salvage"
-        );
-        assert!(
-            mcp_agent_mail_core::disk::sqlite_sidecar_path(&db_path, "-fsqlite-ns-use").is_file(),
-            "fixture must retain the live namespace use record required by guarded salvage"
+            !db_path.exists(),
+            "fixture requires the configured live database to be absent"
         );
 
         let database_url = format!("sqlite:///{}", db_path.display());
@@ -29671,9 +29649,9 @@ first body
             !snapshot_index.exists(),
             "archive-backed observability must not create a lexical index beside the snapshot"
         );
-        mcp_agent_mail_db::close_db_conn(
-            live_writer,
-            "GH#297 archive-backed observability fixture",
+        assert!(
+            !db_path.exists(),
+            "archive-backed observability must not initialize the configured live database"
         );
     }
 
