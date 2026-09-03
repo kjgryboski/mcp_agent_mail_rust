@@ -142,7 +142,7 @@ jobs:
           cargo clippy --locked --release --target aarch64-apple-darwin \
             -p mcp-agent-mail-db -p mcp-agent-mail-share -p mcp-agent-mail-cli \
             -p mcp-agent-mail-server -p mcp-agent-mail-tools \
-            --no-default-features --features portable --all-targets -- -D warnings
+            --no-default-features --features portable --all-targets --no-deps -- -D warnings
 
       - name: Build release-compatible portable binaries
         if: matrix.lane == 'binary-e2e'

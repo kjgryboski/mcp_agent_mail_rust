@@ -29620,9 +29620,11 @@ first body
             mcp_agent_mail_core::disk::sqlite_sidecar_path(&db_path, "-wal").is_file(),
             "fixture must retain the live WAL sidecar required by guarded salvage"
         );
+        let wal_cert_path = mcp_agent_mail_core::disk::sqlite_sidecar_path(&db_path, "-wal-cert");
         assert!(
-            mcp_agent_mail_core::disk::sqlite_sidecar_path(&db_path, "-shm").is_file(),
-            "fixture must retain the live SHM sidecar required by guarded salvage"
+            std::fs::metadata(&wal_cert_path)
+                .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0),
+            "fixture must retain materialized FrankenSQLite WAL-certificate authority"
         );
         assert!(
             mcp_agent_mail_core::disk::sqlite_sidecar_path(&db_path, "-fsqlite-ns-gate").is_file(),
