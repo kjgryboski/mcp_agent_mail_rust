@@ -29608,10 +29608,30 @@ first body
         )
         .expect("write canonical message");
 
-        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
-        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+        let live_writer =
+            DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open live db");
+        live_writer
+            .execute_raw("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;")
+            .expect("retain live FrankenSQLite namespace sidecars");
+        live_writer
+            .execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
             .expect("init schema");
-        drop(conn);
+        assert!(
+            mcp_agent_mail_core::disk::sqlite_sidecar_path(&db_path, "-wal").is_file(),
+            "fixture must retain the live WAL sidecar required by guarded salvage"
+        );
+        assert!(
+            mcp_agent_mail_core::disk::sqlite_sidecar_path(&db_path, "-shm").is_file(),
+            "fixture must retain the live SHM sidecar required by guarded salvage"
+        );
+        assert!(
+            mcp_agent_mail_core::disk::sqlite_sidecar_path(&db_path, "-fsqlite-ns-gate").is_file(),
+            "fixture must retain the live namespace gate required by guarded salvage"
+        );
+        assert!(
+            mcp_agent_mail_core::disk::sqlite_sidecar_path(&db_path, "-fsqlite-ns-use").is_file(),
+            "fixture must retain the live namespace use record required by guarded salvage"
+        );
 
         let database_url = format!("sqlite:///{}", db_path.display());
         let observed =
@@ -29648,6 +29668,10 @@ first body
         assert!(
             !snapshot_index.exists(),
             "archive-backed observability must not create a lexical index beside the snapshot"
+        );
+        mcp_agent_mail_db::close_db_conn(
+            live_writer,
+            "GH#297 archive-backed observability fixture",
         );
     }
 

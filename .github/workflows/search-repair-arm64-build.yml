@@ -19,9 +19,19 @@ env:
   BEADS_RUST_COMMIT: ba6ff75da25529c8cad8395352f5c5fc2162ee95
 
 jobs:
-  build-and-qualify:
+  qualify:
+    name: qualify-${{ matrix.lane }}
     runs-on: macos-14
     timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        lane:
+          - db-cli-regressions
+          - server-tools-regressions
+          - compiler-lint
+          - binary-e2e
 
     steps:
       - name: Check out exact repair commit
@@ -81,6 +91,7 @@ jobs:
             crates/mcp-agent-mail-tools/src/archive_read.rs
 
       - name: Resolve and retain the exact dependency graph
+        if: matrix.lane == 'binary-e2e'
         shell: bash
         run: |
           set -euo pipefail
@@ -90,6 +101,7 @@ jobs:
           shasum -a 256 Cargo.lock
 
       - name: Upload resolved lockfile for exact-head reconciliation
+        if: matrix.lane == 'binary-e2e'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: agent-mail-search-repair-resolved-lock-${{ github.run_id }}
@@ -98,27 +110,28 @@ jobs:
           retention-days: 7
           compression-level: 0
 
-      - name: Run focused search regressions
+      - name: Run focused database and CLI search regressions
+        if: matrix.lane == 'db-cli-regressions'
         shell: bash
         run: |
           set -euo pipefail
           cargo test --locked --release --target aarch64-apple-darwin \
-            -p mcp-agent-mail-db --no-default-features --features portable \
-            --lib gh296_ -- --nocapture --test-threads=1
+            -p mcp-agent-mail-db -p mcp-agent-mail-cli \
+            --no-default-features --features portable \
+            --lib gh29 -- --nocapture --test-threads=1
+
+      - name: Run focused server and tools search regressions
+        if: matrix.lane == 'server-tools-regressions'
+        shell: bash
+        run: |
+          set -euo pipefail
           cargo test --locked --release --target aarch64-apple-darwin \
-            -p mcp-agent-mail-db --no-default-features --features portable \
-            --lib gh297_ -- --nocapture --test-threads=1
-          cargo test --locked --release --target aarch64-apple-darwin \
-            -p mcp-agent-mail-cli --no-default-features --features portable \
-            --lib gh297_ -- --nocapture --test-threads=1
-          cargo test --locked --release --target aarch64-apple-darwin \
-            -p mcp-agent-mail-server --no-default-features --features portable \
-            --lib gh297_ -- --nocapture --test-threads=1
-          cargo test --locked --release --target aarch64-apple-darwin \
-            -p mcp-agent-mail-tools --no-default-features --features portable \
+            -p mcp-agent-mail-server -p mcp-agent-mail-tools \
+            --no-default-features --features portable \
             --lib gh297_ -- --nocapture --test-threads=1
 
       - name: Run focused compiler and lint gates
+        if: matrix.lane == 'compiler-lint'
         shell: bash
         run: |
           set -euo pipefail
@@ -132,6 +145,7 @@ jobs:
             --no-default-features --features portable --all-targets -- -D warnings
 
       - name: Build release-compatible portable binaries
+        if: matrix.lane == 'binary-e2e'
         shell: bash
         run: |
           set -euo pipefail
@@ -140,6 +154,7 @@ jobs:
             --no-default-features --features portable
 
       - name: Prove repeated MCP search and snapshot-marker safety end to end
+        if: matrix.lane == 'binary-e2e'
         shell: bash
         run: |
           set -euo pipefail
@@ -272,6 +287,7 @@ jobs:
           search_ok 7 "MCP search after CLI snapshot search"
 
       - name: Verify binary surfaces and provenance
+        if: matrix.lane == 'binary-e2e'
         shell: bash
         run: |
           set -euo pipefail
@@ -286,6 +302,7 @@ jobs:
           cat repair-artifact/SOURCE_COMMIT repair-artifact/SHA256SUMS
 
       - name: Upload qualified arm64 repair binaries
+        if: matrix.lane == 'binary-e2e'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: agent-mail-search-repair-aarch64-apple-darwin
