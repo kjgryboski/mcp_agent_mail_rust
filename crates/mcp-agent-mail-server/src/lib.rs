@@ -164,22 +164,23 @@ use mcp_agent_mail_tools::{
     AcknowledgeMessage, AcquireBuildSlot, AgentsListResource, CheckFileReservationConflicts,
     CleanupPaneIdentities, ConfigEnvironmentQueryResource, ConfigEnvironmentResource,
     CreateAgentIdentity, DeregisterAgent, EnsureProduct, EnsureProject, FetchInbox,
-    FetchInboxEvents, FetchInboxProduct, FileReservationPaths, FileReservationsResource,
-    ForceReleaseFileReservation, GetMessageDeliveryReceipt, HealthCheck, IdentityProjectResource,
-    InboxResource, InstallPrecommitGuard, ListAgents, ListContacts, MacroContactHandshake,
-    MacroFileReservationCycle, MacroPrepareThread, MacroStartSession, MailboxResource,
-    MailboxWithCommitsResource, MarkMessageRead, MessageDetailsResource, OutboxResource,
-    ProductDetailsResource, ProductsLink, ProjectDetailsResource, ProjectsListQueryResource,
-    ProjectsListResource, RegisterAgent, ReleaseBuildSlot, ReleaseFileReservations, RenewBuildSlot,
-    RenewFileReservations, ReplyMessage, RequestContact, ResolvePaneIdentity, RespondContact,
-    RetireAgent, SearchMessages, SearchMessagesProduct, SendMessage, SetContactPolicy,
-    SummarizeThread, SummarizeThreadProduct, ThreadDetailsResource, ToolingCapabilitiesResource,
-    ToolingDiagnosticsQueryResource, ToolingDiagnosticsResource, ToolingDirectoryQueryResource,
-    ToolingDirectoryResource, ToolingLocksQueryResource, ToolingLocksResource,
-    ToolingMetricsCoreQueryResource, ToolingMetricsCoreResource, ToolingMetricsQueryResource,
-    ToolingMetricsResource, ToolingRecentResource, ToolingSchemasQueryResource,
-    ToolingSchemasResource, UninstallPrecommitGuard, UnretireAgent, ViewsAckOverdueResource,
-    ViewsAckRequiredResource, ViewsAcksStaleResource, ViewsUrgentUnreadResource, Whois, clusters,
+    FetchInboxEvents, FetchInboxProduct, FetchTopic, FileReservationPaths,
+    FileReservationsResource, ForceReleaseFileReservation, GetMessageDeliveryReceipt, HealthCheck,
+    IdentityProjectResource, InboxResource, InstallPrecommitGuard, ListAgents, ListContacts,
+    MacroContactHandshake, MacroFileReservationCycle, MacroPrepareThread, MacroStartSession,
+    MailboxResource, MailboxWithCommitsResource, MarkAllRead, MarkMessageRead,
+    MessageDetailsResource, OutboxResource, ProductDetailsResource, ProductsLink,
+    ProjectDetailsResource, ProjectsListQueryResource, ProjectsListResource, RegisterAgent,
+    ReleaseBuildSlot, ReleaseFileReservations, RenewBuildSlot, RenewFileReservations, ReplyMessage,
+    RequestContact, ResolvePaneIdentity, RespondContact, RetireAgent, SearchMessages,
+    SearchMessagesProduct, SendMessage, SetContactPolicy, SummarizeThread, SummarizeThreadProduct,
+    ThreadDetailsResource, ToolingCapabilitiesResource, ToolingDiagnosticsQueryResource,
+    ToolingDiagnosticsResource, ToolingDirectoryQueryResource, ToolingDirectoryResource,
+    ToolingLocksQueryResource, ToolingLocksResource, ToolingMetricsCoreQueryResource,
+    ToolingMetricsCoreResource, ToolingMetricsQueryResource, ToolingMetricsResource,
+    ToolingRecentResource, ToolingSchemasQueryResource, ToolingSchemasResource,
+    UninstallPrecommitGuard, UnretireAgent, ViewsAckOverdueResource, ViewsAckRequiredResource,
+    ViewsAcksStaleResource, ViewsUrgentUnreadResource, Whois, clusters,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -198,6 +199,25 @@ struct InstrumentedTool<T> {
     tool_index: usize,
     tool_name: &'static str,
     inner: T,
+}
+
+/// Preserve Agent Mail's client-facing legacy error envelope across the MCP
+/// tool-result boundary.
+///
+/// FastMCP correctly converts handler `ToolExecutionError`s into an
+/// `isError=true` result, but the legacy result shape only carries text and
+/// therefore otherwise drops `McpError::data`. Agent Mail's tools deliberately
+/// put their stable error type and recovery metadata in that data field. Only
+/// recognized Agent Mail envelopes are serialized here; framework and opaque
+/// errors retain their original messages and sanitization behavior.
+fn preserve_legacy_tool_error_payload(mut error: McpError) -> McpError {
+    if mcp_agent_mail_tools::tool_error_code(&error).is_some()
+        && let Some(data) = error.data.as_ref()
+        && let Ok(serialized) = serde_json::to_string(data)
+    {
+        error.message = serialized;
+    }
+    error
 }
 
 struct InflightGuard {
@@ -359,7 +379,7 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
             agent,
         ));
 
-        out
+        out.map_err(preserve_legacy_tool_error_payload)
     }
 
     fn call_async<'a>(
@@ -486,7 +506,12 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
                 agent,
             ));
 
-            out
+            match out {
+                fastmcp_core::Outcome::Err(error) => {
+                    fastmcp_core::Outcome::Err(preserve_legacy_tool_error_payload(error))
+                }
+                other => other,
+            }
         })
     }
 }
@@ -713,6 +738,13 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> fastmcp_server::Ser
     let server = add_tool(
         server,
         config,
+        "fetch_topic",
+        clusters::MESSAGING,
+        FetchTopic,
+    );
+    let server = add_tool(
+        server,
+        config,
         "fetch_inbox_events",
         clusters::MESSAGING,
         FetchInboxEvents,
@@ -723,6 +755,13 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> fastmcp_server::Ser
         "mark_message_read",
         clusters::MESSAGING,
         MarkMessageRead,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "mark_all_read",
+        clusters::MESSAGING,
+        MarkAllRead,
     );
     let server = add_tool(
         server,
@@ -1013,15 +1052,13 @@ impl Drop for StartupSearchBackfillResetGuard {
 }
 
 fn record_startup_search_backfill_completion(config: &mcp_agent_mail_core::Config) {
-    // GH#261: record completion under the SAME identity the health probe and
-    // query gate compare against — the live pool's `sqlite_identity_key()`
-    // ("path@generation"). Recording the bare URL-derived path marked the
-    // daemon's own (and only) database as "active for a different database"
-    // forever, permanently degrading every search to the plain-SQL fallback
-    // whenever the startup backfill completed before the first search (the
-    // common boot order for an always-on daemon). Resolve — or create — the
-    // same env-shaped pool the request handlers use so the recorded key
-    // carries the matching cache generation.
+    // GH#261/GH#296: record completion under the SAME stable file identity the
+    // health probe and query gate compare against. Recording the bare
+    // URL-derived path — or a short-lived pool's private cache generation —
+    // marked the daemon's own database as "active for a different database"
+    // and permanently degraded later request pools to the plain-SQL fallback.
+    // The DB layer derives a stable search identity from the normalized path
+    // plus file identity, while still changing it after same-path replacement.
     if !mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
         let mut db_config = DbPoolConfig::from_env();
         db_config.database_url = config.database_url.clone();
@@ -1044,8 +1081,9 @@ fn record_startup_search_backfill_completion(config: &mcp_agent_mail_core::Confi
                 tracing::warn!(
                     error = %error,
                     "[startup-search] could not resolve the live pool for lexical bootstrap \
-                     completion; falling back to database-url identity"
+                     completion; leaving bootstrap state lazy until the first proven request pool"
                 );
+                return;
             }
         }
     }
@@ -3300,6 +3338,14 @@ pub(crate) fn open_observability_db_pool(
     };
     let pool = mcp_agent_mail_db::create_pool(&cfg)
         .map_err(|e| format!("failed to initialize DB pool: {e}"))?;
+    let pool = if snapshot_dir.is_some() {
+        // Archive reconstruction is a caller-owned private snapshot. It may
+        // inherit the canonical storage root for archive context, but it must
+        // never acquire authority over the live search index or its marker.
+        pool.with_ephemeral_search_index()
+    } else {
+        pool
+    };
     Ok(ObservabilityDbPool {
         pool,
         _snapshot_dir: snapshot_dir,
@@ -6331,17 +6377,21 @@ fn atc_durable_experience_store_writable(pool: &mcp_agent_mail_db::DbPool) -> bo
 /// Whether the ATC operator may persist durable experience rows this run.
 ///
 /// Requires BOTH (a) an executing executor mode (Live/Canary — Shadow/DryRun
-/// suppress real actions and durable rows) AND (b) a non-Off write mode. Write
-/// mode Off — the default, or via `AM_ATC_WRITE_MODE=off`, `ATC_LEARNING_DISABLED`,
-/// or the runtime kill switch — means the learning ledger is NOT written,
-/// regardless of executor mode. The executor independently defaults to Shadow;
-/// Live/Canary execution and experience writes both require explicit opt-in.
+/// suppress real actions and durable rows) AND (b) Live write mode. Shadow write
+/// mode is trace-only; Off — the default, or via `AM_ATC_WRITE_MODE=off` —
+/// suppresses experience-ledger activity. `ATC_LEARNING_DISABLED` also disables
+/// the operator runtime entirely. The executor independently defaults to Shadow,
+/// so effect execution and experience persistence each require explicit opt-in.
+/// The file-backed runtime kill switch overrides an otherwise-live combination.
 fn atc_durable_writes_enabled(
     write_mode: mcp_agent_mail_core::AtcWriteMode,
     executor_mode: AtcExecutorMode,
     atc_db_pool: Option<&mcp_agent_mail_db::DbPool>,
+    kill_switch_active: bool,
 ) -> bool {
-    !write_mode.is_off() && atc_durable_experience_store_enabled(executor_mode, atc_db_pool)
+    !kill_switch_active
+        && write_mode.is_live()
+        && atc_durable_experience_store_enabled(executor_mode, atc_db_pool)
 }
 
 fn atc_durable_experience_store_enabled(
@@ -8304,8 +8354,6 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
     if atc_db_pool.is_none() {
         tracing::warn!("ATC durable experience append disabled: failed to acquire DB pool");
     }
-    let durable_writes_enabled =
-        atc_durable_writes_enabled(config.atc_write_mode, executor_mode, atc_db_pool.as_ref());
     let mut recent_actions = VecDeque::with_capacity(ATC_OPERATOR_ACTION_CAPACITY);
     let mut recent_executions = VecDeque::with_capacity(ATC_OPERATOR_EXECUTION_CAPACITY);
     let mut last_action_by_key: HashMap<String, i64> = HashMap::new();
@@ -8331,6 +8379,12 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
 
     while !stop.load(Ordering::Relaxed) {
         atc::refresh_kill_switch();
+        let durable_writes_enabled = atc_durable_writes_enabled(
+            config.atc_write_mode,
+            executor_mode,
+            atc_db_pool.as_ref(),
+            atc::atc_kill_switch_active(),
+        );
         let started_at = Instant::now();
         let sync_check_micros = mcp_agent_mail_core::timestamps::now_micros();
         if let Some(pool) = atc_db_pool.as_ref()
@@ -8415,7 +8469,7 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
                     if let Some(dropped) = pending_effects.pop_front() {
                         let dropped_key = atc_effect_semantic_key(&dropped);
                         pending_effect_keys.remove(&dropped_key);
-                        if let Some(pool) = atc_db_pool.as_ref() {
+                        if durable_writes_enabled && let Some(pool) = atc_db_pool.as_ref() {
                             capture_atc_execution_result(
                                 pool,
                                 dropped.experience_id,
@@ -8467,7 +8521,7 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
                 };
                 pending_effect_keys.remove(&cooldown_key);
                 let status = format!("throttled:{}", effect.semantics.family);
-                if let Some(pool) = atc_db_pool.as_ref() {
+                if durable_writes_enabled && let Some(pool) = atc_db_pool.as_ref() {
                     capture_atc_execution_result(
                         pool,
                         effect.experience_id,
@@ -8503,7 +8557,7 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
                 last_action_by_key.insert(cooldown_key, now_micros);
             }
             // Capture execution result into durable experience store (br-0qt6e.2.2).
-            if let Some(pool) = atc_db_pool.as_ref() {
+            if durable_writes_enabled && let Some(pool) = atc_db_pool.as_ref() {
                 capture_atc_execution_result(
                     pool,
                     effect.experience_id,
@@ -8532,7 +8586,8 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
                 sweep_open_experiences_for_resolution(pool, now_micros, 600_000_000);
             }
         }
-        if let Some(pool) = atc_db_pool.as_ref()
+        if durable_writes_enabled
+            && let Some(pool) = atc_db_pool.as_ref()
             && now_micros >= next_rollup_refresh_micros
         {
             let cx = Cx::for_request_with_budget(Budget::INFINITE);
@@ -10842,6 +10897,10 @@ fn fetch_dashboard_db_stats_from_conn(conn: &DbConn) -> DashboardDbStats {
     let agents_list = conn
         .query_sync(
             "SELECT id, name, program, last_active_ts FROM agents \
+             WHERE retired_at IS NULL \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM agent_deregistrations d WHERE d.agent_id = agents.id \
+               ) \
              ORDER BY last_active_ts DESC LIMIT 10",
             &[],
         )
@@ -17574,6 +17633,7 @@ mod tests {
     use super::*;
     use asupersync::http::h1::types::Version as Http1Version;
     use chrono::Utc;
+    use fastmcp_protocol::{CallToolParams, LegacyContent};
     use ftui_runtime::stdio_capture::StdioCapture;
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -17941,6 +18001,70 @@ mod tests {
                 serde_json::json!({}),
             ))
         }
+    }
+
+    #[test]
+    fn fetch_topic_is_admitted_through_the_instrumented_router_boundary() {
+        let tool_index = mcp_agent_mail_tools::tool_index("fetch_topic")
+            .expect("fetch_topic must have a metrics index");
+        let mut router = fastmcp::Router::new();
+        router
+            .add_tool(InstrumentedTool {
+                tool_index,
+                tool_name: "fetch_topic",
+                inner: FetchTopic,
+            })
+            .expect("fetch_topic must satisfy both legacy and final tool admission");
+
+        assert_eq!(
+            router
+                .tools()
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect::<Vec<_>>(),
+            vec!["fetch_topic"]
+        );
+    }
+
+    #[test]
+    fn legacy_tool_error_payload_survives_the_router_result_boundary() {
+        let tool_index = mcp_agent_mail_tools::tool_index("acquire_build_slot")
+            .expect("acquire_build_slot must have a metrics index");
+        let mut router = fastmcp::Router::new();
+        router
+            .add_tool(InstrumentedTool {
+                tool_index,
+                tool_name: "acquire_build_slot",
+                inner: FailingTool {
+                    code: "CONTACT_REQUIRED",
+                },
+            })
+            .expect("failing test tool must be admitted");
+
+        let cx = Cx::for_testing();
+        let result = router
+            .handle_tools_call(
+                &McpContext::new(cx, 1),
+                CallToolParams {
+                    name: "failing".to_string(),
+                    arguments: Some(serde_json::json!({})),
+                    meta: None,
+                },
+                SessionState::new(),
+                None,
+                None,
+            )
+            .expect("tool-level failure must remain a successful JSON-RPC tools/call result");
+
+        assert!(result.is_error);
+        let LegacyContent::Text { text, .. } = &result.content[0] else {
+            panic!("tool error must use text content");
+        };
+        let payload: serde_json::Value =
+            serde_json::from_str(text).expect("tool error text must retain its JSON envelope");
+        assert_eq!(payload["error"]["type"], "CONTACT_REQUIRED");
+        assert_eq!(payload["error"]["message"], "synthetic failure");
+        assert_eq!(payload["error"]["recoverable"], true);
     }
 
     /// Fetch `(calls, errors, rejections)` for a tool from the full snapshot.
@@ -21348,7 +21472,7 @@ first body
     }
 
     #[test]
-    fn atc_durable_writes_require_non_off_write_mode_and_executing_executor() {
+    fn atc_durable_writes_require_live_write_mode_and_executing_executor() {
         use mcp_agent_mail_core::AtcWriteMode;
         let pool = create_pool(&DbPoolConfig {
             database_url: "sqlite:///:memory:".to_string(),
@@ -21365,36 +21489,51 @@ first body
         assert!(!atc_durable_writes_enabled(
             AtcWriteMode::Off,
             AtcExecutorMode::Live,
-            Some(&pool)
+            Some(&pool),
+            false
         ));
         assert!(!atc_durable_writes_enabled(
             AtcWriteMode::Off,
             AtcExecutorMode::Canary,
-            Some(&pool)
+            Some(&pool),
+            false
         ));
-        // Shadow/Live write mode + an executing executor allows durable writes.
-        assert!(atc_durable_writes_enabled(
+        // Shadow write mode is trace-only even with an executing executor.
+        assert!(!atc_durable_writes_enabled(
             AtcWriteMode::Shadow,
             AtcExecutorMode::Live,
-            Some(&pool)
+            Some(&pool),
+            false
         ));
+        // Live write mode + an executing executor allows durable writes.
         assert!(atc_durable_writes_enabled(
             AtcWriteMode::Live,
             AtcExecutorMode::Live,
-            Some(&pool)
+            Some(&pool),
+            false
         ));
         // A non-executing executor (Shadow/DryRun) still suppresses durable rows
         // even with a writing write mode.
         assert!(!atc_durable_writes_enabled(
             AtcWriteMode::Live,
             AtcExecutorMode::Shadow,
-            Some(&pool)
+            Some(&pool),
+            false
         ));
         // No pool → never writable.
         assert!(!atc_durable_writes_enabled(
             AtcWriteMode::Live,
             AtcExecutorMode::Live,
-            None
+            None,
+            false
+        ));
+        // The file-backed runtime kill switch is re-read every operator tick
+        // and overrides an otherwise fully-live configuration immediately.
+        assert!(!atc_durable_writes_enabled(
+            AtcWriteMode::Live,
+            AtcExecutorMode::Live,
+            Some(&pool),
+            true
         ));
     }
 
@@ -29432,10 +29571,10 @@ first body
     }
 
     #[test]
-    fn dashboard_open_connection_uses_archive_snapshot_when_live_db_is_stale() {
+    fn gh297_archive_backed_observability_snapshot_is_private_and_sql_only() {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage_root = dir.path().join("storage");
-        let db_path = dir.path().join("dashboard-stale.sqlite3");
+        let db_path = dir.path().join("dashboard-missing.sqlite3");
         let project_dir = storage_root.join("projects").join("ahead-project");
         let agent_dir = project_dir.join("agents").join("Alice");
         let messages_dir = project_dir.join("messages").join("2026").join("03");
@@ -29469,10 +29608,10 @@ first body
         )
         .expect("write canonical message");
 
-        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
-        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
-            .expect("init schema");
-        drop(conn);
+        assert!(
+            !db_path.exists(),
+            "fixture requires the configured live database to be absent"
+        );
 
         let database_url = format!("sqlite:///{}", db_path.display());
         let observed =
@@ -29486,6 +29625,34 @@ first body
             .query_sync("SELECT COUNT(*) AS c FROM messages", &[])
             .expect("query snapshot messages");
         assert_eq!(rows[0].get_named::<i64>("c").unwrap_or(0), 1);
+        drop(observed);
+
+        let observed_pool = open_observability_db_pool(
+            &database_url,
+            &storage_root,
+            "GH#297 archive-backed observability pool",
+        )
+        .expect("open archive-backed observability pool");
+        let snapshot_index = observed_pool
+            ._snapshot_dir
+            .as_ref()
+            .expect("fixture must exercise the private archive-snapshot pool")
+            .path()
+            .join("search_index");
+        let search_health =
+            mcp_agent_mail_db::search_service::lexical_backfill_health(observed_pool.pool());
+        assert_eq!(
+            search_health.state, "sql_only_snapshot",
+            "archive-backed observability search must be explicitly SQL-only"
+        );
+        assert!(
+            !snapshot_index.exists(),
+            "archive-backed observability must not create a lexical index beside the snapshot"
+        );
+        assert!(
+            !db_path.exists(),
+            "archive-backed observability must not initialize the configured live database"
+        );
     }
 
     #[test]

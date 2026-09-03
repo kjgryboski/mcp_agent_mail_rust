@@ -55,106 +55,137 @@ fn has_file_reservations_released_ts_column(conn: &DbConn) -> bool {
         })
 }
 
-fn legacy_active_reservation_predicate_sql(
-    table_ref: &str,
-    has_legacy_released_ts_column: bool,
-) -> String {
-    if !has_legacy_released_ts_column {
-        return "1 = 1".to_string();
-    }
-    let table_ref = table_ref.trim().trim_end_matches('.');
-    // Validate table_ref is a safe SQL identifier (alphanumeric + underscore only)
-    // to prevent SQL injection via crafted table alias names.
-    let is_safe = !table_ref.is_empty()
-        && table_ref
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_');
-    let predicate = mcp_agent_mail_db::queries::ACTIVE_RESERVATION_LEGACY_PREDICATE;
-    if !is_safe || table_ref == "file_reservations" {
-        predicate.to_string()
-    } else {
-        predicate
-            .replace("released_ts", &format!("{table_ref}.released_ts"))
-            .replace("file_reservations.id", &format!("{table_ref}.id"))
-    }
-}
-
 fn has_file_reservation_release_ledger(conn: &DbConn) -> bool {
     conn.query_sync("PRAGMA table_info(file_reservation_releases)", &[])
         .ok()
         .is_some_and(|rows| !rows.is_empty())
 }
 
-fn active_reservation_release_join_sql(
-    has_release_ledger: bool,
+/// GH#274/GH#180: SQL-side *candidate* predicate for active reservations —
+/// the cheap `released_ts`-only check with no release-ledger anti-join. The
+/// ledger anti-join (`LEFT JOIN file_reservation_releases … IS NULL` or the
+/// uncorrelated `NOT IN`) degrades to O(N·M) under sqlmodel-frankensqlite
+/// join execution, so callers fetch candidate rows with this predicate and
+/// subtract the ledger's reservation IDs in Rust via [`ReleaseLedgerIndex`].
+fn active_reservation_candidate_sql(
+    has_legacy_released_ts_column: bool,
     table_ref: &str,
-    release_alias: &str,
 ) -> String {
-    if has_release_ledger {
-        format!(
-            " LEFT JOIN file_reservation_releases {release_alias} ON {release_alias}.reservation_id = {table_ref}.id"
-        )
+    if has_legacy_released_ts_column {
+        mcp_agent_mail_db::queries::active_reservation_candidate_predicate_for(table_ref)
     } else {
-        String::new()
+        "1 = 1".to_string()
     }
 }
 
-fn active_reservation_filter_sql(
-    has_release_ledger: bool,
-    has_legacy_released_ts_column: bool,
-    table_ref: &str,
-    release_alias: &str,
-) -> String {
-    let legacy = legacy_active_reservation_predicate_sql(table_ref, has_legacy_released_ts_column);
-    match (has_release_ledger, has_legacy_released_ts_column) {
-        (true, true) => format!("({legacy}) AND {release_alias}.reservation_id IS NULL"),
-        (true, false) => format!("{release_alias}.reservation_id IS NULL"),
-        (false, _) => legacy,
+/// Select expression for the legacy `released_ts` column, or SQL `NULL` on
+/// schemas that dropped it. Ledger release timestamps are merged in Rust via
+/// [`ReleaseLedgerIndex::coalesce`], mirroring the former SQL
+/// `COALESCE(ledger.released_ts, fr.released_ts)`.
+fn legacy_released_ts_select_sql(has_legacy_released_ts_column: bool, table_ref: &str) -> String {
+    if has_legacy_released_ts_column {
+        format!("{table_ref}.released_ts")
+    } else {
+        "NULL".to_string()
     }
 }
 
-fn reservation_released_ts_sql(
-    has_release_ledger: bool,
-    has_legacy_released_ts_column: bool,
-    table_ref: &str,
-    release_alias: &str,
-) -> String {
-    let table_ref = table_ref.trim().trim_end_matches('.');
-    // Validate SQL identifier safety for both interpolated parameters.
-    let safe_ident =
-        |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-    let table_ref = if safe_ident(table_ref) {
-        table_ref
-    } else {
-        "file_reservations"
-    };
-    let release_alias = if safe_ident(release_alias) {
-        release_alias
-    } else {
-        "frl"
-    };
-    let legacy_release_expr = has_legacy_released_ts_column.then(|| {
-        format!(
-            "CASE \
-                 WHEN {table_ref}.released_ts IS NULL THEN NULL \
-                 WHEN typeof({table_ref}.released_ts) = 'text' THEN \
-                     CAST(strftime('%s', REPLACE(REPLACE({table_ref}.released_ts, 'T', ' '), 'Z', '')) AS INTEGER) * 1000000 + \
-                     CASE WHEN instr({table_ref}.released_ts, '.') > 0 \
-                          THEN CAST(substr({table_ref}.released_ts || '000000', instr({table_ref}.released_ts, '.') + 1, 6) AS INTEGER) \
-                          ELSE 0 \
-                     END \
-                 ELSE {table_ref}.released_ts \
-             END"
-        )
-    });
-    match (has_release_ledger, legacy_release_expr) {
-        (true, Some(legacy_release_expr)) => {
-            format!("COALESCE({release_alias}.released_ts, {legacy_release_expr})")
+/// In-memory image of the `file_reservation_releases` sidecar ledger.
+///
+/// GH#274: fetched once per command (a single-column scan, cheap in any
+/// engine) so active-view queries can subtract released reservations in Rust
+/// instead of via the O(N·M) SQL anti-join (GH#180). Ledger membership marks
+/// a reservation released regardless of the stored timestamp, matching the
+/// former `release.reservation_id IS NULL` filter; reservation IDs are
+/// globally unique, so the unscoped set is safe against project-scoped rows.
+#[derive(Debug, Default)]
+struct ReleaseLedgerIndex {
+    released_ts_by_id: HashMap<i64, Option<i64>>,
+}
+
+impl ReleaseLedgerIndex {
+    fn contains(&self, reservation_id: i64) -> bool {
+        self.released_ts_by_id.contains_key(&reservation_id)
+    }
+
+    /// Mirror of the former SQL `COALESCE(ledger.released_ts, <legacy>)`.
+    fn coalesce(&self, reservation_id: i64, legacy_released_ts: Option<i64>) -> Option<i64> {
+        match self.released_ts_by_id.get(&reservation_id) {
+            Some(Some(ledger_ts)) => Some(*ledger_ts),
+            Some(None) | None => legacy_released_ts,
         }
-        (true, None) => format!("{release_alias}.released_ts"),
-        (false, Some(legacy_release_expr)) => legacy_release_expr,
-        (false, None) => "NULL".to_string(),
     }
+}
+
+fn release_ledger_index(
+    conn: &DbConn,
+    has_release_ledger: bool,
+) -> Result<ReleaseLedgerIndex, CliError> {
+    if !has_release_ledger {
+        return Ok(ReleaseLedgerIndex::default());
+    }
+    let rows = conn
+        .query_sync(
+            "SELECT reservation_id, released_ts FROM file_reservation_releases",
+            &[],
+        )
+        .map_err(|e| CliError::Other(format!("release ledger query failed: {e}")))?;
+    let mut released_ts_by_id = HashMap::with_capacity(rows.len());
+    for row in &rows {
+        let Some(id) = row
+            .get_by_name("reservation_id")
+            .and_then(sqlmodel_core::Value::as_i64)
+        else {
+            continue;
+        };
+        let released_ts = row.get_by_name("released_ts").and_then(value_to_micros);
+        released_ts_by_id.insert(id, released_ts);
+    }
+    Ok(ReleaseLedgerIndex { released_ts_by_id })
+}
+
+/// Rust mirror of [`ACTIVE_RESERVATION_LEGACY_PREDICATE`]'s sentinel
+/// handling for a raw legacy `released_ts` value (NULL, non-positive
+/// numbers, and empty/`0`/`null`/`none`/non-positive-numeric text all mean
+/// "never released").
+///
+/// [`ACTIVE_RESERVATION_LEGACY_PREDICATE`]: mcp_agent_mail_db::queries::ACTIVE_RESERVATION_LEGACY_PREDICATE
+fn legacy_released_value_is_active(raw: Option<&sqlmodel_core::Value>) -> bool {
+    use sqlmodel_core::Value as V;
+    match raw {
+        None | Some(V::Null) => true,
+        Some(V::Timestamp(v) | V::TimestampTz(v) | V::Time(v) | V::BigInt(v)) => *v <= 0,
+        Some(V::Date(v) | V::Int(v)) => *v <= 0,
+        Some(V::SmallInt(v)) => *v <= 0,
+        Some(V::TinyInt(v)) => *v <= 0,
+        Some(V::Bool(v)) => !*v,
+        Some(V::Double(v)) => *v <= 0.0,
+        Some(V::Float(v)) => *v <= 0.0,
+        Some(V::Decimal(s) | V::Text(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return true;
+            }
+            let lower = trimmed.to_ascii_lowercase();
+            if matches!(lower.as_str(), "0" | "null" | "none") {
+                return true;
+            }
+            trimmed.parse::<f64>().is_ok_and(|number| number <= 0.0)
+        }
+        Some(_) => false,
+    }
+}
+
+/// Full active-reservation check for one fetched row: the legacy
+/// `released_ts` sentinel check plus the Rust-side release-ledger
+/// subtraction. Equivalent to the former SQL
+/// `(<legacy predicate>) AND release.reservation_id IS NULL` filter.
+fn reservation_row_is_active(
+    ledger: &ReleaseLedgerIndex,
+    reservation_id: i64,
+    legacy_released_ts: Option<&sqlmodel_core::Value>,
+) -> bool {
+    !ledger.contains(reservation_id) && legacy_released_value_is_active(legacy_released_ts)
 }
 
 fn reservation_is_released(released_ts: Option<i64>) -> bool {
@@ -1092,6 +1123,7 @@ pub struct RecoveryAdmissionSnapshot {
 
 fn robot_search_index_health_from_config(
     config: &mcp_agent_mail_core::Config,
+    conn: &DbConn,
 ) -> Result<LexicalBackfillHealth, String> {
     let mut pool_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     pool_cfg.database_url = config.database_url.clone();
@@ -1100,6 +1132,8 @@ fn robot_search_index_health_from_config(
     pool_cfg.warmup_connections = 0;
     let pool = mcp_agent_mail_db::create_pool_without_startup_init(&pool_cfg)
         .map_err(|err| format!("db pool init failed: {err}"))?;
+    pool.observe_search_database_generation_from_conn(conn)
+        .map_err(|err| format!("search health database identity probe failed: {err}"))?;
     Ok(mcp_agent_mail_db::search_service::lexical_backfill_health(
         &pool,
     ))
@@ -1107,7 +1141,7 @@ fn robot_search_index_health_from_config(
 
 fn search_index_probe_status(health: &LexicalBackfillHealth) -> &'static str {
     match health.state.as_str() {
-        "fresh" | "in_memory" => "ok",
+        "fresh" | "in_memory" | "sql_only_snapshot" => "ok",
         "delayed" | "partial" => "degraded",
         _ => "fail",
     }
@@ -1279,6 +1313,8 @@ pub struct InboxEntry {
     pub priority: String,
     pub from: String,
     pub subject: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub thread: String,
     pub age: String,
     pub ack_status: String,
@@ -1318,6 +1354,8 @@ pub struct ThreadMessage {
     pub ack: String,
     pub subject: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
 }
 
@@ -1325,13 +1363,18 @@ impl MarkdownRenderable for Vec<ThreadMessage> {
     fn to_markdown(&self, meta: &RobotMeta, _alerts: &[RobotAlert], _actions: &[String]) -> String {
         let mut md = format!("# Thread: {}\n\n", meta.command);
         for msg in self {
+            let topic_line = msg
+                .topic
+                .as_deref()
+                .map_or_else(String::new, |topic| format!("**Topic:** {topic}\n"));
             md.push_str(&format!(
-                "## [{pos}] {from} → {to} ({age})\n**{subject}**\n\n{body}\n\n---\n\n",
+                "## [{pos}] {from} → {to} ({age})\n**{subject}**\n{topic_line}\n{body}\n\n---\n\n",
                 pos = msg.position,
                 from = msg.from,
                 to = msg.to,
                 age = msg.age,
                 subject = msg.subject,
+                topic_line = topic_line,
                 body = msg.body.as_deref().unwrap_or(""),
             ));
         }
@@ -1346,6 +1389,8 @@ pub struct SearchResult {
     pub relevance: f64,
     pub from: String,
     pub subject: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub thread: String,
     pub snippet: String,
     pub age: String,
@@ -1386,6 +1431,8 @@ pub struct MessageContext {
     pub from_model: Option<String>,
     pub to: Vec<String>,
     pub subject: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     pub body: String,
     pub thread: String,
     pub position: usize,
@@ -1422,11 +1469,16 @@ impl MarkdownRenderable for MessageContext {
             (Some(p), Some(m)) => format!("{} ({p}, {m})", self.from),
             _ => self.from.clone(),
         };
+        let topic_line = self
+            .topic
+            .as_deref()
+            .map_or_else(String::new, |topic| format!("**Topic:** {topic}  \n"));
         let mut md = format!(
             "## Message #{id} | Thread: {thread} ({pos} of {total})\n\n\
              **From:** {sender}  \n\
              **To:** {to}  \n\
              **Subject:** {subject}  \n\
+             {topic_line}\
              **Importance:** {importance} | **Ack:** {ack}  \n\
              **Sent:** {created} ({age})\n\n---\n\n{body}\n",
             id = self.id,
@@ -1436,6 +1488,7 @@ impl MarkdownRenderable for MessageContext {
             sender = sender_info,
             to = self.to.join(", "),
             subject = self.subject,
+            topic_line = topic_line,
             importance = self.importance,
             ack = self.ack_status,
             created = self.created,
@@ -3583,11 +3636,33 @@ const ACK_SLA_VIOLATION_THRESHOLD_US: i64 = MICROS_PER_HOUR;
 
 /// Freshness budget for coalesced robot status/overview snapshots.
 ///
-/// The generation stamp below invalidates on mailbox writes that affect the
-/// dashboard. This TTL bounds time-derived drift such as age strings,
-/// reservation countdowns, and active-agent windows.
-const ROBOT_SNAPSHOT_CACHE_TTL: Duration = Duration::from_millis(500);
+/// The generation stamp below is recomputed on every call and invalidates on
+/// mailbox writes that affect the dashboard (counts plus monotone max
+/// timestamps across messages, recipient read/ack touches, reservations, and
+/// the release ledger), so a generation-verified cache entry is exact on every
+/// counted dimension regardless of age. The TTL only bounds time-derived
+/// drift inside the cached payload — age strings, reservation countdowns,
+/// active-agent windows — and the residual fingerprint blind spots.
+///
+/// GH#274: the original 500ms budget made the cache useless to real pollers
+/// (seconds-to-minutes cadence): every poll paid the full 4-queries-per-
+/// project rebuild even when the fingerprint proved nothing had changed. 30s
+/// keeps counts exact while letting an idle multi-project mailbox answer
+/// `am robot overview` from cache. Override with `AM_ROBOT_SNAPSHOT_TTL_MS`.
+const ROBOT_SNAPSHOT_CACHE_TTL_DEFAULT_MS: u64 = 30_000;
 const ROBOT_SNAPSHOT_CACHE_MAX_ENTRIES: usize = 64;
+
+fn robot_snapshot_cache_ttl() -> Duration {
+    static TTL: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *TTL.get_or_init(|| {
+        let ms = std::env::var("AM_ROBOT_SNAPSHOT_TTL_MS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .unwrap_or(ROBOT_SNAPSHOT_CACHE_TTL_DEFAULT_MS);
+        Duration::from_millis(ms)
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RobotSnapshotGeneration {
@@ -4760,14 +4835,9 @@ fn build_status_with_phase(
     let _now_s = now_us / 1_000_000;
     let has_release_ledger = has_file_reservation_release_ledger(conn);
     let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
-    let active_reservation_join =
-        active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
-    let active_reservation_predicate = active_reservation_filter_sql(
-        has_release_ledger,
-        has_legacy_released_ts_column,
-        "fr",
-        "rr",
-    );
+    let release_ledger = release_ledger_index(conn, has_release_ledger)?;
+    let active_reservation_predicate =
+        active_reservation_candidate_sql(has_legacy_released_ts_column, "fr");
 
     // 1. Inbox counts (agent-specific, if resolved)
     let (unread, urgent, ack_required, ack_overdue) = if let Some((agent_id, _)) = &agent {
@@ -4834,20 +4904,24 @@ fn build_status_with_phase(
         .unwrap_or(0) as usize;
     mark_tail_latency_phase(&mut phase, "sqlite_recent_messages");
 
-    // 4. File reservations (active = not released and not expired)
+    // 4. File reservations (active = not released and not expired). Fetch
+    // candidate IDs and subtract ledger-released rows in Rust (GH#274).
     let active_reservations = conn
         .query_sync(
             &format!(
-                "SELECT COUNT(*) AS cnt
-                 FROM file_reservations fr{active_reservation_join}
+                "SELECT fr.id
+                 FROM file_reservations fr
                  WHERE fr.project_id = ? AND ({active_reservation_predicate}) AND fr.expires_ts > ?"
             ),
             &[Value::BigInt(project_id), Value::BigInt(now_us)],
         )
         .map_err(|e| CliError::Other(format!("active reservations query failed: {e}")))?
-        .first()
-        .and_then(|r| r.get_named::<i64>("cnt").ok())
-        .unwrap_or(0) as usize;
+        .iter()
+        .filter(|r| {
+            !r.get_named::<i64>("id")
+                .is_ok_and(|id| release_ledger.contains(id))
+        })
+        .count();
     mark_tail_latency_phase(&mut phase, "sqlite_active_reservations");
 
     // Reservations expiring soon (within 5 minutes)
@@ -4855,8 +4929,8 @@ fn build_status_with_phase(
     let reservations_expiring_soon = conn
         .query_sync(
             &format!(
-                "SELECT COUNT(*) AS cnt
-                 FROM file_reservations fr{active_reservation_join}
+                "SELECT fr.id
+                 FROM file_reservations fr
                  WHERE fr.project_id = ? AND ({active_reservation_predicate})
                  AND fr.expires_ts > ? AND fr.expires_ts < ?"
             ),
@@ -4867,17 +4941,20 @@ fn build_status_with_phase(
             ],
         )
         .map_err(|e| CliError::Other(format!("expiring reservations query failed: {e}")))?
-        .first()
-        .and_then(|r| r.get_named::<i64>("cnt").ok())
-        .unwrap_or(0) as usize;
+        .iter()
+        .filter(|r| {
+            !r.get_named::<i64>("id")
+                .is_ok_and(|id| release_ledger.contains(id))
+        })
+        .count();
     mark_tail_latency_phase(&mut phase, "sqlite_expiring_reservations");
 
     // 5. My reservations (agent-specific)
     let my_reservations = if let Some((agent_id, _)) = &agent {
         conn.query_sync(
             &format!(
-                "SELECT fr.path_pattern, fr.\"exclusive\", fr.expires_ts
-                 FROM file_reservations fr{active_reservation_join}
+                "SELECT fr.path_pattern, fr.\"exclusive\", fr.expires_ts, fr.id
+                 FROM file_reservations fr
                  WHERE fr.project_id = ? AND fr.agent_id = ? AND ({active_reservation_predicate})
                    AND fr.expires_ts > ?
                  ORDER BY fr.expires_ts ASC"
@@ -4890,6 +4967,10 @@ fn build_status_with_phase(
         )
         .map_err(|e| CliError::Other(format!("my reservations query failed: {e}")))?
         .iter()
+        .filter(|r| {
+            !r.get_named::<i64>("id")
+                .is_ok_and(|id| release_ledger.contains(id))
+        })
         .map(|r| {
             let expires: i64 = r.get_named("expires_ts").unwrap_or(0);
             ReservationEntry {
@@ -5148,7 +5229,7 @@ fn build_status_with_snapshot_cache(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(entry) = cache.get(&key)
         && entry.generation == generation
-        && cache_lookup_at.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
+        && cache_lookup_at.duration_since(entry.cached_at) <= robot_snapshot_cache_ttl()
     {
         mark_tail_latency_phase(&mut phase, "snapshot_cache_hit");
         return Ok((entry.data.clone(), entry.actions.clone()));
@@ -5608,6 +5689,10 @@ fn server_inbox_row_to_entry(
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
+            topic: row
+                .get("topic")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
             thread: canonical_thread_ref(id, thread_id),
             age: format_age(age_seconds),
             ack_status,
@@ -5884,12 +5969,12 @@ fn build_inbox_with_phase(
         "'' AS body_md"
     };
     let sql = format!(
-        "SELECT sub.id, sub.subject, sub.thread_id, sub.importance, sub.ack_required,
+        "SELECT sub.id, sub.subject, sub.topic, sub.thread_id, sub.importance, sub.ack_required,
                 sub.created_ts, sub.sender_id, sub.read_ts, sub.ack_ts, sub.body_md,
                 sub.priority_bucket,
                 COALESCE(a_sender.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name
          FROM (
-             SELECT m.id, m.subject, m.thread_id, m.importance, m.ack_required,
+             SELECT m.id, m.subject, m.topic, m.thread_id, m.importance, m.ack_required,
                     m.created_ts, m.sender_id, mr.read_ts, mr.ack_ts, {body_select},
                     CASE
                         WHEN m.importance IN ('urgent','high') AND mr.read_ts IS NULL THEN 1
@@ -5930,6 +6015,7 @@ fn build_inbox_with_phase(
         let bucket: i64 = row.get_named("priority_bucket").unwrap_or(7);
         let sender: String = row.get_named("sender_name").unwrap_or_default();
         let subject: String = row.get_named("subject").unwrap_or_default();
+        let topic: Option<String> = row.get_named("topic").ok();
         let thread_id: String = row.get_named("thread_id").unwrap_or_default();
         let thread_ref = canonical_thread_ref(id, &thread_id);
         let importance: String = row.get_named("importance").unwrap_or_default();
@@ -5976,6 +6062,7 @@ fn build_inbox_with_phase(
             priority: priority_label.to_string(),
             from: sender,
             subject,
+            topic,
             thread: thread_ref,
             age: format_age(age_seconds),
             ack_status,
@@ -6113,7 +6200,7 @@ fn build_inbox_with_snapshot_cache(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(entry) = cache.get(&key)
         && entry.generation == generation
-        && cache_lookup_at.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
+        && cache_lookup_at.duration_since(entry.cached_at) <= robot_snapshot_cache_ttl()
     {
         mark_tail_latency_phase(&mut phase, "snapshot_cache_hit");
         return Ok(entry.result.clone());
@@ -6341,7 +6428,7 @@ fn build_outbox_entries(
         "'' AS body_md"
     };
     let sql = format!(
-        "SELECT m.id, m.subject, m.thread_id, m.importance, m.ack_required, m.created_ts, {body_select},
+        "SELECT m.id, m.subject, m.topic, m.thread_id, m.importance, m.ack_required, m.created_ts, {body_select},
                 COUNT(mr.agent_id) AS recipient_count,
                 SUM(CASE WHEN mr.ack_ts IS NOT NULL THEN 1 ELSE 0 END) AS acked_count
          FROM messages m
@@ -6366,6 +6453,7 @@ fn build_outbox_entries(
     for row in &rows {
         let id: i64 = row.get_named("id").unwrap_or(0);
         let subject: String = row.get_named("subject").unwrap_or_default();
+        let topic: Option<String> = row.get_named("topic").ok();
         let thread_id: String = row.get_named("thread_id").unwrap_or_default();
         let thread_ref = canonical_thread_ref(id, &thread_id);
         let importance: String = row.get_named("importance").unwrap_or_default();
@@ -6405,6 +6493,7 @@ fn build_outbox_entries(
             priority: "sent".to_string(),
             from: recipient_names,
             subject,
+            topic,
             thread: thread_ref,
             age: format_age(age_seconds),
             ack_status,
@@ -6445,8 +6534,12 @@ impl MarkdownRenderable for ThreadData {
             self.last_activity,
         );
         for msg in &self.messages {
+            let topic_line = msg
+                .topic
+                .as_deref()
+                .map_or_else(String::new, |topic| format!("**Topic**: {topic}\n"));
             md.push_str(&format!(
-                "### [{pos}] {from} → {to} | {age} | importance: {imp} | ack: {ack}\n**Subject**: {subj}\n\n{body}\n\n---\n\n",
+                "### [{pos}] {from} → {to} | {age} | importance: {imp} | ack: {ack}\n**Subject**: {subj}\n{topic_line}\n{body}\n\n---\n\n",
                 pos = msg.position,
                 from = msg.from,
                 to = msg.to,
@@ -6454,6 +6547,7 @@ impl MarkdownRenderable for ThreadData {
                 imp = msg.importance,
                 ack = msg.ack,
                 subj = msg.subject,
+                topic_line = topic_line,
                 body = msg.body.as_deref().unwrap_or("*(no body)*"),
             ));
         }
@@ -6495,7 +6589,7 @@ fn build_thread(
         "'' AS body_md"
     };
     let sql = format!(
-        "SELECT m.id, m.subject, {body_select}, m.importance, m.ack_required, m.created_ts,
+        "SELECT m.id, m.subject, m.topic, {body_select}, m.importance, m.ack_required, m.created_ts,
                 m.sender_id,
                 COALESCE(a_sender.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name,
                 COUNT(mr.agent_id) AS recipient_count,
@@ -6520,6 +6614,7 @@ fn build_thread(
     for (idx, row) in rows.iter().enumerate() {
         let msg_id: i64 = row.get_named("id").unwrap_or(0);
         let subject: String = row.get_named("subject").unwrap_or_default();
+        let topic: Option<String> = row.get_named("topic").ok();
         let body: String = row.get_named("body_md").unwrap_or_default();
         let importance: String = row.get_named("importance").unwrap_or_default();
         let ack_required: i64 = row.get_named("ack_required").unwrap_or(0);
@@ -6558,6 +6653,7 @@ fn build_thread(
             importance,
             ack: ack_status,
             subject,
+            topic,
             body: if include_bodies { Some(body) } else { None },
         });
     }
@@ -6718,7 +6814,7 @@ fn build_message(
     // Fetch the message
     let rows = conn
         .query_sync(
-            "SELECT m.id, m.subject, m.body_md, m.importance, m.ack_required,
+            "SELECT m.id, m.subject, m.topic, m.body_md, m.importance, m.ack_required,
                     m.created_ts, m.thread_id, m.attachments,
                     COALESCE(a.name, ?1) AS sender_name, a.program, a.model
              FROM messages m
@@ -6737,6 +6833,7 @@ fn build_message(
         .ok_or_else(|| CliError::InvalidArgument(format!("message #{message_id} not found")))?;
 
     let subject: String = row.get_named("subject").unwrap_or_default();
+    let topic: Option<String> = row.get_named("topic").ok();
     let body: String = row.get_named("body_md").unwrap_or_default();
     let importance: String = row.get_named("importance").unwrap_or_default();
     let ack_required: i64 = row.get_named("ack_required").unwrap_or(0);
@@ -6842,6 +6939,7 @@ fn build_message(
         from_model: if model.is_empty() { None } else { Some(model) },
         to,
         subject,
+        topic,
         body,
         thread: thread_ref,
         position,
@@ -7012,6 +7110,7 @@ fn build_search(
 
     for row in collected.rows {
         let subject = row.title;
+        let topic = row.topic;
         let thread_ref = canonical_thread_ref_for_row(row.id, row.thread_id.as_deref());
         let importance = row.importance.unwrap_or_else(|| "normal".to_string());
         let created_ts = row.created_ts.unwrap_or(0);
@@ -7040,6 +7139,7 @@ fn build_search(
             relevance: row.score.unwrap_or(0.0),
             from: sender,
             subject,
+            topic,
             thread: thread_ref,
             snippet,
             age: format_age(age_seconds),
@@ -7932,23 +8032,19 @@ fn build_reservations(
     );
     let has_release_ledger = has_file_reservation_release_ledger(conn);
     let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
-    let active_reservation_join =
-        active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
-    let active_reservation_predicate = active_reservation_filter_sql(
-        has_release_ledger,
-        has_legacy_released_ts_column,
-        "fr",
-        "rr",
-    );
+    let release_ledger = release_ledger_index(conn, has_release_ledger)?;
+    let active_reservation_predicate =
+        active_reservation_candidate_sql(has_legacy_released_ts_column, "fr");
 
-    // Fetch all active reservations
+    // Fetch all active candidate reservations; ledger-released rows are
+    // subtracted in Rust below (GH#274).
     let all_rows = conn
         .query_sync(
             &format!(
                 "SELECT fr.id, fr.path_pattern, fr.\"exclusive\", fr.created_ts, fr.expires_ts,
                         COALESCE(NULLIF(a.name, ''), '[unknown-agent-' || fr.agent_id || ']') AS agent_name,
                         fr.agent_id AS agent_id
-                 FROM file_reservations fr{active_reservation_join}
+                 FROM file_reservations fr
                  LEFT JOIN agents a ON a.id = fr.agent_id
                  WHERE fr.project_id = ? AND ({active_reservation_predicate}) AND fr.expires_ts > ?
                  ORDER BY fr.expires_ts ASC"
@@ -7962,6 +8058,12 @@ fn build_reservations(
     let mut expiring_soon = Vec::new();
 
     for row in &all_rows {
+        if row
+            .get_named::<i64>("id")
+            .is_ok_and(|id| release_ledger.contains(id))
+        {
+            continue;
+        }
         let path: String = row.get_named("path_pattern").unwrap_or_default();
         let exclusive: bool = row.get_named::<i64>("exclusive").unwrap_or(1) != 0;
         let created_ts: i64 = row.get_named("created_ts").unwrap_or(0);
@@ -8205,7 +8307,7 @@ fn build_reservations_with_snapshot_cache(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(entry) = cache.get(&key)
         && entry.generation == generation
-        && cache_lookup_at.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
+        && cache_lookup_at.duration_since(entry.cached_at) <= robot_snapshot_cache_ttl()
     {
         return Ok((entry.data.clone(), entry.actions.clone()));
     }
@@ -8438,21 +8540,16 @@ fn fetch_handoff_active_reservations(
 ) -> Result<Vec<HandoffReservationInfo>, CliError> {
     let has_release_ledger = has_file_reservation_release_ledger(conn);
     let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
-    let active_reservation_join =
-        active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
-    let active_reservation_predicate = active_reservation_filter_sql(
-        has_release_ledger,
-        has_legacy_released_ts_column,
-        "fr",
-        "rr",
-    );
+    let release_ledger = release_ledger_index(conn, has_release_ledger)?;
+    let active_reservation_predicate =
+        active_reservation_candidate_sql(has_legacy_released_ts_column, "fr");
     let rows = conn
         .query_sync(
             &format!(
                 "SELECT fr.id,
                         COALESCE(NULLIF(a.name, ''), '[unknown-agent-' || fr.agent_id || ']') AS agent_name,
                         fr.path_pattern, fr.\"exclusive\", fr.reason, fr.created_ts, fr.expires_ts
-                 FROM file_reservations fr{active_reservation_join}
+                 FROM file_reservations fr
                  LEFT JOIN agents a ON a.id = fr.agent_id
                  WHERE fr.project_id = ? AND ({active_reservation_predicate}) AND fr.expires_ts > ?
                  ORDER BY fr.expires_ts ASC, fr.id ASC"
@@ -8465,6 +8562,12 @@ fn fetch_handoff_active_reservations(
 
     let mut reservations = Vec::new();
     for row in &rows {
+        if row
+            .get_as::<i64>(0)
+            .is_ok_and(|id| release_ledger.contains(id))
+        {
+            continue;
+        }
         let agent: String = row.get_as(1).unwrap_or_default();
         if agent.trim().is_empty() {
             continue;
@@ -8947,37 +9050,37 @@ fn build_timeline(
     if kind_filter.is_none() || kind_filter == Some("reservation") {
         let has_release_ledger = has_file_reservation_release_ledger(conn);
         let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
-        let release_join = active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
-        let released_ts_sql = reservation_released_ts_sql(
-            has_release_ledger,
-            has_legacy_released_ts_column,
-            "fr",
-            "rr",
-        );
+        let release_ledger = release_ledger_index(conn, has_release_ledger)?;
+        let released_ts_sql = legacy_released_ts_select_sql(has_legacy_released_ts_column, "fr");
+        // The recent-release filter needs the ledger-merged released_ts, so
+        // it moves to Rust below; the SQL fetches all project rows just as
+        // the former anti-join scan did (GH#274).
         let res_rows = conn
             .query_sync(
                 &format!(
                     "SELECT fr.id, fr.path_pattern, fr.created_ts, {released_ts_sql} AS released_ts,
                             COALESCE(NULLIF(a.name, ''), '[unknown-agent-' || fr.agent_id || ']') AS agent
-                     FROM file_reservations fr{release_join}
+                     FROM file_reservations fr
                      LEFT JOIN agents a ON a.id = fr.agent_id
                      WHERE fr.project_id = ?
-                       AND (fr.created_ts > ? OR (({released_ts_sql}) IS NOT NULL AND ({released_ts_sql}) > ?))
                      ORDER BY fr.created_ts ASC"
                 ),
-                &[
-                    Value::BigInt(project_id),
-                    Value::BigInt(since_us),
-                    Value::BigInt(since_us),
-                ],
+                &[Value::BigInt(project_id)],
             )
             .map_err(|e| CliError::Other(format!("timeline reservations query: {e}")))?;
 
         for row in &res_rows {
             let path: String = row.get_named("path_pattern").unwrap_or_default();
             let created_ts: i64 = row.get_named("created_ts").unwrap_or(0);
-            let released_ts: Option<i64> = row.get_named("released_ts").ok();
+            let legacy_released_ts = row.get_by_name("released_ts").and_then(value_to_micros);
+            let released_ts: Option<i64> =
+                row.get_named::<i64>("id").map_or(legacy_released_ts, |id| {
+                    release_ledger.coalesce(id, legacy_released_ts)
+                });
             let agent: String = row.get_named("agent").unwrap_or_default();
+            if created_ts <= since_us && !released_ts.is_some_and(|ts| ts > since_us) {
+                continue;
+            }
 
             if source_filter.is_some() && source_filter != Some(agent.as_str()) {
                 continue;
@@ -9073,19 +9176,13 @@ fn build_overview(conn: &DbConn) -> Result<Vec<OverviewProject>, CliError> {
     let now_us = mcp_agent_mail_db::now_micros();
     let has_release_ledger = has_file_reservation_release_ledger(conn);
     let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
-    let active_reservation_join =
-        active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
-    let active_reservation_predicate = active_reservation_filter_sql(
-        has_release_ledger,
-        has_legacy_released_ts_column,
-        "fr",
-        "rr",
-    );
+    let release_ledger = release_ledger_index(conn, has_release_ledger)?;
+    let active_reservation_predicate =
+        active_reservation_candidate_sql(has_legacy_released_ts_column, "fr");
 
     let rows = conn
         .query_sync(
-            &format!(
-                "WITH live_projects AS (
+            "WITH live_projects AS (
                  SELECT p.id AS project_id, p.slug
                  FROM projects p
              ), orphan_project_ids AS (
@@ -9098,27 +9195,34 @@ fn build_overview(conn: &DbConn) -> Result<Vec<OverviewProject>, CliError> {
                  FROM agents a
                  LEFT JOIN projects p ON p.id = a.project_id
                  WHERE p.id IS NULL
-                 UNION
-                     SELECT DISTINCT fr.project_id AS raw_project_id
-                     FROM file_reservations fr{active_reservation_join}
-                     LEFT JOIN projects p ON p.id = fr.project_id
-                     WHERE p.id IS NULL
-                       AND ({active_reservation_predicate})
-                       AND fr.expires_ts > ?
              )
              SELECT project_id AS id, slug
              FROM live_projects
              UNION ALL
              SELECT o.raw_project_id AS id,
                     '[unknown-project-' || o.raw_project_id || ']' AS slug
-             FROM orphan_project_ids o
-             ORDER BY slug ASC"
-            ),
-            &[Value::BigInt(now_us)],
+             FROM orphan_project_ids o",
+            &[],
         )
         .map_err(|e| CliError::Other(format!("overview projects query: {e}")))?;
 
-    let mut projects = Vec::new();
+    // Reservation-derived orphan projects come from a flat candidate scan;
+    // ledger-released rows are subtracted in Rust (GH#274).
+    let orphan_res_rows = conn
+        .query_sync(
+            &format!(
+                "SELECT fr.project_id AS raw_project_id, fr.id AS id
+                 FROM file_reservations fr
+                 LEFT JOIN projects p ON p.id = fr.project_id
+                 WHERE p.id IS NULL
+                   AND ({active_reservation_predicate})
+                   AND fr.expires_ts > ?"
+            ),
+            &[Value::BigInt(now_us)],
+        )
+        .map_err(|e| CliError::Other(format!("overview orphan reservations query: {e}")))?;
+
+    let mut project_rows: Vec<(i64, String)> = Vec::with_capacity(rows.len());
     for row in &rows {
         let pid = row
             .get_by_name("id")
@@ -9127,7 +9231,27 @@ fn build_overview(conn: &DbConn) -> Result<Vec<OverviewProject>, CliError> {
         let slug = row
             .get_named::<String>("slug")
             .map_err(|e| CliError::Other(format!("overview project slug decode failed: {e}")))?;
+        project_rows.push((pid, slug));
+    }
+    let known_pids: HashSet<i64> = project_rows.iter().map(|(pid, _)| *pid).collect();
+    let mut orphan_res_pids: Vec<i64> = orphan_res_rows
+        .iter()
+        .filter(|row| {
+            !row.get_named::<i64>("id")
+                .is_ok_and(|id| release_ledger.contains(id))
+        })
+        .filter_map(|row| row.get_named::<i64>("raw_project_id").ok())
+        .filter(|pid| !known_pids.contains(pid))
+        .collect();
+    orphan_res_pids.sort_unstable();
+    orphan_res_pids.dedup();
+    for pid in orphan_res_pids {
+        project_rows.push((pid, format!("[unknown-project-{pid}]")));
+    }
+    project_rows.sort_by(|a, b| a.1.cmp(&b.1));
 
+    let mut projects = Vec::new();
+    for (pid, slug) in project_rows {
         // Count unread messages across all agents in project
         let unread: i64 = conn
             .query_sync(
@@ -9175,21 +9299,23 @@ fn build_overview(conn: &DbConn) -> Result<Vec<OverviewProject>, CliError> {
             .transpose()?
             .unwrap_or(0);
 
-        // Count active reservations
+        // Count active reservations (candidate rows minus ledger releases)
         let reservations: i64 = conn
             .query_sync(
                 &format!(
-                    "SELECT COUNT(*) AS cnt
-                     FROM file_reservations fr{active_reservation_join}
+                    "SELECT fr.id
+                     FROM file_reservations fr
                      WHERE fr.project_id = ? AND ({active_reservation_predicate}) AND fr.expires_ts > ?"
                 ),
                 &[Value::BigInt(pid), Value::BigInt(now_us)],
             )
             .map_err(|e| CliError::Other(format!("overview reservations query failed: {e}")))?
-            .first()
-            .map(|row| decode_count(row, "overview reservations"))
-            .transpose()?
-            .unwrap_or(0);
+            .iter()
+            .filter(|row| {
+                !row.get_named::<i64>("id")
+                    .is_ok_and(|id| release_ledger.contains(id))
+            })
+            .count() as i64;
 
         projects.push(OverviewProject {
             slug,
@@ -9229,7 +9355,7 @@ fn build_overview_with_snapshot_cache(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(entry) = cache.get(&key)
         && entry.generation == generation
-        && cache_lookup_at.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
+        && cache_lookup_at.duration_since(entry.cached_at) <= robot_snapshot_cache_ttl()
     {
         mark_tail_latency_phase(&mut phase, "snapshot_cache_hit");
         return Ok(entry.projects.clone());
@@ -9326,19 +9452,14 @@ fn build_analytics(
 
     // Check for expiring-soon reservations
     let expiring_threshold = micros_from_now(now_us, 10 * MICROS_PER_MINUTE);
-    let active_reservation_join =
-        active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
-    let active_reservation_predicate = active_reservation_filter_sql(
-        has_release_ledger,
-        has_legacy_released_ts_column,
-        "fr",
-        "rr",
-    );
+    let release_ledger = release_ledger_index(conn, has_release_ledger)?;
+    let active_reservation_predicate =
+        active_reservation_candidate_sql(has_legacy_released_ts_column, "fr");
     let expiring_count: i64 = if let Some((agent_id, _)) = &agent {
         conn.query_sync(
             &format!(
-                "SELECT COUNT(*) AS cnt
-                 FROM file_reservations fr{active_reservation_join}
+                "SELECT fr.id
+                 FROM file_reservations fr
                  WHERE fr.project_id = ? AND fr.agent_id = ? AND ({active_reservation_predicate})
                    AND fr.expires_ts > ? AND fr.expires_ts < ?"
             ),
@@ -9352,8 +9473,8 @@ fn build_analytics(
     } else {
         conn.query_sync(
             &format!(
-                "SELECT COUNT(*) AS cnt
-                 FROM file_reservations fr{active_reservation_join}
+                "SELECT fr.id
+                 FROM file_reservations fr
                  WHERE fr.project_id = ? AND ({active_reservation_predicate})
                    AND fr.expires_ts > ? AND fr.expires_ts < ?"
             ),
@@ -9365,9 +9486,12 @@ fn build_analytics(
         )
     }
     .map_err(|e| CliError::Other(format!("analytics expiring reservations query failed: {e}")))?
-    .first()
-    .and_then(|r| r.get_named("cnt").ok())
-    .unwrap_or(0);
+    .iter()
+    .filter(|r| {
+        !r.get_named::<i64>("id")
+            .is_ok_and(|id| release_ledger.contains(id))
+    })
+    .count() as i64;
     if expiring_count > 0 {
         anomalies.push(AnomalyCard {
             severity: "warn".to_string(),
@@ -9682,35 +9806,49 @@ fn add_reservation_topology_edges(
     let now_us = mcp_agent_mail_db::now_micros();
     let has_release_ledger = has_file_reservation_release_ledger(conn);
     let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
-    let active_reservation_join =
-        active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
-    let active_reservation_predicate = active_reservation_filter_sql(
-        has_release_ledger,
-        has_legacy_released_ts_column,
-        "fr",
-        "rr",
-    );
+    let release_ledger = release_ledger_index(conn, has_release_ledger)?;
+    let active_reservation_predicate =
+        active_reservation_candidate_sql(has_legacy_released_ts_column, "fr");
+    // Flat candidate rows; the ledger subtraction and the former SQL
+    // GROUP BY fr.agent_id, fr.path_pattern both happen in Rust (GH#274).
     let rows = conn
         .query_sync(
             &format!(
-                "SELECT COALESCE(NULLIF(a.name, ''), '[unknown-agent-' || fr.agent_id || ']') AS agent_name,
-                        fr.path_pattern AS path_pattern,
-                        COUNT(*) AS reservation_count
-                 FROM file_reservations fr{active_reservation_join}
+                "SELECT fr.id AS id, fr.agent_id AS agent_id,
+                        COALESCE(NULLIF(a.name, ''), '[unknown-agent-' || fr.agent_id || ']') AS agent_name,
+                        fr.path_pattern AS path_pattern
+                 FROM file_reservations fr
                  LEFT JOIN agents a ON a.id = fr.agent_id
-                 WHERE fr.project_id = ? AND ({active_reservation_predicate}) AND fr.expires_ts > ?
-                 GROUP BY fr.agent_id, fr.path_pattern
-                 ORDER BY reservation_count DESC, agent_name ASC, path_pattern ASC"
+                 WHERE fr.project_id = ? AND ({active_reservation_predicate}) AND fr.expires_ts > ?"
             ),
             &[Value::BigInt(project_id), Value::BigInt(now_us)],
         )
         .map_err(|e| CliError::Other(format!("topology reservations query failed: {e}")))?;
 
-    let mut reservation_count = 0_u64;
+    let mut grouped: BTreeMap<(Option<i64>, String), (String, u64)> = BTreeMap::new();
     for row in &rows {
+        if row
+            .get_named::<i64>("id")
+            .is_ok_and(|id| release_ledger.contains(id))
+        {
+            continue;
+        }
+        let agent_id: Option<i64> = row.get_named("agent_id").ok();
         let agent_name: String = row.get_named("agent_name").unwrap_or_default();
         let path_pattern: String = row.get_named("path_pattern").unwrap_or_default();
-        let hold_count = nonnegative_u64(row.get_named("reservation_count").unwrap_or(0));
+        let entry = grouped
+            .entry((agent_id, path_pattern))
+            .or_insert((agent_name, 0));
+        entry.1 = entry.1.saturating_add(1);
+    }
+    let mut aggregated: Vec<(String, String, u64)> = grouped
+        .into_iter()
+        .map(|((_, path_pattern), (agent_name, count))| (agent_name, path_pattern, count))
+        .collect();
+    aggregated.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
+
+    let mut reservation_count = 0_u64;
+    for (agent_name, path_pattern, hold_count) in aggregated {
         reservation_count = reservation_count.saturating_add(hold_count);
         record_topology_edge(
             nodes,
@@ -10006,6 +10144,15 @@ fn build_agents_with_health(
                     (SELECT COUNT(*) FROM messages m WHERE m.sender_id = a.id) AS msg_count
              FROM agents a
              WHERE a.project_id = ?
+               AND a.retired_at IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM agent_deregistrations d WHERE d.agent_id = a.id
+               )
+               AND a.id = (
+                   SELECT MIN(canonical.id) FROM agents canonical
+                   WHERE canonical.project_id = a.project_id
+                     AND canonical.name = a.name COLLATE NOCASE
+               )
              ORDER BY a.last_active_ts DESC, a.id DESC",
             &[Value::BigInt(project_id)],
         )
@@ -10196,7 +10343,7 @@ fn build_agents_with_snapshot_cache(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(entry) = cache.get(&key)
         && entry.generation == generation
-        && cache_lookup_at.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
+        && cache_lookup_at.duration_since(entry.cached_at) <= robot_snapshot_cache_ttl()
     {
         return Ok(entry.agents.clone());
     }
@@ -10827,78 +10974,59 @@ fn fetch_robot_agent_reservation_stats(
     }
     let has_release_ledger = has_file_reservation_release_ledger(conn);
     let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
-    let release_alias = "frl";
-    let release_join = active_reservation_release_join_sql(has_release_ledger, "fr", release_alias);
-    let released_ts_sql = reservation_released_ts_sql(
-        has_release_ledger,
-        has_legacy_released_ts_column,
-        "fr",
-        release_alias,
-    );
-    let active_filter_sql = active_reservation_filter_sql(
-        has_release_ledger,
-        has_legacy_released_ts_column,
-        "fr",
-        release_alias,
-    );
+    let Ok(release_ledger) = release_ledger_index(conn, has_release_ledger) else {
+        return HashMap::new();
+    };
+    let released_ts_sql = legacy_released_ts_select_sql(has_legacy_released_ts_column, "fr");
+    // Flat per-reservation rows; the release-ledger merge and the former SQL
+    // CASE buckets are computed in Rust (GH#274).
     let sql = format!(
-        "SELECT \
-            fr.agent_id AS agent_id, \
-            SUM(CASE \
-                    WHEN fr.created_ts >= ? \
-                     AND {released_ts_sql} > 0 \
-                     AND {released_ts_sql} <= fr.expires_ts \
-                    THEN 1 ELSE 0 END) AS clean_count, \
-            SUM(CASE \
-                    WHEN fr.created_ts >= ? \
-                     AND {released_ts_sql} > fr.expires_ts \
-                    THEN 1 ELSE 0 END) AS late_count, \
-            SUM(CASE \
-                    WHEN fr.created_ts >= ? \
-                     AND {released_ts_sql} IS NULL \
-                     AND fr.expires_ts < ? \
-                    THEN 1 ELSE 0 END) AS expired_count, \
-            SUM(CASE \
-                    WHEN fr.created_ts >= ? \
-                     AND {active_filter_sql} \
-                    THEN 1 ELSE 0 END) AS active_count \
+        "SELECT fr.id AS id, fr.agent_id AS agent_id, fr.created_ts AS created_ts, \
+                fr.expires_ts AS expires_ts, {released_ts_sql} AS released_ts \
          FROM file_reservations fr \
-         {release_join} \
          WHERE fr.project_id = ? \
-           AND fr.agent_id IN ({agent_ids_sql}) \
-         GROUP BY fr.agent_id"
+           AND fr.agent_id IN ({agent_ids_sql})"
     );
-    conn.query_sync(
-        &sql,
-        &[
-            Value::BigInt(window_start),
-            Value::BigInt(window_start),
-            Value::BigInt(window_start),
-            Value::BigInt(now),
-            Value::BigInt(window_start),
-            Value::BigInt(project_id),
-        ],
-    )
-    .ok()
-    .map(|rows| {
-        rows.into_iter()
-            .map(|row| {
-                (
-                    row.get_named::<i64>("agent_id").unwrap_or(0),
-                    RobotAgentReservationStats {
-                        clean_count: row.get_named::<i64>("clean_count").unwrap_or(0).max(0) as u64,
-                        late_release_count: row.get_named::<i64>("late_count").unwrap_or(0).max(0)
-                            as u64,
-                        expired_count: row.get_named::<i64>("expired_count").unwrap_or(0).max(0)
-                            as u64,
-                        active_count: row.get_named::<i64>("active_count").unwrap_or(0).max(0)
-                            as u64,
-                    },
-                )
-            })
-            .collect()
-    })
-    .unwrap_or_default()
+    conn.query_sync(&sql, &[Value::BigInt(project_id)])
+        .ok()
+        .map(|rows| {
+            let mut stats: HashMap<i64, RobotAgentReservationStats> = HashMap::new();
+            for row in &rows {
+                let agent_id = row.get_named::<i64>("agent_id").unwrap_or(0);
+                let created_ts = row.get_named::<i64>("created_ts").unwrap_or(0);
+                let expires_ts = row.get_named::<i64>("expires_ts").unwrap_or(0);
+                let id = row.get_named::<i64>("id").ok();
+                let legacy_released = row.get_by_name("released_ts");
+                let legacy_released_micros = legacy_released.and_then(value_to_micros);
+                let released_ts = id.map_or(legacy_released_micros, |id| {
+                    release_ledger.coalesce(id, legacy_released_micros)
+                });
+                let is_active = id.map_or_else(
+                    || legacy_released_value_is_active(legacy_released),
+                    |id| reservation_row_is_active(&release_ledger, id, legacy_released),
+                );
+                let entry = stats.entry(agent_id).or_default();
+                if created_ts >= window_start {
+                    match released_ts {
+                        Some(rel) if rel > 0 && rel <= expires_ts => {
+                            entry.clean_count = entry.clean_count.saturating_add(1);
+                        }
+                        _ => {}
+                    }
+                    if released_ts.is_some_and(|rel| rel > expires_ts) {
+                        entry.late_release_count = entry.late_release_count.saturating_add(1);
+                    }
+                    if released_ts.is_none() && expires_ts < now {
+                        entry.expired_count = entry.expired_count.saturating_add(1);
+                    }
+                    if is_active {
+                        entry.active_count = entry.active_count.saturating_add(1);
+                    }
+                }
+            }
+            stats
+        })
+        .unwrap_or_default()
 }
 
 fn fetch_robot_agent_contact_stats(
@@ -11113,19 +11241,40 @@ fn build_projects(conn: &DbConn) -> Result<Vec<ProjectRow>, CliError> {
     let now_us = mcp_agent_mail_db::now_micros();
     let has_release_ledger = has_file_reservation_release_ledger(conn);
     let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
-    let active_reservation_join =
-        active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
-    let active_reservation_predicate = active_reservation_filter_sql(
-        has_release_ledger,
-        has_legacy_released_ts_column,
-        "fr",
-        "rr",
-    );
+    let release_ledger = release_ledger_index(conn, has_release_ledger)?;
+    let active_reservation_predicate =
+        active_reservation_candidate_sql(has_legacy_released_ts_column, "fr");
+
+    // One flat candidate scan yields per-project active counts (after the
+    // Rust-side ledger subtraction) and the reservation-derived orphan
+    // project ids, replacing the ledger anti-join CTE branch and the
+    // correlated res_count subselect (GH#274).
+    let candidate_rows = conn
+        .query_sync(
+            &format!(
+                "SELECT fr.project_id AS raw_project_id, fr.id AS id
+                 FROM file_reservations fr
+                 WHERE ({active_reservation_predicate}) AND fr.expires_ts > ?"
+            ),
+            &[Value::BigInt(now_us)],
+        )
+        .map_err(|e| CliError::Other(format!("projects reservations query: {e}")))?;
+    let mut active_res_by_project: HashMap<i64, usize> = HashMap::new();
+    for row in &candidate_rows {
+        if row
+            .get_named::<i64>("id")
+            .is_ok_and(|id| release_ledger.contains(id))
+        {
+            continue;
+        }
+        if let Ok(pid) = row.get_named::<i64>("raw_project_id") {
+            *active_res_by_project.entry(pid).or_insert(0) += 1;
+        }
+    }
 
     let rows = conn
         .query_sync(
-            &format!(
-                "WITH live_projects AS (
+            "WITH live_projects AS (
                      SELECT p.id AS project_id, p.slug, p.human_key, p.created_at
                      FROM projects p
                  ), orphan_project_ids AS (
@@ -11138,13 +11287,6 @@ fn build_projects(conn: &DbConn) -> Result<Vec<ProjectRow>, CliError> {
                      FROM agents a
                      LEFT JOIN projects p ON p.id = a.project_id
                      WHERE p.id IS NULL
-                 UNION
-                     SELECT DISTINCT fr.project_id AS raw_project_id
-                     FROM file_reservations fr{active_reservation_join}
-                     LEFT JOIN projects p ON p.id = fr.project_id
-                     WHERE p.id IS NULL
-                       AND ({active_reservation_predicate})
-                       AND fr.expires_ts > ?
                  ), project_inventory AS (
                      SELECT project_id, slug, human_key, created_at
                      FROM live_projects
@@ -11161,33 +11303,78 @@ fn build_projects(conn: &DbConn) -> Result<Vec<ProjectRow>, CliError> {
                  )
                  SELECT pi.project_id AS id, pi.slug, pi.human_key, pi.created_at,
                         (SELECT COUNT(*) FROM agents a WHERE a.project_id = pi.project_id) AS agent_count,
-                        (SELECT COUNT(*) FROM messages m WHERE m.project_id = pi.project_id) AS msg_count,
-                        (SELECT COUNT(*) FROM file_reservations fr{active_reservation_join}
-                         WHERE fr.project_id = pi.project_id AND ({active_reservation_predicate}) AND fr.expires_ts > ?) AS res_count
-                 FROM project_inventory pi
-                 ORDER BY pi.slug ASC"
-            ),
-            &[Value::BigInt(now_us), Value::BigInt(now_us)],
+                        (SELECT COUNT(*) FROM messages m WHERE m.project_id = pi.project_id) AS msg_count
+                 FROM project_inventory pi",
+            &[],
         )
         .map_err(|e| CliError::Other(format!("projects query: {e}")))?;
 
+    struct ProjectInventoryRow {
+        pid: Option<i64>,
+        slug: String,
+        path: String,
+        agent_count: i64,
+        msg_count: i64,
+        created_at: i64,
+    }
+
+    let mut inventory: Vec<ProjectInventoryRow> = rows
+        .iter()
+        .map(|row| ProjectInventoryRow {
+            pid: row.get_named::<i64>("id").ok(),
+            slug: row.get_named("slug").unwrap_or_default(),
+            path: row.get_named("human_key").unwrap_or_default(),
+            agent_count: row.get_named("agent_count").unwrap_or(0),
+            msg_count: row.get_named("msg_count").unwrap_or(0),
+            created_at: row.get_named("created_at").unwrap_or(0),
+        })
+        .collect();
+
+    // Reservation-derived orphan projects: active reservations pointing at a
+    // project id absent from the inventory (deleted project rows). Their
+    // created_at falls back to the earliest reservation, matching the former
+    // SQL COALESCE (such projects have no messages by construction).
+    let known_pids: HashSet<i64> = inventory.iter().filter_map(|row| row.pid).collect();
+    let mut orphan_res_pids: Vec<i64> = active_res_by_project
+        .keys()
+        .copied()
+        .filter(|pid| !known_pids.contains(pid))
+        .collect();
+    orphan_res_pids.sort_unstable();
+    for pid in orphan_res_pids {
+        let created_at = conn
+            .query_sync(
+                "SELECT MIN(fr.created_ts) AS min_created FROM file_reservations fr WHERE fr.project_id = ?",
+                &[Value::BigInt(pid)],
+            )
+            .map_err(|e| CliError::Other(format!("projects orphan created_at query: {e}")))?
+            .first()
+            .and_then(|row| row.get_named::<i64>("min_created").ok())
+            .unwrap_or(0);
+        inventory.push(ProjectInventoryRow {
+            pid: Some(pid),
+            slug: format!("[unknown-project-{pid}]"),
+            path: format!("[unknown-project-{pid}]"),
+            agent_count: 0,
+            msg_count: 0,
+            created_at,
+        });
+    }
+    inventory.sort_by(|a, b| a.slug.cmp(&b.slug));
+
     let mut projects = Vec::new();
-    for row in &rows {
-        let slug: String = row.get_named("slug").unwrap_or_default();
-        let path: String = row.get_named("human_key").unwrap_or_default();
-        let agent_count: i64 = row.get_named("agent_count").unwrap_or(0);
-        let msg_count: i64 = row.get_named("msg_count").unwrap_or(0);
-        let res_count: i64 = row.get_named("res_count").unwrap_or(0);
-        let created_at: i64 = row.get_named("created_at").unwrap_or(0);
-
-        let age = age_seconds_from_micros(now_us, created_at);
-
+    for row in inventory {
+        let res_count = row
+            .pid
+            .and_then(|pid| active_res_by_project.get(&pid).copied())
+            .unwrap_or(0);
+        let age = age_seconds_from_micros(now_us, row.created_at);
         projects.push(ProjectRow {
-            slug,
-            path,
-            agents: agent_count as usize,
-            messages: msg_count as usize,
-            reservations: res_count as usize,
+            slug: row.slug,
+            path: row.path,
+            agents: row.agent_count.max(0) as usize,
+            messages: row.msg_count.max(0) as usize,
+            reservations: res_count,
             created: format_age(age),
         });
     }
@@ -11214,7 +11401,7 @@ fn build_projects_with_snapshot_cache(conn: &DbConn) -> Result<Vec<ProjectRow>, 
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(entry) = cache.get(&key)
         && entry.generation == generation
-        && cache_lookup_at.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
+        && cache_lookup_at.duration_since(entry.cached_at) <= robot_snapshot_cache_ttl()
     {
         return Ok(entry.projects.clone());
     }
@@ -11592,31 +11779,24 @@ fn build_navigate_file_reservations(
         .is_none_or(|value| parse_resource_bool(Some(value)));
     let has_release_ledger = has_file_reservation_release_ledger(conn);
     let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
-    let active_reservation_join =
-        active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
-    let active_reservation_predicate = active_reservation_filter_sql(
-        has_release_ledger,
-        has_legacy_released_ts_column,
-        "fr",
-        "rr",
-    );
-    let released_ts_sql = reservation_released_ts_sql(
-        has_release_ledger,
-        has_legacy_released_ts_column,
-        "fr",
-        "rr",
-    );
+    let release_ledger = release_ledger_index(conn, has_release_ledger)?;
+    let active_reservation_predicate =
+        active_reservation_candidate_sql(has_legacy_released_ts_column, "fr");
+    let released_ts_sql = legacy_released_ts_select_sql(has_legacy_released_ts_column, "fr");
 
+    // active_only filters candidate rows against the release ledger in Rust,
+    // so its SQL LIMIT moves to Rust too (a SQL LIMIT over candidates could
+    // under-fill after subtracting ledger-released rows) (GH#274).
     let (sql, params) = if active_only {
         (
             format!(
                 "SELECT fr.path_pattern,
                         COALESCE(NULLIF(a.name, ''), '[unknown-agent-' || fr.agent_id || ']') AS agent_name,
-                        fr.\"exclusive\", fr.expires_ts, {released_ts_sql} AS released_ts, fr.created_ts
-                 FROM file_reservations fr{active_reservation_join}
+                        fr.\"exclusive\", fr.expires_ts, {released_ts_sql} AS released_ts, fr.created_ts, fr.id
+                 FROM file_reservations fr
                  LEFT JOIN agents a ON a.id = fr.agent_id
                  WHERE fr.project_id = ? AND ({active_reservation_predicate})
-                 ORDER BY fr.created_ts DESC LIMIT 50"
+                 ORDER BY fr.created_ts DESC"
             ),
             vec![Value::BigInt(project_id)],
         )
@@ -11625,8 +11805,8 @@ fn build_navigate_file_reservations(
             format!(
                 "SELECT fr.path_pattern,
                         COALESCE(NULLIF(a.name, ''), '[unknown-agent-' || fr.agent_id || ']') AS agent_name,
-                        fr.\"exclusive\", fr.expires_ts, {released_ts_sql} AS released_ts, fr.created_ts
-                 FROM file_reservations fr{active_reservation_join}
+                        fr.\"exclusive\", fr.expires_ts, {released_ts_sql} AS released_ts, fr.created_ts, fr.id
+                 FROM file_reservations fr
                  LEFT JOIN agents a ON a.id = fr.agent_id
                  WHERE fr.project_id = ?
                  ORDER BY fr.created_ts DESC LIMIT 50"
@@ -11640,11 +11820,20 @@ fn build_navigate_file_reservations(
 
     let reservations: Vec<serde_json::Value> = rows
         .iter()
+        .filter(|r| {
+            !(active_only
+                && r.get_as::<i64>(6)
+                    .is_ok_and(|id| release_ledger.contains(id)))
+        })
+        .take(50)
         .map(|r| {
-            let released_ts = r
+            let legacy_released_ts = r
                 .get_as::<sqlmodel_core::Value>(4)
                 .ok()
                 .and_then(|value| value_to_micros(&value));
+            let released_ts = r.get_as::<i64>(6).map_or(legacy_released_ts, |id| {
+                release_ledger.coalesce(id, legacy_released_ts)
+            });
             serde_json::json!({
                 "path": r.get_as::<String>(0).unwrap_or_default(),
                 "agent": r.get_as::<String>(1).unwrap_or_default(),
@@ -13261,6 +13450,14 @@ fn emit_robot_output(out: &str) {
     ftui_runtime::ftui_println!("{out}");
 }
 
+fn aggregate_robot_health_level(overall: &str, capacity_health_level: &str) -> String {
+    match overall {
+        "unhealthy" => "red".to_string(),
+        "degraded" if capacity_health_level == "green" => "yellow".to_string(),
+        _ => capacity_health_level.to_string(),
+    }
+}
+
 fn build_navigate_config_environment() -> (NavigateResult, Option<String>) {
     let config = mcp_agent_mail_core::Config::get();
     (
@@ -13984,7 +14181,9 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                         Some(&mut phase),
                     )?;
                     let config = mcp_agent_mail_core::Config::from_env();
-                    if let Ok(search_index) = robot_search_index_health_from_config(&config) {
+                    if let Ok(search_index) =
+                        robot_search_index_health_from_config(&config, scope.conn())
+                    {
                         enrich_status_with_search_index(&mut data, &mut actions, search_index);
                         phase.mark("search_index_health");
                     }
@@ -14643,6 +14842,16 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             // safe-remediation contract so an agent knows what is safe to do.
             let mut db_error_message: Option<String> = None;
 
+            // Stage and inspect the private file-family copy before opening the
+            // FrankenSQLite connectivity connection below. On classic POSIX
+            // fcntl locking, closing any second descriptor for the same inode
+            // from this process can release locks held by the first descriptor.
+            // Preserve the historical output order by pushing this precomputed
+            // assessment only after the connectivity probe.
+            let db_file_sanity = summarize_db_file_sanity_probe(&config.database_url);
+            let db_file_sanity_unhealthy = db_file_sanity.unhealthy;
+            let db_file_sanity_degraded = db_file_sanity.degraded;
+
             // 1. DB connectivity probe
             let db_start = std::time::Instant::now();
             let db_ok = match crate::open_db_sync_read_only_with_database_url_and_path(
@@ -14688,10 +14897,9 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 probe.latency_ms = (db_ms * 100.0).round() / 100.0;
             }
 
-            // 1b. Live sqlite file sanity probe (non-mutating).
-            let db_file_sanity = summarize_db_file_sanity_probe(&config.database_url);
-            let db_file_sanity_unhealthy = db_file_sanity.unhealthy;
-            let db_file_sanity_degraded = db_file_sanity.degraded;
+            // 1b. Live sqlite file sanity probe (non-mutating). The work was
+            // completed before `db_conn` existed; only its result is appended
+            // here so existing probe ordering remains stable.
             probes.push(db_file_sanity.probe);
 
             // 1c. Core schema presence probe.
@@ -14707,7 +14915,10 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             probes.push(archive_db_parity.probe);
 
             // 1e. Search V3 lexical index/backfill state (read-only).
-            let search_index = robot_search_index_health_from_config(&config);
+            let search_index = db_conn.as_ref().map_or_else(
+                || Err("search health requires a live database connection".to_string()),
+                |conn| robot_search_index_health_from_config(&config, conn),
+            );
             let (search_index_snapshot, search_index_unhealthy, search_index_degraded) =
                 match search_index {
                     Ok(snapshot) => {
@@ -14964,7 +15175,13 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             #[derive(Serialize)]
             struct HealthData {
                 overall: String,
+                /// Aggregate robot-health level. This must agree with
+                /// `overall`, even when the capacity counters in this CLI
+                /// process are green but live server/database probes fail.
                 health_level: String,
+                /// Capacity/backpressure-only level retained as a distinct
+                /// signal for consumers that need the former field's detail.
+                capacity_health_level: String,
                 runtime_identity: serde_json::Value,
                 probes: Vec<HealthProbe>,
                 circuits: Vec<CircuitEntry>,
@@ -14992,6 +15209,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 config.http_port,
                 db_file.as_deref(),
             );
+            let aggregate_health_level = aggregate_robot_health_level(overall, &health_str);
 
             #[derive(Serialize)]
             struct CircuitEntry {
@@ -15056,7 +15274,8 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 format,
                 HealthData {
                     overall: overall.into(),
-                    health_level: health_str,
+                    health_level: aggregate_health_level,
+                    capacity_health_level: health_str,
                     runtime_identity,
                     probes,
                     circuits: circuit_entries,
@@ -17481,6 +17700,7 @@ mod tests {
             priority: "high".into(),
             from: "RedHarbor".into(),
             subject: "Test".into(),
+            topic: None,
             thread: "br-123".into(),
             age: "5m".into(),
             ack_status: "pending".into(),
@@ -17557,6 +17777,7 @@ mod tests {
                 importance: "normal".into(),
                 ack: "read".into(),
                 subject: "Plan review".into(),
+                topic: Some("planning.v1".into()),
                 body: Some("Looks good.".into()),
             },
             ThreadMessage {
@@ -17567,6 +17788,7 @@ mod tests {
                 importance: "normal".into(),
                 ack: "pending".into(),
                 subject: "Re: Plan review".into(),
+                topic: Some("planning.v1".into()),
                 body: Some("Thanks!".into()),
             },
         ];
@@ -17588,6 +17810,7 @@ mod tests {
             from_model: Some("opus-4.6".into()),
             to: vec!["SilverCove".into(), "RedHarbor".into()],
             subject: "Important update".into(),
+            topic: Some("release.v31".into()),
             body: "Here are the details...".into(),
             thread: "TKT-5".into(),
             position: 3,
@@ -17604,6 +17827,7 @@ mod tests {
         let envelope = RobotEnvelope::new("robot message 42", OutputFormat::Markdown, msg);
         let md = format_output_md(&envelope, OutputFormat::Markdown).unwrap();
         assert!(md.contains("Important update"));
+        assert!(md.contains("Topic:** release.v31"));
         assert!(md.contains("GoldHawk"));
         assert!(md.contains("claude-code"));
         assert!(md.contains("SilverCove, RedHarbor"));
@@ -17619,6 +17843,7 @@ mod tests {
             priority: "ack-overdue".into(),
             from: "RedFox".into(),
             subject: "Urgent review needed".into(),
+            topic: None,
             thread: "AUTH-001".into(),
             age: "35m ago".into(),
             ack_status: "overdue".into(),
@@ -17638,6 +17863,7 @@ mod tests {
             priority: "unread".into(),
             from: "BlueLake".into(),
             subject: "FYI".into(),
+            topic: None,
             thread: "".into(),
             age: "1h ago".into(),
             ack_status: "none".into(),
@@ -17667,6 +17893,7 @@ mod tests {
                     priority: "ack-overdue".into(),
                     from: "RedFox".into(),
                     subject: "Review auth".into(),
+                    topic: None,
                     thread: "AUTH-1".into(),
                     age: "35m ago".into(),
                     ack_status: "overdue".into(),
@@ -17678,6 +17905,7 @@ mod tests {
                     priority: "urgent".into(),
                     from: "BlueLake".into(),
                     subject: "Blocking issue".into(),
+                    topic: None,
                     thread: "FEAT-1".into(),
                     age: "10m ago".into(),
                     ack_status: "required".into(),
@@ -17881,6 +18109,7 @@ mod tests {
             from_model: Some("opus-4.6".into()),
             to: vec!["RedFox".into(), "GreenCastle".into()],
             subject: "JWT implementation plan".into(),
+            topic: Some("auth.jwt".into()),
             body: "Planning JWT with JWKS rotation.".into(),
             thread: "FEAT-123".into(),
             position: 3,
@@ -17931,6 +18160,7 @@ mod tests {
                     relevance: 0.95,
                     from: "BlueLake".into(),
                     subject: "JWT plan".into(),
+                    topic: Some("auth.jwt".into()),
                     thread: "FEAT-123".into(),
                     snippet: "...JWT with JWKS rotation...".into(),
                     age: "2h ago".into(),
@@ -17940,6 +18170,7 @@ mod tests {
                     relevance: 0.87,
                     from: "RedFox".into(),
                     subject: "Auth review".into(),
+                    topic: None,
                     thread: "FEAT-123".into(),
                     snippet: "...middleware chain for auth...".into(),
                     age: "3h ago".into(),
@@ -18546,6 +18777,15 @@ mod tests {
         assert_eq!(v["overall"], "healthy");
         assert_eq!(v["health_level"], "green");
         assert_eq!(v["probes"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn aggregate_robot_health_level_never_contradicts_overall_verdict() {
+        assert_eq!(aggregate_robot_health_level("healthy", "green"), "green");
+        assert_eq!(aggregate_robot_health_level("degraded", "green"), "yellow");
+        assert_eq!(aggregate_robot_health_level("degraded", "yellow"), "yellow");
+        assert_eq!(aggregate_robot_health_level("unhealthy", "green"), "red");
+        assert_eq!(aggregate_robot_health_level("unhealthy", "red"), "red");
     }
 
     #[test]
@@ -19920,6 +20160,7 @@ mod tests {
             priority: "ack-overdue".into(),
             from: "BlueLake".into(),
             subject: "[FEAT-1] Test".into(),
+            topic: Some("feat.1".into()),
             thread: "FEAT-1".into(),
             age: "5m".into(),
             ack_status: "overdue".into(),
@@ -19928,6 +20169,7 @@ mod tests {
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("\"priority\":\"ack-overdue\""));
+        assert!(json.contains("\"topic\":\"feat.1\""));
         assert!(json.contains("\"from\":\"BlueLake\""));
     }
 
@@ -19944,6 +20186,7 @@ mod tests {
                 priority: "ack-overdue".into(),
                 from: "Agent1".into(),
                 subject: "Urgent".into(),
+                topic: None,
                 thread: "".into(),
                 age: "45m".into(),
                 ack_status: "overdue".into(),
@@ -19955,6 +20198,7 @@ mod tests {
                 priority: "urgent".into(),
                 from: "Agent2".into(),
                 subject: "High".into(),
+                topic: None,
                 thread: "".into(),
                 age: "10m".into(),
                 ack_status: "none".into(),
@@ -20170,11 +20414,13 @@ mod tests {
             importance: "high".into(),
             ack: "required".into(),
             subject: "[FEAT-1] Starting work".into(),
+            topic: Some("feat.1".into()),
             body: Some("I'm starting on this feature.".into()),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"position\":1"));
         assert!(json.contains("\"from\":\"BlueLake\""));
+        assert!(json.contains("\"topic\":\"feat.1\""));
     }
 
     #[test]
@@ -20208,6 +20454,7 @@ mod tests {
                 importance: "normal".into(),
                 ack: "none".into(),
                 subject: "[BUG-42] Login failing".into(),
+                topic: None,
                 body: Some("Users report login failures.".into()),
             }],
         };
@@ -20224,6 +20471,7 @@ mod tests {
             relevance: 0.95,
             from: "BlueLake".into(),
             subject: "JWT implementation".into(),
+            topic: Some("auth.jwt".into()),
             thread: "AUTH-1".into(),
             snippet: "...using JWT with JWKS...".into(),
             age: "2h".into(),
@@ -20231,6 +20479,7 @@ mod tests {
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"relevance\":0.95"));
         assert!(json.contains("\"snippet\""));
+        assert!(json.contains("\"topic\":\"auth.jwt\""));
     }
 
     #[test]
@@ -20349,6 +20598,7 @@ mod tests {
                 relevance: 0.91,
                 from: "BlueLake".into(),
                 subject: "Rollback plan".into(),
+                topic: None,
                 thread: "br-search".into(),
                 snippet: sensitive_body.into(),
                 age: "1m".into(),
@@ -20412,6 +20662,7 @@ mod tests {
             from_model: Some("opus-4.5".into()),
             to: vec!["RedFox".into()],
             subject: "[FEAT-123] Implementation plan".into(),
+            topic: Some("feat.123".into()),
             body: "Here is the plan...".into(),
             thread: "FEAT-123".into(),
             position: 3,
@@ -20427,6 +20678,7 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"position\":3"));
         assert!(json.contains("\"from_program\":\"claude-code\""));
+        assert!(json.contains("\"topic\":\"feat.123\""));
     }
 
     #[test]
@@ -20438,6 +20690,7 @@ mod tests {
             from_model: None,
             to: vec!["Team".into()],
             subject: "Kickoff".into(),
+            topic: None,
             body: "Starting project".into(),
             thread: "INIT-1".into(),
             position: 1,
@@ -20465,6 +20718,7 @@ mod tests {
             from_model: None,
             to: vec!["Team".into()],
             subject: "Done".into(),
+            topic: None,
             body: "Task completed".into(),
             thread: "DONE-1".into(),
             position: 5,
@@ -21405,17 +21659,50 @@ mod tests {
 
     #[test]
     fn active_reservation_helpers_omit_legacy_column_when_schema_lacks_it() {
-        let active_with_ledger = active_reservation_filter_sql(true, false, "fr", "rr");
-        assert_eq!(active_with_ledger, "rr.reservation_id IS NULL");
+        // Without the legacy released_ts column, every row is a candidate
+        // and the released check comes solely from the Rust-side ledger
+        // subtraction (GH#274).
+        assert_eq!(active_reservation_candidate_sql(false, "fr"), "1 = 1");
+        assert_eq!(legacy_released_ts_select_sql(false, "fr"), "NULL");
+        assert_eq!(legacy_released_ts_select_sql(true, "fr"), "fr.released_ts");
 
-        let released_with_ledger = reservation_released_ts_sql(true, false, "fr", "rr");
-        assert_eq!(released_with_ledger, "rr.released_ts");
+        let candidate = active_reservation_candidate_sql(true, "fr");
+        assert!(candidate.contains("fr.released_ts"));
+        // GH#274/GH#180: the hot-path predicate must not reintroduce the
+        // release-ledger anti-join.
+        assert!(!candidate.contains("file_reservation_releases"));
+        assert!(!candidate.contains("LEFT JOIN"));
+    }
 
-        let active_without_ledger = active_reservation_filter_sql(false, false, "fr", "rr");
-        assert_eq!(active_without_ledger, "1 = 1");
+    #[test]
+    fn release_ledger_index_membership_and_coalesce() {
+        let mut released_ts_by_id = HashMap::new();
+        released_ts_by_id.insert(7_i64, Some(1_000_i64));
+        released_ts_by_id.insert(9_i64, None);
+        let ledger = ReleaseLedgerIndex { released_ts_by_id };
 
-        let released_without_ledger = reservation_released_ts_sql(false, false, "fr", "rr");
-        assert_eq!(released_without_ledger, "NULL");
+        assert!(ledger.contains(7));
+        assert!(ledger.contains(9));
+        assert!(!ledger.contains(8));
+        // Ledger value wins; a NULL ledger value falls back to the legacy
+        // column, mirroring SQL COALESCE.
+        assert_eq!(ledger.coalesce(7, Some(5)), Some(1_000));
+        assert_eq!(ledger.coalesce(9, Some(5)), Some(5));
+        assert_eq!(ledger.coalesce(8, None), None);
+
+        // Membership marks a row released even when the stored ts is NULL.
+        assert!(!reservation_row_is_active(&ledger, 9, None));
+        assert!(reservation_row_is_active(&ledger, 8, None));
+        assert!(!reservation_row_is_active(
+            &ledger,
+            8,
+            Some(&sqlmodel_core::Value::BigInt(123))
+        ));
+        assert!(reservation_row_is_active(
+            &ledger,
+            8,
+            Some(&sqlmodel_core::Value::Text("none".to_string()))
+        ));
     }
 
     #[test]
@@ -23659,6 +23946,14 @@ mod tests {
         );
 
         assert_eq!(value["overall"], "unhealthy");
+        assert_eq!(
+            value["health_level"], "red",
+            "aggregate health level must not stay green when a decisive probe failed"
+        );
+        assert!(
+            value["capacity_health_level"].is_string(),
+            "capacity-only telemetry remains separately available"
+        );
         let schema_probe = value["probes"]
             .as_array()
             .expect("probes array")

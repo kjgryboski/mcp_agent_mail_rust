@@ -754,7 +754,8 @@ fn build_snapshot(
         warmup_connections: 0,
         ..Default::default()
     })
-    .map_err(AcquireError::failed)?;
+    .map_err(AcquireError::failed)?
+    .with_ephemeral_search_index();
     Ok(Arc::new(SharedSnapshot {
         pool,
         _directory: directory,
@@ -1605,14 +1606,16 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_cold_readers_share_one_immutable_query_only_snapshot() {
+    fn gh297_concurrent_cold_readers_share_one_immutable_sql_only_snapshot() {
         let _guard = TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_for_test();
         let directory = tempfile::tempdir().expect("tempdir");
-        let storage_root = directory.path().join("archive");
-        let sqlite_path = directory.path().join("missing-live.sqlite3");
+        let canonical_directory =
+            std::fs::canonicalize(directory.path()).expect("canonicalize tempdir");
+        let storage_root = canonical_directory.join("archive");
+        let sqlite_path = canonical_directory.join("missing-live.sqlite3");
         write_archive_fixture(&storage_root);
         let database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&sqlite_path);
         let scope = scope(&storage_root, &sqlite_path).expect("scope");
@@ -1651,6 +1654,10 @@ mod tests {
         assert_eq!(slot.reconstructions_max_active.load(Ordering::Acquire), 1);
 
         let snapshot = &snapshots[0];
+        assert!(
+            snapshot.pool.is_sql_only_search(),
+            "published archive snapshots must never initialize a process-global search bridge"
+        );
         let family_before = snapshot_family(snapshot.path());
         let cx = Cx::for_testing();
         let runtime = RuntimeBuilder::current_thread()

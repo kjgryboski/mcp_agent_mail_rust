@@ -903,17 +903,14 @@ fn validate_reply_body_limit(config: &Config, body_md: &str) -> McpResult<()> {
     Ok(())
 }
 
-fn normalize_topic_argument(topic: Option<&str>) -> McpResult<Option<String>> {
-    let Some(raw_topic) = topic else {
-        return Ok(None);
-    };
+fn normalize_topic_value(raw_topic: &str, argument: &'static str) -> McpResult<String> {
     let topic = raw_topic.trim();
     let mut chars = topic.chars();
     let valid = (1..=64).contains(&topic.len())
         && chars.next().is_some_and(|ch| ch.is_ascii_alphanumeric())
         && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'));
     if valid {
-        return Ok(Some(topic.to_string()));
+        return Ok(topic.to_string());
     }
 
     Err(legacy_tool_error(
@@ -924,10 +921,31 @@ fn normalize_topic_argument(topic: Option<&str>) -> McpResult<Option<String>> {
         ),
         true,
         json!({
-            "argument": "topic",
+            "argument": argument,
             "provided": topic,
         }),
     ))
+}
+
+fn normalize_topic_argument(topic: Option<&str>) -> McpResult<Option<String>> {
+    topic
+        .map(|topic| normalize_topic_value(topic, "topic"))
+        .transpose()
+}
+
+fn normalize_topic_filter(topic: Option<&str>) -> McpResult<Option<String>> {
+    let Some(topic) = topic else {
+        return Ok(None);
+    };
+    let topic = topic.trim();
+    if topic.is_empty() {
+        return Ok(None);
+    }
+    // Every persisted topic passes the same validation on write. Rejecting a
+    // lookup that can never match avoids needless database work and prevents
+    // an unbounded read-only argument from becoming an allocation/diagnostic
+    // amplification path.
+    normalize_topic_value(topic, "topic").map(Some)
 }
 
 const fn has_any_recipients(to: &[String], cc: &[String], bcc: &[String]) -> bool {
@@ -1689,6 +1707,24 @@ pub struct InboxMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ack_ts: Option<String>,
     pub kind: String,
+    pub attachments: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_md: Option<String>,
+}
+
+/// Project-scoped message returned by `fetch_topic`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopicMessage {
+    pub id: i64,
+    pub project_id: i64,
+    pub sender_id: i64,
+    pub thread_id: Option<String>,
+    pub topic: Option<String>,
+    pub subject: String,
+    pub importance: String,
+    pub ack_required: bool,
+    pub from: String,
+    pub created_ts: Option<String>,
     pub attachments: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body_md: Option<String>,
@@ -3738,7 +3774,7 @@ pub async fn fetch_inbox(
     let urgent = urgent_only.unwrap_or(false);
     let unread = unread_only.unwrap_or(false);
     let ack_overdue = ack_overdue_only.unwrap_or(false);
-    let topic = normalize_topic_argument(topic.as_deref())?;
+    let topic = normalize_topic_filter(topic.as_deref())?;
     phase.set_include_bodies(include_body);
     phase.mark("argument_validation");
 
@@ -3938,6 +3974,95 @@ pub async fn fetch_inbox(
     phase.mark("json_serialization");
     emit_tail_latency_evidence(&phase.finish("ok"));
     Ok(response)
+}
+
+/// Fetch all project messages carrying one exact topic tag.
+///
+/// This is intentionally project-scoped under the supported Rust contract: it
+/// is the topic-search counterpart to recipient-scoped
+/// `fetch_inbox(topic=...)`.
+#[tool(
+    description = "Fetch all messages in a project with a given topic tag, regardless of recipient.\n\nParameters\n----------\nproject_key : str\n    Project identifier.\ntopic_name : str\n    The topic tag to filter by (case-insensitive).\nlimit : int\n    Max number of messages to return (default 50).\ninclude_bodies : bool\n    Include full Markdown bodies in the payloads (default true).\nsince_ts : Optional[str]\n    ISO-8601 timestamp; only messages newer than this are returned.\n\nReturns\n-------\nlist[dict]\n    Each message includes: { id, subject, from, created_ts, importance, topic, [body_md] }"
+)]
+pub async fn fetch_topic(
+    ctx: &McpContext,
+    project_key: String,
+    topic_name: String,
+    limit: Option<i32>,
+    include_bodies: Option<bool>,
+    since_ts: Option<String>,
+) -> McpResult<String> {
+    let topic = topic_name.trim();
+    if topic.is_empty() {
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            "topic_name must be a non-empty string",
+            true,
+            json!({ "argument": "topic_name" }),
+        ));
+    }
+    let topic = normalize_topic_value(topic, "topic_name")?;
+    let requested_limit = limit.unwrap_or(50).clamp(1, 1000);
+    let limit = usize::try_from(requested_limit).map_err(|_| {
+        legacy_tool_error(
+            "INVALID_LIMIT",
+            format!("limit exceeds supported range: {requested_limit}"),
+            true,
+            json!({ "provided": requested_limit, "min": 1, "max": 1000 }),
+        )
+    })?;
+    let include_bodies = include_bodies.unwrap_or(true);
+    let since_micros = if let Some(timestamp) = since_ts.as_deref() {
+        Some(mcp_agent_mail_db::iso_to_micros(timestamp).ok_or_else(|| {
+            legacy_tool_error(
+                "INVALID_TIMESTAMP",
+                format!("Invalid since_ts format: {timestamp:?}. Expected ISO-8601."),
+                true,
+                json!({
+                    "provided": timestamp,
+                    "expected_format": "YYYY-MM-DDTHH:MM:SS+HH:MM",
+                }),
+            )
+        })?)
+    } else {
+        None
+    };
+
+    let pool = get_coalescer_bypass_read_db_pool()?;
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
+    let rows = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::fetch_topic_messages(
+            ctx.cx(),
+            &pool,
+            project.id.unwrap_or(0),
+            &topic,
+            since_micros,
+            limit,
+            include_bodies,
+        )
+        .await,
+    )?;
+
+    let messages = rows
+        .into_iter()
+        .map(|row| TopicMessage {
+            id: row.message.id.unwrap_or(0),
+            project_id: row.message.project_id,
+            sender_id: row.message.sender_id,
+            thread_id: row.message.thread_id,
+            topic: row.message.topic,
+            subject: row.message.subject,
+            importance: row.message.importance,
+            ack_required: row.message.ack_required != 0,
+            from: row.sender_name,
+            created_ts: Some(micros_to_iso(row.message.created_ts)),
+            attachments: parse_attachment_metadata_json(&row.message.attachments),
+            body_md: include_bodies.then_some(row.message.body_md),
+        })
+        .collect::<Vec<_>>();
+
+    serde_json::to_string(&messages)
+        .map_err(|error| McpError::new(McpErrorCode::InternalError, error.to_string()))
 }
 
 /// Read durable, body-free inbox delivery events for a monitor.
@@ -4224,6 +4349,118 @@ pub async fn mark_message_read(
 
     serde_json::to_string(&response)
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+}
+
+/// Default number of messages transitioned per `mark_all_read` call (GH#273).
+pub const MARK_ALL_READ_DEFAULT_LIMIT: usize = 500;
+
+/// Hard cap on messages transitioned per `mark_all_read` call (GH#273).
+pub const MARK_ALL_READ_MAX_LIMIT: usize = 1000;
+
+/// Bulk mark-read for one agent's inbox in one project (GH#273).
+///
+/// # Parameters
+/// - `project_key`: Project identifier (must already exist; never auto-created)
+/// - `agent_name`: Agent whose unread inbox rows transition to read
+/// - `older_than_days`: Only mark messages created at least this many days ago
+/// - `limit`: Max messages per call (default 500, capped at 1000)
+///
+/// # Returns
+/// `{ agent, marked_count, more, limit, older_than_days }` — `more=true` means
+/// eligible unread messages remain and the caller should call again.
+///
+/// # Conformance
+/// Rust-native (the legacy Python server only exposed bulk mark-read through
+/// the web dashboard).
+#[tool(
+    description = "Mark every unread message in an agent's project inbox as read, in bounded batches.\n\nWhat this does\n--------------\n- Sets read_ts for up to `limit` unread (agent, message) recipient rows in the project, oldest first\n- Acknowledgement state is never touched; ack_required mail still needs `acknowledge_message`\n- Does NOT delete anything; pair with MESSAGES_RETENTION_DAYS retention to bound old mail\n\nWhen to use\n-----------\n- Clearing the backlog of a departed/finished agent so its inbox stops counting as unread\n- Draining stale coordination or ATC liveness mail after a swarm winds down\n- Before enabling message retention pruning (only read+acked mail is ever pruned)\n\nParameters\n----------\nproject_key : str\n    Project identifier (same used with `ensure_project`/`register_agent`). The project must\n    already exist; a typo'd key is an error, never a newly minted project.\nagent_name : str\n    Agent whose inbox is being cleared. Any caller may clear any agent's backlog (operator tool).\nolder_than_days : Optional[int]\n    Only mark messages created at least this many days ago (default: no age filter).\n    Use this to keep fresh mail unread while draining aged backlog.\nlimit : Optional[int]\n    Maximum messages to transition in this call. Default 500, hard cap 1000 (larger values are\n    clamped). The response's `more` flag tells you whether another call is needed.\n\nReturns\n-------\ndict\n    { \"agent\": str, \"marked_count\": int, \"more\": bool, \"limit\": int, \"older_than_days\": int | null }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"8b\",\"method\":\"tools/call\",\"params\":{\"name\":\"mark_all_read\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"agent_name\":\"BlueLake\",\"older_than_days\":7\n}}}\n```\n\nDo / Don't\n----------\nDo:\n- Loop while `more` is true to fully drain a large backlog (each call is bounded by design).\n- Use `older_than_days` when the agent is still active and fresh mail should stay unread.\nDon't:\n- Use this as a substitute for reading coordination mail an active agent still needs.\n- Expect acks: ack_required messages remain unacknowledged until `acknowledge_message`."
+)]
+pub async fn mark_all_read(
+    ctx: &McpContext,
+    project_key: String,
+    agent_name: String,
+    older_than_days: Option<i64>,
+    limit: Option<i32>,
+) -> McpResult<String> {
+    let agent_name = normalize_agent_name_or_original(agent_name);
+
+    let effective_limit = match limit {
+        None => MARK_ALL_READ_DEFAULT_LIMIT,
+        Some(value) if value < 1 => {
+            return Err(legacy_tool_error(
+                "INVALID_LIMIT",
+                format!("limit must be at least 1, got {value}. Use a positive integer."),
+                true,
+                json!({ "provided": value, "min": 1, "max": MARK_ALL_READ_MAX_LIMIT }),
+            ));
+        }
+        Some(value) => usize::try_from(value)
+            .unwrap_or(MARK_ALL_READ_MAX_LIMIT)
+            .min(MARK_ALL_READ_MAX_LIMIT),
+    };
+
+    let older_than_us = match older_than_days {
+        None => None,
+        Some(days) if days < 0 => {
+            return Err(legacy_tool_error(
+                "INVALID_ARGUMENT",
+                format!("older_than_days must be >= 0, got {days}."),
+                true,
+                json!({ "field": "older_than_days", "provided": days }),
+            ));
+        }
+        Some(days) => Some(
+            mcp_agent_mail_db::now_micros()
+                .saturating_sub(days.saturating_mul(86_400).saturating_mul(1_000_000)),
+        ),
+    };
+
+    let pool = get_db_pool()?;
+    // Bulk mark-read is an operator/cleanup action: the project must already
+    // exist — a typo'd key must never mint a project.
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
+    let project_id = project.id.unwrap_or(0);
+    let agent = resolve_agent(
+        ctx,
+        &pool,
+        project_id,
+        &agent_name,
+        &project.slug,
+        &project.human_key,
+    )
+    .await?;
+    let agent_id = agent.id.unwrap_or(0);
+
+    let outcome = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::mark_messages_read_bulk(
+            ctx.cx(),
+            &pool,
+            project_id,
+            agent_id,
+            older_than_us,
+            effective_limit,
+        )
+        .await,
+    )?;
+
+    tracing::info!(
+        project = %project.slug,
+        agent = %agent_name,
+        marked = outcome.marked,
+        more = outcome.more,
+        limit = effective_limit,
+        older_than_days = ?older_than_days,
+        "mark_all_read: bulk-marked inbox messages read"
+    );
+
+    serde_json::to_string(&json!({
+        "agent": agent_name,
+        "marked_count": outcome.marked,
+        "more": outcome.more,
+        "limit": effective_limit,
+        "older_than_days": older_than_days,
+    }))
+    .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
 }
 
 // ── Durable ack intents (br-bvq1x.8.3 / H3) ──────────────────────────────────
@@ -5752,6 +5989,25 @@ mod tests {
         assert_eq!(data["error"]["type"], "INVALID_TOPIC");
         assert_eq!(data["error"]["data"]["argument"], "topic");
         assert_eq!(data["error"]["data"]["provided"], "");
+    }
+
+    #[test]
+    fn normalize_topic_filter_treats_blank_as_no_filter() {
+        assert_eq!(normalize_topic_filter(None).unwrap(), None);
+        assert_eq!(normalize_topic_filter(Some("   ")).unwrap(), None);
+        assert_eq!(
+            normalize_topic_filter(Some("  br-abc.1 ")).unwrap(),
+            Some("br-abc.1".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_topic_filter_rejects_values_that_cannot_exist() {
+        let err = normalize_topic_filter(Some("../never-stored"))
+            .expect_err("invalid topic lookup must fail before querying");
+        let data = err.data.expect("error payload");
+        assert_eq!(data["error"]["type"], "INVALID_TOPIC");
+        assert_eq!(data["error"]["data"]["argument"], "topic");
     }
 
     #[test]

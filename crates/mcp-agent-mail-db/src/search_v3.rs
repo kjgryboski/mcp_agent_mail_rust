@@ -617,7 +617,10 @@ enum BackfillPlan {
     FullRebuild,
 }
 
-const BACKFILL_STATE_SCHEMA_VERSION: u32 = 1;
+// Schema v2 binds every persisted skip hint to the logical database
+// generation stored inside SQLite. A filesystem path, inode, timestamp, or
+// count/max-id tuple can all be reused by an in-place database replacement.
+const BACKFILL_STATE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct BackfillDbFingerprint {
@@ -639,6 +642,7 @@ struct IndexMetaFingerprint {
 struct BackfillState {
     schema_version: u32,
     db_path: String,
+    db_generation_id: String,
     db_fingerprint: BackfillDbFingerprint,
     db_stats: MessageStats,
     #[serde(default)]
@@ -666,13 +670,10 @@ fn sqlite_file_backfill_fingerprint(db_path: &str) -> Option<BackfillDbFingerpri
         return None;
     }
     let metadata = std::fs::metadata(db_path).ok()?;
-    #[cfg(unix)]
-    let (device_id, inode) = {
-        use std::os::unix::fs::MetadataExt as _;
-        (Some(metadata.dev()), Some(metadata.ino()))
-    };
-    #[cfg(not(unix))]
-    let (device_id, inode) = (None, None);
+    let (device_id, inode) = crate::pool::stable_sqlite_file_identity(Path::new(db_path))
+        .map_or((None, None), |(device_id, inode)| {
+            (Some(device_id), Some(inode))
+        });
     let modified_micros = metadata
         .modified()
         .ok()
@@ -711,6 +712,7 @@ fn read_backfill_state(bridge: &TantivyBridge) -> Option<BackfillState> {
 fn write_backfill_state(
     bridge: &TantivyBridge,
     db_path: &str,
+    db_generation_id: &str,
     fingerprint: BackfillDbFingerprint,
     db_stats: MessageStats,
     message_watermark: MessageWatermark,
@@ -727,6 +729,7 @@ fn write_backfill_state(
     let state = BackfillState {
         schema_version: BACKFILL_STATE_SCHEMA_VERSION,
         db_path: db_path.to_string(),
+        db_generation_id: db_generation_id.to_string(),
         db_fingerprint: fingerprint,
         db_stats,
         message_watermark,
@@ -738,6 +741,57 @@ fn write_backfill_state(
         return;
     };
     let _ = std::fs::write(path, payload);
+}
+
+fn read_backfill_db_generation(conn: &DbConn) -> Result<String, String> {
+    let generation = crate::queries::db_generation_id_conn(conn).ok_or_else(|| {
+        "backfill: durable db_identity.generation_id is unavailable; refusing to reuse or publish process-global lexical state"
+            .to_string()
+    })?;
+    if generation.len() > 128 || !generation.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(
+            "backfill: durable db_identity.generation_id is malformed; refusing process-global lexical state"
+                .to_string(),
+        );
+    }
+    Ok(generation)
+}
+
+fn verify_backfill_db_generation(conn: &DbConn, expected: &str) -> Result<(), String> {
+    let observed = read_backfill_db_generation(conn)?;
+    if observed == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "backfill: database generation changed while indexing (expected {expected}, observed {observed}); refusing to publish mixed lexical state"
+        ))
+    }
+}
+
+fn verify_backfill_path_generation(db_path: &str, expected: &str) -> Result<(), String> {
+    let verification_conn = open_backfill_conn(db_path)?;
+    verify_backfill_db_generation(&verification_conn, expected)
+}
+
+fn verify_backfill_path_snapshot(
+    db_path: &str,
+    expected_generation: &str,
+    expected_watermark: MessageWatermark,
+) -> Result<(), String> {
+    let verification_conn = open_backfill_conn(db_path)?;
+    verify_backfill_db_generation(&verification_conn, expected_generation)?;
+    let observed_watermark = fetch_db_message_watermark(&verification_conn)?;
+    if observed_watermark == expected_watermark {
+        Ok(())
+    } else {
+        Err(format!(
+            "backfill: message watermark changed while indexing (expected sequence/max-id {}/{}, observed {}/{}); refusing to publish a stale lexical marker",
+            expected_watermark.sequence,
+            expected_watermark.max_id,
+            observed_watermark.sequence,
+            observed_watermark.max_id
+        ))
+    }
 }
 
 fn fetch_db_message_stats(conn: &DbConn) -> Result<MessageStats, String> {
@@ -1190,34 +1244,23 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
     };
     let db_path = &db_path_owned;
 
-    let db_fingerprint = sqlite_file_backfill_fingerprint(db_path);
-    let initial_index_fingerprint = index_meta_fingerprint(&bridge);
-    if let (Some(fingerprint), Some(state)) = (db_fingerprint, read_backfill_state(&bridge))
-        && state.db_path == *db_path
-        && state.db_fingerprint == fingerprint
-        && state.index_meta_fingerprint == initial_index_fingerprint
-    {
-        tracing::info!(
-            db_count = state.db_stats.count,
-            db_max_id = state.db_stats.max_id,
-            index_count = state.index_stats.count,
-            index_max_id = state.index_stats.max_id,
-            "backfill: sqlite/index meta fingerprints unchanged, skipping"
-        );
-        refresh_index_health_metrics(&bridge);
-        return Ok((
-            0,
-            usize::try_from(state.db_stats.count).unwrap_or(usize::MAX),
-        ));
-    }
-
-    // br-5u3w5: the bespoke bootstrap open races live pool connections on the
-    // same WAL mailbox and can surface "database is busy" — retry it on the
-    // bootstrap budget instead of failing the whole bootstrap.
+    // Open SQLite before consulting any persisted skip hint. The logical
+    // generation lives inside the database and is the only authority that
+    // survives same-path/inode/stat reuse safely.
     let mut conn = open_backfill_conn(db_path)?;
+    let db_generation_id = if db_path == ":memory:" {
+        None
+    } else {
+        Some(read_backfill_db_generation(&conn)?)
+    };
+    let db_fingerprint = sqlite_file_backfill_fingerprint(db_path);
 
     if !backfill_table_exists(&conn, "messages")? {
         let index_stats = fetch_index_message_stats(&bridge)?;
+        drop(conn);
+        if let Some(generation) = db_generation_id.as_deref() {
+            verify_backfill_path_generation(db_path, generation)?;
+        }
         if index_stats.count > 0 {
             with_tantivy_writer(&bridge, |writer| {
                 writer
@@ -1241,15 +1284,24 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
     let current_index_fingerprint = index_meta_fingerprint(&bridge);
     if let Some(state) = read_backfill_state(&bridge)
         && state.db_path == *db_path
+        && db_generation_id
+            .as_deref()
+            .is_some_and(|generation| state.db_generation_id == generation)
         && state.message_watermark == message_watermark
         && state.index_meta_fingerprint == current_index_fingerprint
     {
+        drop(conn);
+        let generation = db_generation_id
+            .as_deref()
+            .expect("file-backed skip requires a durable generation");
+        verify_backfill_path_snapshot(db_path, generation, message_watermark)?;
         if let Some(fingerprint) = db_fingerprint
             && state.db_fingerprint != fingerprint
         {
             write_backfill_state(
                 &bridge,
                 db_path,
+                generation,
                 fingerprint,
                 state.db_stats,
                 state.message_watermark,
@@ -1271,7 +1323,20 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
 
     let db_stats = fetch_db_message_stats(&conn)?;
     let index_stats = fetch_index_message_stats(&bridge)?;
-    let plan = choose_backfill_plan(&conn, db_stats, index_stats)?;
+    // Count/max-id equality is only meaningful after a marker proves that the
+    // current index was built from this exact logical database generation.
+    // Without that proof, a same-shaped replacement must rebuild in full.
+    let state_generation_matches = read_backfill_state(&bridge).is_some_and(|state| {
+        state.db_path == *db_path
+            && db_generation_id
+                .as_deref()
+                .is_some_and(|generation| state.db_generation_id == generation)
+    });
+    let plan = if state_generation_matches {
+        choose_backfill_plan(&conn, db_stats, index_stats)?
+    } else {
+        BackfillPlan::FullRebuild
+    };
 
     if matches!(plan, BackfillPlan::Skip) {
         tracing::info!(
@@ -1281,10 +1346,16 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
             index_max_id = index_stats.max_id,
             "backfill: Tantivy index already up-to-date, skipping"
         );
+        drop(conn);
+        let generation = db_generation_id
+            .as_deref()
+            .expect("file-backed skip requires a durable generation");
+        verify_backfill_path_snapshot(db_path, generation, message_watermark)?;
         if let Some(fingerprint) = sqlite_file_backfill_fingerprint(db_path) {
             write_backfill_state(
                 &bridge,
                 db_path,
+                generation,
                 fingerprint,
                 db_stats,
                 message_watermark,
@@ -1357,7 +1428,12 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
                         );
                         std::thread::sleep(delay);
                         match open_backfill_conn(db_path) {
-                            Ok(fresh) => conn = fresh,
+                            Ok(fresh) => {
+                                if let Some(generation) = db_generation_id.as_deref() {
+                                    verify_backfill_db_generation(&fresh, generation)?;
+                                }
+                                conn = fresh;
+                            }
                             Err(open_error) => tracing::warn!(
                                 error = %open_error,
                                 "backfill page scan could not re-open a fresh connection; retrying on the existing one"
@@ -1420,16 +1496,29 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
         Ok(total_indexed)
     })?;
 
+    // Seal the run only after proving that the current path still names the
+    // same logical database generation scanned above. This closes the window
+    // where an in-place replacement could occur while the old open descriptor
+    // continued serving rows successfully.
+    drop(conn);
+    if let Some(generation) = db_generation_id.as_deref() {
+        verify_backfill_path_snapshot(db_path, generation, message_watermark)?;
+    }
+
     refresh_index_health_metrics(&bridge);
     crate::search_service::invalidate_search_cache(
         crate::search_cache::InvalidationTrigger::IndexUpdate,
     );
 
     let final_index_stats = fetch_index_message_stats(&bridge).unwrap_or(db_stats);
-    if let Some(fingerprint) = sqlite_file_backfill_fingerprint(db_path) {
+    if let (Some(fingerprint), Some(generation)) = (
+        sqlite_file_backfill_fingerprint(db_path),
+        db_generation_id.as_deref(),
+    ) {
         write_backfill_state(
             &bridge,
             db_path,
+            generation,
             fingerprint,
             db_stats,
             message_watermark,
@@ -2562,6 +2651,16 @@ mod tests {
         let conn = DbConn::open_file(path_str).unwrap();
 
         conn.execute_sync(
+            "CREATE TABLE db_identity (singleton INTEGER PRIMARY KEY CHECK (singleton = 0), generation_id TEXT NOT NULL)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO db_identity (singleton, generation_id) VALUES (0, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
             "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, \
              human_key TEXT NOT NULL, created_at INTEGER NOT NULL)",
             &[],
@@ -2705,6 +2804,70 @@ mod tests {
             Some(UNKNOWN_SENDER_DISPLAY)
         );
 
+        reset_bridge_for_tests();
+    }
+
+    #[test]
+    fn gh296_new_database_generation_rebuilds_same_shaped_index_contents() {
+        let _guard = BRIDGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_bridge_for_tests();
+
+        let db_dir = tempfile::TempDir::new().expect("db tempdir");
+        let index_dir = tempfile::TempDir::new().expect("index tempdir");
+        let db_path = create_test_db(
+            db_dir.path(),
+            &[(1, "oldwalrus marker", "oldwalrus body", "normal", "gh296")],
+        );
+        init_bridge(index_dir.path()).expect("init bridge");
+        let (first_indexed, _) = backfill_from_db(&db_path).expect("first backfill");
+        assert_eq!(first_indexed, 1);
+
+        let replacement = DbConn::open_file(&db_path).expect("open replacement generation");
+        replacement
+            .execute_sync(
+                "UPDATE messages SET subject = 'newnarwhal marker', body_md = 'newnarwhal body' WHERE id = 1",
+                &[],
+            )
+            .expect("replace message contents without changing count/max-id");
+        replacement
+            .execute_sync(
+                "UPDATE db_identity SET generation_id = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' WHERE singleton = 0",
+                &[],
+            )
+            .expect("replace logical database generation");
+        drop(replacement);
+
+        let (second_indexed, _) = backfill_from_db(&db_path).expect("generation-safe backfill");
+        assert_eq!(
+            second_indexed, 1,
+            "a new generation with the same count/max-id must rebuild rather than skip"
+        );
+
+        let bridge = get_bridge().expect("bridge initialized");
+        let query = |text: &str| PlannerQuery {
+            text: text.to_string(),
+            doc_kind: DocKind::Message,
+            project_id: Some(1),
+            ..Default::default()
+        };
+        assert!(
+            bridge.search(&query("oldwalrus")).is_empty(),
+            "documents from the replaced generation must not survive"
+        );
+        assert_eq!(
+            bridge.search(&query("newnarwhal")).len(),
+            1,
+            "the replacement generation must supply the indexed document"
+        );
+
+        let state = read_backfill_state(&bridge).expect("schema-v2 backfill marker");
+        assert_eq!(state.schema_version, BACKFILL_STATE_SCHEMA_VERSION);
+        assert_eq!(
+            state.db_generation_id,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
         reset_bridge_for_tests();
     }
 
