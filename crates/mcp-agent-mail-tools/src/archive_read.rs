@@ -1612,8 +1612,10 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_for_test();
         let directory = tempfile::tempdir().expect("tempdir");
-        let storage_root = directory.path().join("archive");
-        let sqlite_path = directory.path().join("missing-live.sqlite3");
+        let canonical_directory =
+            std::fs::canonicalize(directory.path()).expect("canonicalize tempdir");
+        let storage_root = canonical_directory.join("archive");
+        let sqlite_path = canonical_directory.join("missing-live.sqlite3");
         write_archive_fixture(&storage_root);
         let database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&sqlite_path);
         let scope = scope(&storage_root, &sqlite_path).expect("scope");
