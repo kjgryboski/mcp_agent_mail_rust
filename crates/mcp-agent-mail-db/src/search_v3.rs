@@ -1538,7 +1538,8 @@ pub(crate) fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
         // Pending segments are not searchable until this sole commit. A failed
         // seal drops the retained writer and rolls back all pending operations.
         #[cfg(test)]
-        if let Some(hook) = BACKFILL_BEFORE_SEAL.lock().expect("seal hook lock").take() {
+        let hook = BACKFILL_BEFORE_SEAL.lock().expect("seal hook lock").take();
+        if let Some(hook) = hook {
             hook();
         }
         if let Some(generation) = db_generation_id.as_deref() {
