@@ -7639,7 +7639,7 @@ pub async fn create_message(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
-    if let Err(error) = index_created_message_best_effort(&conn, &row) {
+    if let Err(error) = index_created_message_best_effort(pool, &conn, &row) {
         tracing::warn!(
             message_id = row.id.unwrap_or_default(),
             error = %error,
@@ -7650,6 +7650,7 @@ pub async fn create_message(
 }
 
 fn index_created_message_best_effort(
+    pool: &DbPool,
     conn: &crate::DbConn,
     row: &MessageRow,
 ) -> std::result::Result<bool, String> {
@@ -7684,7 +7685,7 @@ fn index_created_message_best_effort(
         importance: row.importance.clone(),
         created_ts: row.created_ts,
     };
-    crate::search_v3::index_message(&message)
+    crate::search_service::index_message_for_pool(pool, &message)
 }
 
 /// Read the messages-table allocator floor: the larger of `MAX(id)` and the

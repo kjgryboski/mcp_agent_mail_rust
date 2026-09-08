@@ -1134,9 +1134,7 @@ fn robot_search_index_health_from_config(
         .map_err(|err| format!("db pool init failed: {err}"))?;
     pool.observe_search_database_generation_from_conn(conn)
         .map_err(|err| format!("search health database identity probe failed: {err}"))?;
-    Ok(mcp_agent_mail_db::search_service::lexical_backfill_health(
-        &pool,
-    ))
+    Ok(mcp_agent_mail_db::search_service::lexical_backfill_health_from_conn(&pool, conn))
 }
 
 fn search_index_probe_status(health: &LexicalBackfillHealth) -> &'static str {
@@ -20550,6 +20548,7 @@ mod tests {
             active_db_identity: None,
             stale_reason: Some("indexed message count 2 differs from source count 5".into()),
             safe_remediation: Some("am robot search rollback".into()),
+            ..Default::default()
         };
         let data = SearchData {
             query: "rollback".into(),

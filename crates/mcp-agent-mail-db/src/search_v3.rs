@@ -605,9 +605,11 @@ struct MessageStats {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct MessageWatermark {
-    sequence: u64,
-    max_id: u64,
+pub struct MessageWatermark {
+    pub sequence: u64,
+    pub max_id: u64,
+    #[serde(default)]
+    pub content_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -707,6 +709,14 @@ fn read_backfill_state(bridge: &TantivyBridge) -> Option<BackfillState> {
     let raw = std::fs::read_to_string(path).ok()?;
     let state = serde_json::from_str::<BackfillState>(&raw).ok()?;
     (state.schema_version == BACKFILL_STATE_SCHEMA_VERSION).then_some(state)
+}
+
+pub(crate) fn bridge_matches_database(path: &str, generation: Option<&str>) -> bool {
+    get_bridge()
+        .and_then(|bridge| read_backfill_state(&bridge))
+        .is_some_and(|state| {
+            state.db_path == path && generation == Some(state.db_generation_id.as_str())
+        })
 }
 
 fn write_backfill_state(
@@ -826,7 +836,7 @@ fn fetch_db_message_stats(conn: &DbConn) -> Result<MessageStats, String> {
     })
 }
 
-fn fetch_db_message_watermark(conn: &DbConn) -> Result<MessageWatermark, String> {
+pub fn fetch_db_message_watermark(conn: &DbConn) -> Result<MessageWatermark, String> {
     let max_id_rows = match query_sync_with_lock_retry(
         conn,
         "backfill watermark max-id",
@@ -861,7 +871,19 @@ fn fetch_db_message_watermark(conn: &DbConn) -> Result<MessageWatermark, String>
     // monotonic watermark for append-only message IDs.
     .unwrap_or(max_id);
 
-    Ok(MessageWatermark { sequence, max_id })
+    let content_revision = conn
+        .query_sync(
+            "SELECT revision FROM search_content_revision WHERE singleton = 0",
+            &[],
+        )
+        .ok()
+        .and_then(|rows| rows.first().and_then(|row| row.get_as::<i64>(0).ok()))
+        .and_then(|revision| u64::try_from(revision).ok());
+    Ok(MessageWatermark {
+        sequence,
+        max_id,
+        content_revision,
+    })
 }
 
 fn sqlite_error_is_missing_table(message: &str, table: &str) -> bool {
@@ -1135,7 +1157,7 @@ fn with_tantivy_writer<T>(
 ///
 /// This is intentionally fire-and-forget safe: callers should not fail the
 /// message send operation if indexing fails.
-pub fn index_message(msg: &IndexableMessage) -> Result<bool, String> {
+pub(crate) fn index_message(msg: &IndexableMessage) -> Result<bool, String> {
     // GH#227: a newly ingested message must ALWAYS invalidate the process-wide
     // search cache — even when the lexical bridge is uninitialized, bound to a
     // different database, or the Tantivy write fails. Invalidating only on
@@ -1173,7 +1195,8 @@ pub fn index_message(msg: &IndexableMessage) -> Result<bool, String> {
 ///
 /// More efficient than calling [`index_message`] repeatedly — uses a single
 /// writer and commit for the entire batch.
-pub fn index_messages_batch(messages: &[IndexableMessage]) -> Result<usize, String> {
+#[cfg(test)]
+fn index_messages_batch(messages: &[IndexableMessage]) -> Result<usize, String> {
     if messages.is_empty() {
         return Ok(0);
     }
@@ -1210,6 +1233,11 @@ pub fn index_messages_batch(messages: &[IndexableMessage]) -> Result<usize, Stri
 
 // ── Startup backfill ─────────────────────────────────────────────────────
 
+#[cfg(test)]
+type BackfillSealHook = Box<dyn FnOnce() + Send>;
+#[cfg(test)]
+static BACKFILL_BEFORE_SEAL: Mutex<Option<BackfillSealHook>> = Mutex::new(None);
+
 pub(crate) fn resolve_search_sqlite_path_from_database_url(db_url: &str) -> Option<String> {
     crate::pool::resolve_mailbox_sqlite_path(db_url)
         .ok()
@@ -1226,9 +1254,8 @@ pub(crate) fn resolve_search_sqlite_path_from_database_url(db_url: &str) -> Opti
 ///
 /// Returns `(indexed_count, skipped_count)` where `skipped_count` is always 0.
 #[allow(clippy::too_many_lines)]
-pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
+pub(crate) fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
     const FETCH_BATCH_SIZE: i64 = 500;
-    const COMMIT_EVERY_BATCHES: usize = 8;
 
     let Some(bridge) = get_bridge() else {
         return Ok((0, 0));
@@ -1287,6 +1314,7 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
         && db_generation_id
             .as_deref()
             .is_some_and(|generation| state.db_generation_id == generation)
+        && message_watermark.content_revision.is_some()
         && state.message_watermark == message_watermark
         && state.index_meta_fingerprint == current_index_fingerprint
     {
@@ -1332,7 +1360,11 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
                 .as_deref()
                 .is_some_and(|generation| state.db_generation_id == generation)
     });
-    let plan = if state_generation_matches {
+    let content_matches = read_backfill_state(&bridge).is_some_and(|state| {
+        message_watermark.content_revision.is_some()
+            && state.message_watermark.content_revision == message_watermark.content_revision
+    });
+    let plan = if state_generation_matches && content_matches {
         choose_backfill_plan(&conn, db_stats, index_stats)?
     } else {
         BackfillPlan::FullRebuild
@@ -1392,7 +1424,6 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
                 .map_err(|e| format!("Tantivy delete_all_documents error: {e}"))?;
         }
 
-        let mut pending_batches = 0_usize;
         let mut total_indexed = 0_usize;
         loop {
             // br-5u3w5: the page scan runs while live workers keep
@@ -1477,22 +1508,20 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
                     last_id = msg.id;
                 }
             }
-
-            pending_batches += 1;
-            if pending_batches >= COMMIT_EVERY_BATCHES {
-                writer
-                    .commit()
-                    .map_err(|e| format!("Tantivy commit error: {e}"))?;
-                pending_batches = 0;
-            }
         }
 
-        if pending_batches > 0 || (matches!(plan, BackfillPlan::FullRebuild) && total_indexed == 0)
-        {
-            writer
-                .commit()
-                .map_err(|e| format!("Tantivy commit error: {e}"))?;
+        // Pending segments are not searchable until this sole commit. A failed
+        // seal drops the retained writer and rolls back all pending operations.
+        #[cfg(test)]
+        if let Some(hook) = BACKFILL_BEFORE_SEAL.lock().expect("seal hook lock").take() {
+            hook();
         }
+        if let Some(generation) = db_generation_id.as_deref() {
+            verify_backfill_path_snapshot(db_path, generation, message_watermark)?;
+        }
+        writer
+            .commit()
+            .map_err(|e| format!("Tantivy commit error: {e}"))?;
         Ok(total_indexed)
     })?;
 
@@ -2695,6 +2724,10 @@ mod tests {
         )
         .unwrap();
 
+        for migration in crate::schema::search_content_revision_migrations() {
+            conn.execute_raw(&migration.up)
+                .expect("search content revision schema");
+        }
         for (id, subject, body, importance, thread_id) in messages {
             use sqlmodel_core::Value;
             conn.execute_sync(
@@ -2868,6 +2901,112 @@ mod tests {
             state.db_generation_id,
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         );
+        reset_bridge_for_tests();
+    }
+
+    #[test]
+    fn gh298_revision_detects_update_delete_and_transaction_rollback() {
+        let _guard = BRIDGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_bridge_for_tests();
+        let root = tempfile::tempdir().unwrap();
+        let index = tempfile::tempdir().unwrap();
+        let path = create_test_db(
+            root.path(),
+            &[
+                (1, "oldwalrus", "old body", "normal", "original"),
+                (2, "keepnarwhal", "keep body", "normal", "original"),
+            ],
+        );
+        init_bridge(index.path()).unwrap();
+        backfill_from_db(&path).unwrap();
+        let conn = crate::guard_db_conn(DbConn::open_file(&path).unwrap(), "revision regression");
+        let initial = fetch_db_message_watermark(&conn).unwrap();
+        conn.execute_raw("BEGIN").unwrap();
+        conn.execute_raw("UPDATE messages SET subject = 'rolledback' WHERE id = 1")
+            .unwrap();
+        assert_ne!(fetch_db_message_watermark(&conn).unwrap(), initial);
+        conn.execute_raw("ROLLBACK").unwrap();
+        assert_eq!(fetch_db_message_watermark(&conn).unwrap(), initial);
+        conn.execute_raw(
+            "UPDATE messages SET subject = 'newotter', thread_id = 'revised' WHERE id = 1",
+        )
+        .unwrap();
+        let updated = fetch_db_message_watermark(&conn).unwrap();
+        assert_eq!(initial.sequence, updated.sequence);
+        assert_eq!(initial.max_id, updated.max_id);
+        assert_ne!(initial.content_revision, updated.content_revision);
+        backfill_from_db(&path).unwrap();
+        let query = |text: &str| PlannerQuery {
+            text: text.to_string(),
+            doc_kind: DocKind::Message,
+            project_id: Some(1),
+            ..Default::default()
+        };
+        let bridge = get_bridge().unwrap();
+        assert!(bridge.search(&query("oldwalrus")).is_empty());
+        let matches = bridge.search(&query("newotter"));
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].thread_id.as_deref(), Some("revised"));
+        conn.execute_raw("DELETE FROM messages WHERE id = 1")
+            .unwrap();
+        let deleted = fetch_db_message_watermark(&conn).unwrap();
+        assert_eq!(updated.sequence, deleted.sequence);
+        assert_eq!(updated.max_id, deleted.max_id);
+        assert_ne!(updated.content_revision, deleted.content_revision);
+        backfill_from_db(&path).unwrap();
+        assert!(bridge.search(&query("newotter")).is_empty());
+        assert_eq!(bridge.search(&query("keepnarwhal")).len(), 1);
+        reset_bridge_for_tests();
+    }
+
+    #[test]
+    fn gh298_failed_seal_never_publishes_partial_segments_or_marker() {
+        let _guard = BRIDGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_bridge_for_tests();
+        let root = tempfile::tempdir().unwrap();
+        let index = tempfile::tempdir().unwrap();
+        let rows: Vec<_> = (1..=4001)
+            .map(|id| (id, "oldcohort", "old body", "normal", "original"))
+            .collect();
+        let path = create_test_db(root.path(), &rows);
+        init_bridge(index.path()).unwrap();
+        backfill_from_db(&path).unwrap();
+        let bridge = get_bridge().unwrap();
+        let marker = std::fs::read(backfill_state_path(&bridge)).unwrap();
+        let conn = crate::guard_db_conn(DbConn::open_file(&path).unwrap(), "seal regression");
+        conn.execute_raw("UPDATE messages SET subject = 'pendingcohort'")
+            .unwrap();
+        let mutation_path = path.clone();
+        *BACKFILL_BEFORE_SEAL.lock().unwrap() = Some(Box::new(move || {
+            let conn = crate::guard_db_conn(
+                DbConn::open_file(&mutation_path).unwrap(),
+                "injected concurrent mutation",
+            );
+            conn.execute_raw("UPDATE messages SET subject = 'lateotter' WHERE id = 1")
+                .unwrap();
+        }));
+        let error = backfill_from_db(&path).unwrap_err();
+        assert!(
+            error.contains("watermark"),
+            "unexpected seal error: {error}"
+        );
+        assert_eq!(std::fs::read(backfill_state_path(&bridge)).unwrap(), marker);
+        let query = |text: &str| PlannerQuery {
+            text: text.to_string(),
+            doc_kind: DocKind::Message,
+            project_id: Some(1),
+            ..Default::default()
+        };
+        assert!(!bridge.search(&query("oldcohort")).is_empty());
+        assert!(bridge.search(&query("pendingcohort")).is_empty());
+        assert!(bridge.search(&query("lateotter")).is_empty());
+        backfill_from_db(&path).unwrap();
+        assert!(bridge.search(&query("oldcohort")).is_empty());
+        assert_eq!(bridge.search(&query("lateotter")).len(), 1);
         reset_bridge_for_tests();
     }
 

@@ -412,6 +412,7 @@ pub async fn request_contact(
             &message.body_md,
         );
         crate::messaging::enqueue_message_lexical_index(
+            &pool,
             &mcp_agent_mail_db::search_v3::IndexableMessage {
                 id: message.id.unwrap_or(0),
                 project_id: target_project_id,

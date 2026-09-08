@@ -1106,7 +1106,10 @@ fn startup_search_backfill_spawn_failure_message(error: &std::io::Error) -> Stri
 fn run_startup_search_backfill(config: &mcp_agent_mail_core::Config) {
     let backfill_database_url =
         normalized_startup_search_backfill_database_url(&config.database_url);
-    match mcp_agent_mail_db::search_v3::backfill_from_db(&backfill_database_url) {
+    match mcp_agent_mail_db::search_service::startup_lexical_backfill(
+        &backfill_database_url,
+        &config.storage_root.join("search_index"),
+    ) {
         Ok((indexed, _skipped)) if indexed > 0 => {
             record_startup_search_backfill_completion(config);
             tracing::info!(
@@ -1120,7 +1123,10 @@ fn run_startup_search_backfill(config: &mcp_agent_mail_core::Config) {
         Err(err) => {
             tracing::warn!("[startup-search] Tantivy backfill failed (non-fatal): {err}");
             if recover_startup_search_backfill_db(config, &err) {
-                match mcp_agent_mail_db::search_v3::backfill_from_db(&backfill_database_url) {
+                match mcp_agent_mail_db::search_service::startup_lexical_backfill(
+                    &backfill_database_url,
+                    &config.storage_root.join("search_index"),
+                ) {
                     Ok((indexed, _)) if indexed > 0 => {
                         record_startup_search_backfill_completion(config);
                         tracing::warn!(
