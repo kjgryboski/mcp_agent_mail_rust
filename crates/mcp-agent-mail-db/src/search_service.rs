@@ -392,8 +392,9 @@ fn try_tantivy_search(pool: &DbPool, query: &SearchQuery) -> Option<Vec<SearchRe
     Some(bridge.search(query))
 }
 
-/// Incremental indexing retains the originating pool instead of trusting the
-/// currently active process-global bridge. A mismatch leaves recovery to the
+/// Index a message only through its originating pool.
+///
+/// A mismatch leaves recovery to the
 /// next canonical backfill and never writes another database's index.
 pub fn index_message_for_pool(
     pool: &DbPool,
@@ -412,7 +413,7 @@ pub fn index_message_for_pool(
         || (pool.sqlite_path() != ":memory:"
             && !crate::search_v3::bridge_matches_database(
                 pool.sqlite_path(),
-                pool.search_database_generation_id().as_deref(),
+                pool.search_database_generation_id(),
             ))
     {
         return Ok(false);
@@ -1205,6 +1206,7 @@ pub fn lexical_backfill_health(pool: &DbPool) -> LexicalBackfillHealth {
 
 /// Bracket marker inspection through the caller's existing connection. Robot
 /// health uses this entry point and never opens an extra pooled/SQLite handle.
+#[must_use]
 pub fn lexical_backfill_health_from_conn(
     pool: &DbPool,
     conn: &crate::DbConn,
