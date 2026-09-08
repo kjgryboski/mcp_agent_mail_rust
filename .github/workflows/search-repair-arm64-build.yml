@@ -1,4 +1,4 @@
-name: search-repair-arm64-build
+name: search-repair-native-build
 
 on:
   pull_request:
@@ -20,13 +20,16 @@ env:
 
 jobs:
   qualify:
-    name: qualify-${{ matrix.lane }}
-    runs-on: macos-14
+    name: qualify-${{ matrix.os }}-${{ matrix.lane }}
+    runs-on: ${{ matrix.os }}
+    env:
+      REPAIR_TARGET: ${{ matrix.os == 'macos-14' && 'aarch64-apple-darwin' || 'x86_64-unknown-linux-gnu' }}
     timeout-minutes: 180
     strategy:
       fail-fast: false
       max-parallel: 4
       matrix:
+        os: [macos-14, ubuntu-24.04]
         lane:
           - db-cli-regressions
           - server-tools-regressions
@@ -70,13 +73,17 @@ jobs:
         with:
           toolchain: nightly-2026-08-25
           components: rustfmt, clippy
-          targets: aarch64-apple-darwin
+          targets: ${{ env.REPAIR_TARGET }}
 
       - name: Verify source and toolchain identity
         shell: bash
         run: |
           set -euo pipefail
-          test "$(uname -m)" = arm64
+          case "$REPAIR_TARGET" in
+            aarch64-apple-darwin) test "$(uname -m)" = arm64 ;;
+            x86_64-unknown-linux-gnu) test "$(uname -m)" = x86_64 ;;
+            *) exit 1 ;;
+          esac
           test "$(git rev-parse HEAD)" = "$REPAIR_HEAD_SHA"
           rustc --version --verbose
           cargo --version --verbose
@@ -95,7 +102,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo metadata --locked --format-version 1 --filter-platform aarch64-apple-darwin \
+          cargo metadata --locked --format-version 1 --filter-platform "$REPAIR_TARGET" \
             >"$RUNNER_TEMP/cargo-metadata.json"
           git diff --exit-code -- Cargo.lock
           shasum -a 256 Cargo.lock
@@ -104,7 +111,7 @@ jobs:
         if: matrix.lane == 'binary-e2e'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: agent-mail-search-repair-resolved-lock-${{ github.run_id }}
+          name: agent-mail-search-repair-resolved-lock-${{ env.REPAIR_TARGET }}-${{ github.run_id }}
           path: Cargo.lock
           if-no-files-found: error
           retention-days: 7
@@ -115,7 +122,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --locked --release --target aarch64-apple-darwin \
+          cargo test --locked --release --target "$REPAIR_TARGET" \
             -p mcp-agent-mail-db -p mcp-agent-mail-cli \
             --no-default-features --features portable \
             --lib gh29 -- --nocapture --test-threads=1
@@ -125,7 +132,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --locked --release --target aarch64-apple-darwin \
+          cargo test --locked --release --target "$REPAIR_TARGET" \
             -p mcp-agent-mail-server -p mcp-agent-mail-tools \
             --no-default-features --features portable \
             --lib gh297_ -- --nocapture --test-threads=1
@@ -135,11 +142,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo check --locked --release --target aarch64-apple-darwin \
+          cargo check --locked --release --target "$REPAIR_TARGET" \
             -p mcp-agent-mail-db -p mcp-agent-mail-share -p mcp-agent-mail-cli \
             -p mcp-agent-mail-server -p mcp-agent-mail-tools \
             --no-default-features --features portable --all-targets
-          cargo clippy --locked --release --target aarch64-apple-darwin \
+          cargo clippy --locked --release --target "$REPAIR_TARGET" \
             -p mcp-agent-mail-db -p mcp-agent-mail-share -p mcp-agent-mail-cli \
             -p mcp-agent-mail-server -p mcp-agent-mail-tools \
             --no-default-features --features portable --all-targets --no-deps -- -D warnings
@@ -149,7 +156,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --locked --release --target aarch64-apple-darwin \
+          cargo build --locked --release --target "$REPAIR_TARGET" \
             -p mcp-agent-mail -p mcp-agent-mail-cli \
             --no-default-features --features portable
 
@@ -164,7 +171,7 @@ jobs:
           database_path="$storage_root/storage.sqlite3"
           state_path="$storage_root/search_index/backfill_state.json"
           server_log="$repair_root/server.log"
-          binary="$GITHUB_WORKSPACE/target/aarch64-apple-darwin/release/am"
+          binary="$GITHUB_WORKSPACE/target/$REPAIR_TARGET/release/am"
           port=18777
           mkdir -p "$storage_root" "$project_root"
 
@@ -292,8 +299,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p repair-artifact
-          cp target/aarch64-apple-darwin/release/am repair-artifact/
-          cp target/aarch64-apple-darwin/release/mcp-agent-mail repair-artifact/
+          cp "target/$REPAIR_TARGET/release/am" repair-artifact/
+          cp "target/$REPAIR_TARGET/release/mcp-agent-mail" repair-artifact/
           file repair-artifact/am repair-artifact/mcp-agent-mail
           test "$(repair-artifact/am --version)" = "am 0.3.32"
           test "$(repair-artifact/mcp-agent-mail --version)" = "mcp-agent-mail 0.3.32"
@@ -301,11 +308,11 @@ jobs:
           (cd repair-artifact && shasum -a 256 am mcp-agent-mail > SHA256SUMS)
           cat repair-artifact/SOURCE_COMMIT repair-artifact/SHA256SUMS
 
-      - name: Upload qualified arm64 repair binaries
+      - name: Upload qualified native repair binaries
         if: matrix.lane == 'binary-e2e'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: agent-mail-search-repair-aarch64-apple-darwin
+          name: agent-mail-search-repair-${{ env.REPAIR_TARGET }}
           path: repair-artifact/
           if-no-files-found: error
           retention-days: 7
