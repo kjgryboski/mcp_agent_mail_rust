@@ -90,6 +90,7 @@ pub mod write_barrier;
 
 #[cfg(not(feature = "tantivy-engine"))]
 pub mod search_v3 {
+    use sqlmodel_core::Connection;
     use std::path::Path;
     use std::sync::Arc;
 
@@ -158,12 +159,13 @@ pub mod search_v3 {
         pub sequence: u64,
         pub max_id: u64,
         pub content_revision: Option<u64>,
+        pub rewrite_revision: Option<u64>,
     }
 
     pub fn fetch_db_message_watermark(conn: &crate::DbConn) -> Result<MessageWatermark, String> {
         let rows = conn
             .query_sync(
-                "SELECT revision FROM search_content_revision WHERE singleton = 0",
+                "SELECT revision, rewrite_revision FROM search_content_revision WHERE singleton = 0",
                 &[],
             )
             .map_err(|error| error.to_string())?;
@@ -171,6 +173,10 @@ pub mod search_v3 {
             content_revision: rows
                 .first()
                 .and_then(|row| row.get_as::<i64>(0).ok())
+                .and_then(|revision| u64::try_from(revision).ok()),
+            rewrite_revision: rows
+                .first()
+                .and_then(|row| row.get_as::<i64>(1).ok())
                 .and_then(|revision| u64::try_from(revision).ok()),
             ..Default::default()
         })

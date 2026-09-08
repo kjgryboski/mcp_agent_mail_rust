@@ -143,6 +143,8 @@ jobs:
         run: |
           set -euo pipefail
           cargo check --locked --release --target "$REPAIR_TARGET" \
+            -p mcp-agent-mail-db --no-default-features --lib
+          cargo check --locked --release --target "$REPAIR_TARGET" \
             -p mcp-agent-mail-db -p mcp-agent-mail-share -p mcp-agent-mail-cli \
             -p mcp-agent-mail-server -p mcp-agent-mail-tools \
             --no-default-features --features portable --all-targets

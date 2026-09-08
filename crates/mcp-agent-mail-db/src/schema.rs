@@ -227,7 +227,8 @@ CREATE TABLE IF NOT EXISTS db_identity (
 
 CREATE TABLE IF NOT EXISTS search_content_revision (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 0),
-    revision INTEGER NOT NULL CHECK (revision >= 0)
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    rewrite_revision INTEGER NOT NULL CHECK (rewrite_revision >= 0)
 );
 
 -- FTS5 virtual table for message search
@@ -2369,8 +2370,8 @@ pub fn schema_migrations() -> Vec<Migration> {
 #[must_use]
 pub fn search_content_revision_migrations() -> Vec<Migration> {
     let mut statements = vec![
-        ("table".to_string(), "CREATE TABLE IF NOT EXISTS search_content_revision (singleton INTEGER PRIMARY KEY CHECK (singleton = 0), revision INTEGER NOT NULL CHECK (revision >= 0))".to_string()),
-        ("seed".to_string(), "INSERT OR IGNORE INTO search_content_revision (singleton, revision) VALUES (0, 0)".to_string()),
+        ("table".to_string(), "CREATE TABLE IF NOT EXISTS search_content_revision (singleton INTEGER PRIMARY KEY CHECK (singleton = 0), revision INTEGER NOT NULL CHECK (revision >= 0), rewrite_revision INTEGER NOT NULL CHECK (rewrite_revision >= 0))".to_string()),
+        ("seed".to_string(), "INSERT OR IGNORE INTO search_content_revision (singleton, revision, rewrite_revision) VALUES (0, 0, 0)".to_string()),
     ];
     for (table, events) in [
         ("messages", ["INSERT", "UPDATE", "DELETE"]),
@@ -2382,8 +2383,13 @@ pub fn search_content_revision_migrations() -> Vec<Migration> {
     ] {
         for (suffix, event) in ["insert", "update", "delete"].into_iter().zip(events) {
             let name = format!("{table}_{suffix}");
+            let rewrite = if table == "messages" && suffix == "insert" {
+                ""
+            } else {
+                ", rewrite_revision = rewrite_revision + 1"
+            };
             statements.push((name.clone(), format!(
-                "CREATE TRIGGER IF NOT EXISTS trg_search_revision_{name} AFTER {event} ON {table} BEGIN UPDATE search_content_revision SET revision = revision + 1 WHERE singleton = 0; END"
+                "CREATE TRIGGER IF NOT EXISTS trg_search_revision_{name} AFTER {event} ON {table} BEGIN UPDATE search_content_revision SET revision = revision + 1{rewrite} WHERE singleton = 0; END"
             )));
         }
     }

@@ -610,6 +610,8 @@ pub struct MessageWatermark {
     pub max_id: u64,
     #[serde(default)]
     pub content_revision: Option<u64>,
+    #[serde(default)]
+    pub rewrite_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -791,7 +793,10 @@ fn verify_backfill_path_snapshot(
     let verification_conn = open_backfill_conn(db_path)?;
     verify_backfill_db_generation(&verification_conn, expected_generation)?;
     let observed_watermark = fetch_db_message_watermark(&verification_conn)?;
-    if observed_watermark == expected_watermark {
+    if expected_watermark.content_revision.is_some()
+        && expected_watermark.rewrite_revision.is_some()
+        && observed_watermark == expected_watermark
+    {
         Ok(())
     } else {
         Err(format!(
@@ -871,18 +876,31 @@ pub fn fetch_db_message_watermark(conn: &DbConn) -> Result<MessageWatermark, Str
     // monotonic watermark for append-only message IDs.
     .unwrap_or(max_id);
 
-    let content_revision = conn
-        .query_sync(
-            "SELECT revision FROM search_content_revision WHERE singleton = 0",
-            &[],
-        )
-        .ok()
-        .and_then(|rows| rows.first().and_then(|row| row.get_as::<i64>(0).ok()))
-        .and_then(|revision| u64::try_from(revision).ok());
+    let revision_rows = match query_sync_with_lock_retry(
+        conn,
+        "backfill watermark content revision",
+        "SELECT revision, rewrite_revision FROM search_content_revision WHERE singleton = 0",
+        &[],
+    ) {
+        Ok(rows) => rows,
+        Err(error)
+            if sqlite_error_is_missing_table(&error.to_string(), "search_content_revision") =>
+        {
+            Vec::new()
+        }
+        Err(error) => return Err(format!("backfill content revision query failed: {error}")),
+    };
+    let revision_at = |column| {
+        revision_rows
+            .first()
+            .and_then(|row| row.get_as::<i64>(column).ok())
+            .and_then(|revision| u64::try_from(revision).ok())
+    };
     Ok(MessageWatermark {
         sequence,
         max_id,
-        content_revision,
+        content_revision: revision_at(0),
+        rewrite_revision: revision_at(1),
     })
 }
 
@@ -1308,6 +1326,10 @@ pub(crate) fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
     }
 
     let message_watermark = fetch_db_message_watermark(&conn)?;
+    if message_watermark.content_revision.is_none() || message_watermark.rewrite_revision.is_none()
+    {
+        return Err("backfill: transactional content revision is unavailable; refusing to publish lexical state".to_string());
+    }
     let current_index_fingerprint = index_meta_fingerprint(&bridge);
     if let Some(state) = read_backfill_state(&bridge)
         && state.db_path == *db_path
@@ -1360,11 +1382,14 @@ pub(crate) fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
                 .as_deref()
                 .is_some_and(|generation| state.db_generation_id == generation)
     });
-    let content_matches = read_backfill_state(&bridge).is_some_and(|state| {
-        message_watermark.content_revision.is_some()
-            && state.message_watermark.content_revision == message_watermark.content_revision
+    // A changed content clock with an unchanged rewrite clock proves that only
+    // message inserts occurred. Count/prefix validation can safely retain the
+    // append path, including inserts already projected by the owning writer.
+    let rewrite_matches = read_backfill_state(&bridge).is_some_and(|state| {
+        message_watermark.rewrite_revision.is_some()
+            && state.message_watermark.rewrite_revision == message_watermark.rewrite_revision
     });
-    let plan = if state_generation_matches && content_matches {
+    let plan = if state_generation_matches && rewrite_matches {
         choose_backfill_plan(&conn, db_stats, index_stats)?
     } else {
         BackfillPlan::FullRebuild
@@ -2958,6 +2983,95 @@ mod tests {
         backfill_from_db(&path).unwrap();
         assert!(bridge.search(&query("newotter")).is_empty());
         assert_eq!(bridge.search(&query("keepnarwhal")).len(), 1);
+        reset_bridge_for_tests();
+    }
+
+    #[test]
+    fn gh298_append_only_revisions_keep_incremental_and_already_indexed_paths() {
+        let _guard = BRIDGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_bridge_for_tests();
+        let root = tempfile::tempdir().unwrap();
+        let index = tempfile::tempdir().unwrap();
+        let path = create_test_db(
+            root.path(),
+            &[
+                (1, "firstotter", "body", "normal", "original"),
+                (2, "secondotter", "body", "normal", "original"),
+            ],
+        );
+        init_bridge(index.path()).unwrap();
+        assert_eq!(backfill_from_db(&path).unwrap(), (2, 0));
+        let conn = crate::guard_db_conn(DbConn::open_file(&path).unwrap(), "append regression");
+        let initial = fetch_db_message_watermark(&conn).unwrap();
+        conn.execute_raw("INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) VALUES (3, 1, 1, 'thirdotter', 'body', 1000000)").unwrap();
+        let appended = fetch_db_message_watermark(&conn).unwrap();
+        assert_ne!(initial.content_revision, appended.content_revision);
+        assert_eq!(initial.rewrite_revision, appended.rewrite_revision);
+        let (indexed, _) = backfill_from_db(&path).unwrap();
+        assert_eq!(indexed, 1, "append must not rebuild the existing mailbox");
+        conn.execute_raw("INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) VALUES (4, 1, 1, 'fourthotter', 'body', 1000000)").unwrap();
+        let mut message = make_indexable(4, "fourthotter", "body");
+        message.project_slug = "test-proj".to_string();
+        message.sender_name = "BlueLake".to_string();
+        message.thread_id = None;
+        message.created_ts = 1_000_000;
+        assert!(index_message(&message).unwrap());
+        assert_eq!(backfill_from_db(&path).unwrap(), (0, 4));
+        let state = read_backfill_state(&get_bridge().unwrap()).unwrap();
+        assert_eq!(
+            state.message_watermark,
+            fetch_db_message_watermark(&conn).unwrap()
+        );
+        reset_bridge_for_tests();
+    }
+
+    #[test]
+    fn gh298_unknown_revision_never_publishes_and_query_errors_propagate() {
+        let _guard = BRIDGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_bridge_for_tests();
+        let root = tempfile::tempdir().unwrap();
+        let index = tempfile::tempdir().unwrap();
+        let path = create_test_db(
+            root.path(),
+            &[(1, "originalotter", "body", "normal", "original")],
+        );
+        init_bridge(index.path()).unwrap();
+        backfill_from_db(&path).unwrap();
+        let bridge = get_bridge().unwrap();
+        let marker = std::fs::read(backfill_state_path(&bridge)).unwrap();
+        let conn = crate::guard_db_conn(
+            DbConn::open_file(&path).unwrap(),
+            "unknown revision regression",
+        );
+        conn.execute_raw("DELETE FROM search_content_revision")
+            .unwrap();
+        conn.execute_raw("UPDATE messages SET subject = 'unsealedotter'")
+            .unwrap();
+        assert!(
+            backfill_from_db(&path)
+                .unwrap_err()
+                .contains("revision is unavailable")
+        );
+        assert_eq!(std::fs::read(backfill_state_path(&bridge)).unwrap(), marker);
+        conn.execute_raw("DROP TABLE search_content_revision")
+            .unwrap();
+        assert!(
+            backfill_from_db(&path)
+                .unwrap_err()
+                .contains("revision is unavailable")
+        );
+        conn.execute_raw("CREATE TABLE search_content_revision (singleton INTEGER PRIMARY KEY)")
+            .unwrap();
+        assert!(
+            fetch_db_message_watermark(&conn)
+                .unwrap_err()
+                .contains("content revision query failed")
+        );
+        assert_eq!(std::fs::read(backfill_state_path(&bridge)).unwrap(), marker);
         reset_bridge_for_tests();
     }
 
