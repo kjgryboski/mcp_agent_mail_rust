@@ -6358,7 +6358,11 @@ mod tests {
         runtime.block_on(async {
             let cx = Cx::for_testing();
             for (pool, word) in [(&pool_a, "alphaquokka"), (&pool_b, "betaquokka")] {
-                let conn = match pool.acquire(&cx).await { Outcome::Ok(conn) => conn, other => panic!("acquire: {other:?}") };
+                let conn = match pool.acquire(&cx).await {
+                    Outcome::Ok(conn) => conn,
+                    Outcome::Err(error) => panic!("acquire: {error}"),
+                    _ => panic!("acquire cancelled or panicked"),
+                };
                 conn.execute_raw("INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'fixture', '/fixture', 0)").unwrap();
                 conn.execute_raw("INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) VALUES (1, 1, 'GreenLake', 'test', 'test', 0, 0)").unwrap();
                 for id in [1, 2] {
@@ -6370,7 +6374,11 @@ mod tests {
             let query = SearchQuery::messages("alphaquokka", 1);
             let initial = match execute_search(&cx, &pool_a, &query, &options).await { Outcome::Ok(response) => response, other => panic!("initial search: {other:?}") };
             assert_eq!(initial.results.len(), 2);
-            let conn = match pool_a.acquire(&cx).await { Outcome::Ok(conn) => conn, other => panic!("health connection: {other:?}") };
+            let conn = match pool_a.acquire(&cx).await {
+                Outcome::Ok(conn) => conn,
+                Outcome::Err(error) => panic!("health connection: {error}"),
+                _ => panic!("health connection cancelled or panicked"),
+            };
             let health = lexical_backfill_health_from_conn(&pool_a, &conn);
             assert_eq!(health.state, "fresh", "{health:?}");
             assert!(health.watermark_sample_stable && health.watermark_matches);

@@ -19,7 +19,58 @@ env:
   BEADS_RUST_COMMIT: ba6ff75da25529c8cad8395352f5c5fc2162ee95
 
 jobs:
+  preflight:
+    name: compile-tests-before-native-builds
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CARGO_PROFILE_DEV_OPT_LEVEL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - name: Check out exact repair commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Check out pinned sibling dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          checkout_pinned() {
+            local repo_url="$1"
+            local destination="$2"
+            local expected_commit="$3"
+            git init --quiet "$destination"
+            git -C "$destination" remote add origin "$repo_url"
+            git -C "$destination" fetch --quiet --depth 1 origin "$expected_commit"
+            git -C "$destination" checkout --quiet --detach FETCH_HEAD
+            test "$(git -C "$destination" rev-parse HEAD)" = "$expected_commit"
+          }
+          checkout_pinned https://github.com/Dicklesworthstone/frankensearch ../frankensearch "$FRANKENSEARCH_COMMIT"
+          checkout_pinned https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes "$FAST_CMAES_COMMIT"
+          checkout_pinned https://github.com/Dicklesworthstone/beads_rust ../beads_rust "$BEADS_RUST_COMMIT"
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # pinned 2026-08-05
+        with:
+          toolchain: nightly-2026-08-25
+          components: clippy
+
+      - name: Compile tests and lint before release qualification
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$REPAIR_HEAD_SHA"
+          cargo check --locked -p mcp-agent-mail-db --no-default-features --lib
+          cargo clippy --locked \
+            -p mcp-agent-mail-db -p mcp-agent-mail-share -p mcp-agent-mail-cli \
+            -p mcp-agent-mail-server -p mcp-agent-mail-tools \
+            --no-default-features --features portable --all-targets --no-deps -- -D warnings
+          git diff --exit-code -- Cargo.lock
+
   qualify:
+    needs: preflight
     name: qualify-${{ matrix.os }}-${{ matrix.lane }}
     runs-on: ${{ matrix.os }}
     env:
