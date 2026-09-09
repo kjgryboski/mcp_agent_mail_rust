@@ -1,5 +1,174 @@
 # AGENTS.md — MCP Agent Mail (Rust)
 
+> **L0 (observe) candidate — NOT FLIPPED. Onboarding held on 2026-09-09.**
+> The scheduler row remains `enabled=0`; no worker launch, direct-to-main route,
+> deployment or live Mail maintenance is approved by these files. All changes
+> currently land through independently reviewed pull requests. Only the owner
+> can sign a dated flip after commissioning.
+
+## Flywheel floor — scope and precedence
+
+Read this entire manual at task start and after compaction. The owner's explicit
+current instructions win. For fleet sessions the floor in this section governs
+identity, reservations, shared Beads, routing and completion; the product manual
+below still governs Rust implementation. Its generic bare `br`, clone-local
+Beads, automatic issue creation, push and legacy-branch synchronization examples
+do not authorize those operations in fleet sessions. A restricted remediation
+packet may require an uncommitted handoff and forbids live operations.
+
+Run `git rev-parse --show-toplevel` and `git status --short --branch`; read
+`README.md` and scoped manuals, then reread exact files before editing. Preserve
+concurrent edits. No stash/reset/clean, force-push, branch deletion, hook bypass,
+`--no-verify`, or worker changes to hook configuration. Never invent an urgent
+exception or weaken tests. Do not delete files without owner permission.
+
+### Identity, Mail and shared Beads
+
+The proposed clone anchor is `codex-o02` at
+`/home/kevin/flywheel-agents/codex-o02/mcp_agent_mail_rust`. This path is also the
+canonical Agent Mail project key. It is an intended path, not proof of an
+installed clone. The owner must register the real Mail identity and populate
+`mailAgent` and `observerAgent` in `flywheel.guard.json`; none is claimed yet.
+The launcher supplies `FLYWHEEL_AGENT_ID=worker:codex-o02`, never the agent by
+hand. Worker alias and clone path must match reciprocally. Unset/`human:<name>`
+is human class; dispatched `lane:<slug>` uses worker semantics on direct main
+pushes. Never change identity to work around a refusal.
+
+After commissioning, read the inbox, claim approved ready product work, and
+reserve the narrow paths before editing. Use the same bead ID in the thread,
+reservation reason and `Bead: <id>` trailer. Release only your own reservations
+when work lands or is abandoned. A conflict requires coordination.
+
+Fleet authority is ONLY
+`/home/kevin/flywheel-beads/mcp_agent_mail_rust/authoritative/.beads/beads.db`,
+through native `/home/kevin/.local/bin/br`. Always supply `--db`; reads also
+supply `--no-auto-import --no-auto-flush`. Never initialize in a clone or import
+the existing `.beads/issues.jsonl` into the shared store without owner review.
+The existing product issue history is not automatically the fleet queue.
+Hold a `.beads/**` reservation for claim/close/flush. Never hand-edit or merge a
+JSONL projection. Worker commits require a real, non-terminal bead claimed by
+the alias; `Bead: none` cannot satisfy that. Empty ready `flywheel-queue` means
+stop and report no ready product work; workers do not create tasks to fill it.
+Use robot/JSON task interfaces, never interactive `bv`.
+
+### Guard, runtime and outage behavior
+
+The canary bundle is copied from `d795b83f7ef6fc64b54e272f17fa664a0419e3df`,
+including W45 + W51 bearer-token support. W51 supersedes unauthenticated copies.
+The product remains Cargo-only. Native Linux Node 24.20.0 (`.nvmrc`) is an
+additional development/guard runtime, with no npm package or dependency install.
+The owner runs `node scripts/install-flywheel-hooks.mjs`, then verifies
+`core.hooksPath=.githooks` and `flywheel.nodePath` points at that native ELF Node.
+The POSIX wrappers call Node; no separate shell guard is needed with that
+runtime provisioned. Without it, the clone cannot be commissioned. Existing
+product hooks require reviewed `chainHooksDir` integration, not silent replacement.
+
+Pre-commit checks reservations; commit-msg verifies Beads and writes identity
+trailers; pre-push checks reservations and main CI. Mail or GitHub unreadable
+means worker stop. Preserve the diff; never restart/repair Mail, touch live
+databases, disable hooks or use a human fail-open path as a workaround.
+Human fail-open behavior leaves audit evidence. `CI` and `VERCEL` make the
+guard/installer no-op; unset both during guard tests and owner installation.
+Never print credentials or put them in this repository. W51 obtains the Mail
+credential from the launcher environment or the owner's private token file.
+
+### Main gate and verification
+
+`redMainCheckNames` names `Offline contract suite` in
+`.github/workflows/main-status.yml` (`Flywheel main status`), plus `Skip Guard`
+and `Dashboard WASM + Exporter Matrix`
+in `.github/workflows/ci.yml` (`CI`). That workflow runs on every main push,
+without path filters. `Skip Guard` requires the product build/test and its
+downstream suites; the dashboard is independent and must be included separately.
+The onboarding change adds `Flywheel guard contract` to `Skip Guard`'s needs
+and success checks. Prior CI workflows declare no Node setup or Node commands;
+the new job explicitly provisions `.nvmrc` rather than assuming runner contents.
+
+The sentinel preserves the canary's workflow/job names and ref-scoped concurrency.
+It runs the guard suite, `cargo build --workspace` and `cargo test --workspace`
+with the product's `nightly-2026-08-25` pin and existing CI sibling layout.
+Node is pinned to 24.20.0; the job is bounded at 30 minutes and tests at 15.
+It needs no Mail credentials and uses isolated test storage. Existing CI's
+stable Rust requests and floating sibling revisions remain unqualified product
+prerequisites, not evidence of nightly parity. The scheduler reads the names
+from `flywheel.guard.json`, not a TSV column. The owner must refresh the existing
+W64 prompt to include the additional sentinel before commissioning.
+
+On 2026-09-09, GitHub returned zero check runs on main
+`11b5c98fcc640651d962a9a9df2a11289addaf17`. These are source-selected gate
+names, NOT verified live main results. Keep the row held until every named gate
+has a deciding successful main run and the owner records fresh receipts.
+Missing checks can read pending in the guard; pending/skipped/neutral is not
+onboarding acceptance. Rename jobs and config together; never add a dummy gate.
+Red/unreadable main stops worker pushes; fixes/reverts require coordinated,
+approved work, and fenced paths always use PRs.
+
+Run the task's product checks from the manual below plus `git diff --check`.
+Guard changes require `env -u CI -u VERCEL node --test test/*.test.mjs` on the
+pinned Node. Rust has a separate `nightly-2026-08-25` pin and path dependencies
+on sibling repositories; missing prerequisites are a reported blocker, never an
+invitation to alter shared toolchains or install a new live server. Review-sweep
+scripts and passing fixture tests do not commission a service or schedule a sweep.
+Report executed checks and gaps; close authorized work and release reservations
+only within the session's scope.
+
+## 9. Critical paths — pull request only
+
+Every identity and autonomy level must land these paths through an independently
+reviewed pull request:
+
+```
+.github/workflows/**
+.githooks/**
+scripts/flywheel-guard.mjs
+scripts/flywheel-fence.mjs
+scripts/install-flywheel-hooks.mjs
+scripts/review-sweep.mjs
+test/flywheel-guard.test.mjs
+test/flywheel-fence-globs.test.mjs
+test/install-flywheel-hooks.test.mjs
+test/review-sweep.test.mjs
+flywheel.guard.json
+.nvmrc
+AGENTS.md
+Cargo.toml
+Cargo.lock
+crates/*/Cargo.toml
+crates/*/Cargo.lock
+crates/*/fuzz/Cargo.toml
+crates/*/fuzz/Cargo.lock
+experimental/*/Cargo.toml
+vendor/*/Cargo.toml
+rust-toolchain.toml
+.cargo/**
+.config/nextest.toml
+Dockerfile
+Dockerfile.release
+install.sh
+install.ps1
+install-local.sh
+crates/mcp-agent-mail-core/src/config.rs
+crates/mcp-agent-mail-core/src/mcp_config.rs
+crates/mcp-agent-mail-db/src/**
+crates/mcp-agent-mail-storage/src/**
+crates/mcp-agent-mail-guard/src/**
+crates/mcp-agent-mail-cli/src/doctor/**
+```
+
+This fenced block is authoritative. Keep its order identical to the advisory
+`flywheel.guard.json.criticalPathGlobs.globs` mirror and the literal
+`scripts/flywheel-fence.mjs`; the fence test checks those plus the guard export.
+The guard enforces this list only in condition 6 of its janitor revert exception.
+Other critical-path changes are PR-only by policy and detected after landing by
+`scripts/review-sweep.mjs`; the hook is not a universal edit fence. No source
+change authorizes deploying a binary, altering the running Mail service, its
+credentials or its stores. Missing risky paths must be reported for owner review.
+The manifest globs include nested dashboard, fuzz, experimental and vendor
+workspaces. Database migrations live under the fenced DB source tree; Docker,
+install scripts and workflows cover the repository's deployment configuration.
+
+---
+
 > Guidelines for AI coding agents working in this Rust codebase.
 
 ---

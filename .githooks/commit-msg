@@ -1,0 +1,22 @@
+#!/bin/sh
+set -eu
+NODE_BIN="$(git config --get flywheel.nodePath)"
+"$NODE_BIN" scripts/flywheel-guard.mjs --phase commit-msg "$1"
+# Guard passed. Chain into the repository's own hooks (husky and friends) when configured;
+# git allows exactly one core.hooksPath, so this is how a consuming repo keeps its hooks.
+# --get-all: --get exits 2 on a multi-valued key, which must not read as "no chaining".
+CHAIN_STATUS=0
+CHAIN_RAW="$(git config --get-all flywheel.chainHooksDir)" || CHAIN_STATUS=$?
+CHAIN_DIR=""
+if [ "$CHAIN_STATUS" -eq 0 ]; then
+  CHAIN_DIR="$(printf '%s\n' "$CHAIN_RAW" | head -n 1)"
+elif [ "$CHAIN_STATUS" -ne 1 ]; then
+  echo "flywheel: could not read flywheel.chainHooksDir (git config exit $CHAIN_STATUS); not chaining" >&2
+fi
+if [ -z "$CHAIN_DIR" ] || [ ! -f "$CHAIN_DIR/commit-msg" ]; then
+  exit 0
+fi
+if [ -x "$CHAIN_DIR/commit-msg" ]; then
+  exec "$CHAIN_DIR/commit-msg" "$@"
+fi
+exec sh -e "$CHAIN_DIR/commit-msg" "$@"

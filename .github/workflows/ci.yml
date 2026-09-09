@@ -12,6 +12,20 @@ env:
   DASHBOARD_FRANKENTUI_REVISION: 8aeb72216c3a5e8b03029c9634e607adcc297402
 
 jobs:
+  flywheel-guard:
+    name: Flywheel guard contract
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+      - name: Test Flywheel guard, hooks, fence and review sweep
+        run: env -u CI -u VERCEL node --test test/*.test.mjs
+
   # The browser dashboard crate is an independent nested workspace, so the
   # repository-wide workspace jobs below do not discover or validate it.
   dashboard-wasm:
@@ -1386,12 +1400,13 @@ jobs:
     name: Skip Guard
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [test, mode-matrix, native-command-matrix, conformance, perf-security, e2e-dual-mode, search-v3-e2e, incident-regression-gates, snapshots, durability-unit, durability-e2e, chaos]
+    needs: [flywheel-guard, test, mode-matrix, native-command-matrix, conformance, perf-security, e2e-dual-mode, search-v3-e2e, incident-regression-gates, snapshots, durability-unit, durability-e2e, chaos]
     if: always()
     steps:
       - name: Verify all required jobs passed
         run: |
           echo "Job results:"
+          echo "  flywheel-guard: ${{ needs.flywheel-guard.result }}"
           echo "  test: ${{ needs.test.result }}"
           echo "  mode-matrix: ${{ needs.mode-matrix.result }}"
           echo "  native-command-matrix: ${{ needs.native-command-matrix.result }}"
@@ -1407,6 +1422,7 @@ jobs:
 
           FAILED=0
           for result in \
+            "${{ needs.flywheel-guard.result }}" \
             "${{ needs.test.result }}" \
             "${{ needs.mode-matrix.result }}" \
             "${{ needs.native-command-matrix.result }}" \
