@@ -1,0 +1,28 @@
+#!/bin/sh
+set -eu
+NODE_BIN="$(git config --get flywheel.nodePath)"
+"$NODE_BIN" scripts/flywheel-guard.mjs --phase pre-commit
+# Guard passed. Chain into the repository's own hooks (husky and friends) when configured;
+# git allows exactly one core.hooksPath, so this is how a consuming repo keeps its hooks.
+# --get-all: --get exits 2 on a multi-valued key, which must not read as "no chaining".
+CHAIN_STATUS=0
+CHAIN_RAW="$(git config --get-all flywheel.chainHooksDir)" || CHAIN_STATUS=$?
+CHAIN_DIR=""
+if [ "$CHAIN_STATUS" -eq 0 ]; then
+  CHAIN_DIR="$(printf '%s\n' "$CHAIN_RAW" | head -n 1)"
+elif [ "$CHAIN_STATUS" -ne 1 ]; then
+  echo "flywheel: could not read flywheel.chainHooksDir (git config exit $CHAIN_STATUS); not chaining" >&2
+fi
+if [ -z "$CHAIN_DIR" ] || [ ! -f "$CHAIN_DIR/pre-commit" ]; then
+  exit 0
+fi
+# Chained hooks resolve node tooling through PATH; pin the guard's tree first (komplex runs f5bc, adcb).
+NODE_DIR="$(dirname "$NODE_BIN")"
+case ":$PATH:" in
+  *":$NODE_DIR:"*) ;;
+  *) PATH="$NODE_DIR:$PATH"; export PATH ;;
+esac
+if [ -x "$CHAIN_DIR/pre-commit" ]; then
+  exec "$CHAIN_DIR/pre-commit" "$@"
+fi
+exec sh -e "$CHAIN_DIR/pre-commit" "$@"

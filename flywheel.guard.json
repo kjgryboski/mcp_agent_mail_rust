@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "agentMailUrl": "http://127.0.0.1:8765/mcp/",
+  "agentMailProjectKey": "/home/kevin/flywheel-agents/codex-o02/mcp_agent_mail_rust",
+  "mailTimeoutMs": 650,
+  "redMainCheckNames": [
+    "Offline contract suite",
+    "Skip Guard",
+    "Dashboard WASM + Exporter Matrix"
+  ],
+  "criticalPathGlobs": {
+    "note": "Advisory mirror; AGENTS.md section 9 is authoritative. The guard imports scripts/flywheel-fence.mjs for janitor exception condition 6 only; ordinary critical-path changes remain PR-only by policy and are detected by scripts/review-sweep.mjs.",
+    "source": "AGENTS.md section 9",
+    "globs": [
+      ".github/workflows/**",
+      ".githooks/**",
+      "scripts/flywheel-guard.mjs",
+      "scripts/flywheel-fence.mjs",
+      "scripts/install-flywheel-hooks.mjs",
+      "scripts/review-sweep.mjs",
+      "test/flywheel-guard.test.mjs",
+      "test/flywheel-fence-globs.test.mjs",
+      "test/install-flywheel-hooks.test.mjs",
+      "test/review-sweep.test.mjs",
+      "flywheel.guard.json",
+      ".nvmrc",
+      "AGENTS.md",
+      "Cargo.toml",
+      "Cargo.lock",
+      "crates/*/Cargo.toml",
+      "crates/*/Cargo.lock",
+      "crates/*/fuzz/Cargo.toml",
+      "crates/*/fuzz/Cargo.lock",
+      "experimental/*/Cargo.toml",
+      "vendor/*/Cargo.toml",
+      "rust-toolchain.toml",
+      ".cargo/**",
+      ".config/nextest.toml",
+      "Dockerfile",
+      "Dockerfile.release",
+      "install.sh",
+      "install.ps1",
+      "install-local.sh",
+      "crates/mcp-agent-mail-core/src/config.rs",
+      "crates/mcp-agent-mail-core/src/mcp_config.rs",
+      "crates/mcp-agent-mail-db/src/**",
+      "crates/mcp-agent-mail-storage/src/**",
+      "crates/mcp-agent-mail-guard/src/**",
+      "crates/mcp-agent-mail-cli/src/doctor/**"
+    ]
+  },
+  "workerClones": [
+    {
+      "alias": "codex-o02",
+      "path": "/home/kevin/flywheel-agents/codex-o02/mcp_agent_mail_rust"
+    }
+  ],
+  "br": {
+    "binary": "/home/kevin/.local/bin/br",
+    "database": "/home/kevin/flywheel-beads/mcp_agent_mail_rust/authoritative/.beads/beads.db"
+  }
+}

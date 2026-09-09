@@ -1,0 +1,72 @@
+#!/bin/sh
+set -eu
+NODE_BIN="$(git config --get flywheel.nodePath)"
+# --get-all: --get exits 2 on a multi-valued key, which must not read as "no chaining".
+CHAIN_STATUS=0
+CHAIN_RAW="$(git config --get-all flywheel.chainHooksDir)" || CHAIN_STATUS=$?
+CHAIN_DIR=""
+if [ "$CHAIN_STATUS" -eq 0 ]; then
+  CHAIN_DIR="$(printf '%s\n' "$CHAIN_RAW" | head -n 1)"
+elif [ "$CHAIN_STATUS" -ne 1 ]; then
+  echo "flywheel: could not read flywheel.chainHooksDir (git config exit $CHAIN_STATUS); not chaining" >&2
+fi
+CHAINED=""
+if [ -n "$CHAIN_DIR" ] && [ -f "$CHAIN_DIR/pre-push" ]; then
+  CHAINED="$CHAIN_DIR/pre-push"
+fi
+# A human push (FLYWHEEL_WORK_UNIT_SESSION unset) with nothing to chain keeps the original
+# fast path byte for byte: exec the guard on the inherited stdin, and the guard alone decides.
+if [ -z "$CHAINED" ] && [ -z "${FLYWHEEL_WORK_UNIT_SESSION:-}" ]; then
+  exec "$NODE_BIN" scripts/flywheel-guard.mjs --phase pre-push
+fi
+# Both the guard and the chained hook need the ref list git writes on stdin, and stdin can only
+# be read once: capture it and replay the identical bytes to each.
+REFS="$(mktemp)"
+trap 'rm -f "$REFS"' EXIT INT TERM HUP
+cat > "$REFS"
+"$NODE_BIN" scripts/flywheel-guard.mjs --phase pre-push < "$REFS"
+# Guard passed. Chain into the repository's own hooks (husky and friends).
+# Chained hooks resolve node tooling through PATH; pin the guard's tree first (komplex runs f5bc, adcb).
+if [ -n "$CHAINED" ]; then
+  NODE_DIR="$(dirname "$NODE_BIN")"
+  case ":$PATH:" in
+    *":$NODE_DIR:"*) ;;
+    *) PATH="$NODE_DIR:$PATH"; export PATH ;;
+  esac
+fi
+if [ -n "$CHAINED" ] && [ -x "$CHAINED" ]; then
+  "$CHAINED" "$@" < "$REFS"
+elif [ -n "$CHAINED" ]; then
+  sh -e "$CHAINED" "$@" < "$REFS"
+fi
+# Flywheel work-unit push check. Runs LAST, after the guard and any chained hook, and can only
+# add a refusal: it never lets a push through that the guard or the chained hook rejected, and
+# it is inert unless the scheduler set FLYWHEEL_WORK_UNIT_SESSION, so an ordinary human push
+# behaves exactly as it did before this block existed. No hook is redirected.
+# The run wrapper (control plane scripts/scheduler/flywheel-scheduler-run.sh) greps this file
+# for FLYWHEEL_WORK_UNIT_SESSION and work-unit-push.py and refuses to launch a worker without
+# both. work-unit-push.py imports work-unit.py from its own directory, so the override must
+# point into a directory holding the matching pair; the default is the installed scheduler copy.
+# The check binds to the GitHub landing. git hands pre-push the remote name ($1) and the remote
+# URL ($2); only a push to this owner on github.com is a landing the work unit can be held to.
+# Any other remote is a test fixture: the scheduler exports FLYWHEEL_WORK_UNIT_SESSION for the
+# whole worker session, and the hook tests of this repository spawn this hook from fixture
+# repositories with that inherited environment, pushing to local remotes (filesystem paths).
+# Those pushes skip the check and behave exactly as a push with FLYWHEEL_WORK_UNIT_SESSION unset.
+WORK_UNIT_LANDING=""
+case "${2:-}" in
+  *github.com[:/]kjgryboski/*) WORK_UNIT_LANDING=1 ;;
+  *) ;;
+esac
+if [ -n "${FLYWHEEL_WORK_UNIT_SESSION:-}" ] && [ -n "$WORK_UNIT_LANDING" ]; then
+  WORK_UNIT_PUSH_CHECK="${FLYWHEEL_WORK_UNIT_PUSH_CHECK:-/home/kevin/.local/lib/flywheel-scheduler/work-unit-push.py}"
+  case "$WORK_UNIT_PUSH_CHECK" in
+    */work-unit-push.py) ;;
+    *) echo "flywheel: FLYWHEEL_WORK_UNIT_PUSH_CHECK must name work-unit-push.py, not \"$WORK_UNIT_PUSH_CHECK\"; refusing push" >&2; exit 1 ;;
+  esac
+  if [ ! -f "$WORK_UNIT_PUSH_CHECK" ]; then
+    echo "flywheel: work-unit push check missing at $WORK_UNIT_PUSH_CHECK; refusing push" >&2
+    exit 1
+  fi
+  python3 "$WORK_UNIT_PUSH_CHECK" < "$REFS"
+fi

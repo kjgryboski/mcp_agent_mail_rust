@@ -1,0 +1,56 @@
+name: Flywheel main status
+
+# Every main head, including docs-only changes, needs a deciding check.
+# This supplements the CI aggregate and independent dashboard gate.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A PR must never cancel the sentinel for a pushed main head.
+  group: main-status-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  offline-contract:
+    name: Offline contract suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+      - name: Test Flywheel guard, hooks, fence and review sweep
+        run: env -u CI -u VERCEL node --test test/*.test.mjs
+      # Match the product CI's sibling layout. These public repositories need
+      # no Mail or fleet credentials; revision qualification remains an owner gate.
+      - name: Clone sibling dependencies
+        run: |
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          git clone --depth 1 https://github.com/Dicklesworthstone/fast_cmaes ../fast_cmaes
+          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
+      # Honor the product pin; stable in the existing CI is not proof of parity.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-08-25
+      - name: Build workspace
+        run: cargo build --workspace
+      - name: Unit and integration tests
+        timeout-minutes: 15
+        run: cargo test --workspace
+        env:
+          DATABASE_URL: "sqlite:///tmp/flywheel_main_test.sqlite3"
+          STORAGE_ROOT: "/tmp/flywheel_main_storage"
+          AGENT_NAME: "CiTestAgent"
+          HTTP_HOST: "127.0.0.1"
+          HTTP_PORT: "1"
+          HTTP_PATH: "/mcp/"
