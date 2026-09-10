@@ -577,6 +577,46 @@ pub enum Commands {
         #[arg(long)]
         project: Option<String>,
     },
+    /// Bulk mark-read for an agent's project inbox (GH#273).
+    ///
+    /// Marks up to --limit unread messages read (oldest first) through the
+    /// same machinery as the `mark_all_read` MCP tool. Useful for clearing a
+    /// departed agent's backlog or draining aged mail without a browser.
+    /// Acknowledgement state is never touched.
+    #[command(name = "mark-all-read")]
+    MarkAllRead {
+        /// Agent whose inbox to mark read (default: AGENT_NAME or AGENT_MAIL_AGENT).
+        #[arg(long)]
+        agent: Option<String>,
+        /// Project key (default: AGENT_MAIL_PROJECT env var or current directory).
+        #[arg(long)]
+        project: Option<String>,
+        /// Only mark messages created at least this many days ago.
+        #[arg(long)]
+        older_than_days: Option<i64>,
+        /// Maximum messages per call (default 500; the server caps at 1000).
+        /// The output's `more` flag reports whether backlog remains.
+        #[arg(long, default_value_t = 500, value_parser = parse_positive_usize_arg)]
+        limit: usize,
+        /// Allow a direct SQLite write for co-located setups. Still prefers
+        /// the running daemon over HTTP when it is reachable (avoids WAL
+        /// contention with the daemon's writer) and only writes SQLite
+        /// directly when no daemon is listening.
+        #[arg(long)]
+        direct: bool,
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long)]
+        json: bool,
+        /// Server host for HTTP mode (default: 127.0.0.1).
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Server port for HTTP mode (default: 8765).
+        #[arg(long, default_value_t = 8765)]
+        port: u16,
+    },
     /// Read durable, restart-safe inbox delivery events for one recipient.
     #[command(name = "inbox-events")]
     InboxEvents {
@@ -2005,6 +2045,9 @@ pub enum MailCommand {
         /// Thread ID to associate with.
         #[arg(long)]
         thread_id: Option<String>,
+        /// Optional case-insensitive topic tag (1-64 safe ASCII characters).
+        #[arg(long)]
+        topic: Option<String>,
         /// Sender token proving ownership of --from (DISCOURAGED: visible in
         /// shell history/process list — prefer --sender-token-file or the
         /// AGENT_MAIL_SENDER_TOKEN env var). If --from was registered via
@@ -2174,6 +2217,8 @@ struct PendingMailSendEnvelope {
     importance: String,
     ack_required: bool,
     thread_id: Option<String>,
+    #[serde(default)]
+    topic: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2454,6 +2499,13 @@ pub enum DoctorCommand {
         /// `reclaimable` owner; never kills `am`.
         #[arg(long)]
         take_ownership: bool,
+        /// Quarantine a structurally broken recovery-receipt chain (zero or
+        /// multiple roots, broken link, fork, cycle) before reconstructing, so
+        /// promotion can seed a fresh root (GH#283). The chain directory is
+        /// renamed aside — never deleted. Refused when the chain verifies
+        /// cleanly or an unfinalized promotion intent exists. Requires --yes.
+        #[arg(long)]
+        reseed_receipt_chain: bool,
     },
     /// Report the supervised drain/restart protocol for the current mailbox
     /// owner without killing any process (read-only).
@@ -2978,6 +3030,33 @@ pub enum AgentsCommand {
         #[arg(long, default_value_t = true)]
         json: bool,
     },
+    /// Soft-retire agents idle past a threshold (operator/cron path; GH#275).
+    ///
+    /// No live agent identity or registration token is required: this is a
+    /// host-level administrative sweep, analogous to `am robot handoff
+    /// --stale-minutes` for beads. The default action is a soft retire
+    /// (sets `retired_at`, same as the `retire_agent` MCP tool) — history is
+    /// preserved and `unretire_agent` remains a path back. Agents with
+    /// `reaper_exempt` set are always skipped.
+    Reap {
+        /// Retire agents whose last activity is older than this many days.
+        #[arg(long)]
+        stale_days: u32,
+        /// Project key (slug or human_key / absolute path). Omitting sweeps
+        /// every project.
+        #[arg(long = "project", short = 'p')]
+        project_key: Option<String>,
+        /// List candidates (name, project, idle days) without mutating
+        /// anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -3479,6 +3558,8 @@ fn agents_command_is_read_only(action: &AgentsCommand) -> bool {
             | AgentsCommand::Show { .. }
             | AgentsCommand::Detect { .. }
             | AgentsCommand::ResolvePane { .. }
+            // A dry-run reap is a SELECT-only candidate listing (GH#275).
+            | AgentsCommand::Reap { dry_run: true, .. }
     )
 }
 
@@ -3753,6 +3834,27 @@ fn dispatch_command(command: Commands) -> CliResult<()> {
             port,
             project,
         } => handle_check_inbox(agent, rate_limit, direct, format, json, host, port, project),
+        Commands::MarkAllRead {
+            agent,
+            project,
+            older_than_days,
+            limit,
+            direct,
+            format,
+            json,
+            host,
+            port,
+        } => handle_mark_all_read(
+            agent,
+            project,
+            older_than_days,
+            limit,
+            direct,
+            format,
+            json,
+            host,
+            port,
+        ),
         Commands::InboxEvents {
             agent,
             project,
@@ -7979,6 +8081,7 @@ fn run_startup_database_self_heal(config: &Config) -> CliResult<()> {
                 false,
                 true,
                 false,
+                false,
             )
         },
     )
@@ -9038,6 +9141,317 @@ fn handle_check_inbox(
     Ok(())
 }
 
+/// Handle the mark-all-read command (GH#273).
+///
+/// Routes through the running daemon's `mark_all_read` MCP tool over
+/// JSON-RPC when one is reachable (same preference order as check-inbox:
+/// a bulk UPDATE must not contend on the WAL with a running `serve-http`
+/// daemon's long-lived writer, GH#158), and falls back to the same
+/// `mark_messages_read_bulk` query over direct SQLite only when no daemon is
+/// listening and `--direct` was requested.
+#[allow(clippy::too_many_arguments)]
+fn handle_mark_all_read(
+    agent: Option<String>,
+    project: Option<String>,
+    older_than_days: Option<i64>,
+    limit: usize,
+    direct: bool,
+    format: Option<output::CliOutputFormat>,
+    json: bool,
+    host: String,
+    port: u16,
+) -> CliResult<()> {
+    let fmt = output::CliOutputFormat::resolve(format, json);
+
+    let agent_name = agent
+        .or_else(|| std::env::var("AGENT_NAME").ok())
+        .or_else(|| std::env::var("AGENT_MAIL_AGENT").ok())
+        .filter(|value| !value_looks_like_template(value));
+    let Some(agent_name) = agent_name else {
+        return Err(CliError::InvalidArgument(
+            "agent is required; pass --agent or set AGENT_MAIL_AGENT".to_string(),
+        ));
+    };
+    let project_key = project
+        .or_else(|| std::env::var("AGENT_MAIL_PROJECT").ok())
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default()
+        });
+    if let Some(days) = older_than_days
+        && days < 0
+    {
+        return Err(CliError::InvalidArgument(
+            "--older-than-days must be >= 0".to_string(),
+        ));
+    }
+
+    // Same routing decision as check-inbox (GH#158): prefer the daemon
+    // whenever it is reachable; only touch SQLite directly when `--direct`
+    // was requested AND no daemon is listening.
+    let daemon_reachable = direct && process_owner_port_reachable(&host, port);
+    let use_daemon = check_inbox_should_use_daemon(direct, daemon_reachable);
+
+    let payload = if use_daemon {
+        let config = Config::from_env();
+        let rpc_config = resolve_check_inbox_rpc_config_reader(
+            |key| std::env::var(key).ok(),
+            &project_key,
+            &agent_name,
+            &host,
+            port,
+            &config.http_path,
+        );
+        let server_urls = rpc_config.server_urls.clone();
+
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .map_err(|e| CliError::Other(format!("runtime error: {e}")))?;
+        let via_daemon = rt.block_on(async {
+            mark_all_read_via_jsonrpc(&rpc_config, &server_urls, older_than_days, limit).await
+        });
+
+        match via_daemon {
+            Ok(payload) => payload,
+            // The daemon went away between the reachability probe and the
+            // call; honor the co-located `--direct` intent.
+            Err(_) if direct => {
+                mark_all_read_direct(&project_key, &agent_name, older_than_days, limit)?
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        mark_all_read_direct(&project_key, &agent_name, older_than_days, limit)?
+    };
+
+    render_mark_all_read_payload(&payload, fmt);
+    Ok(())
+}
+
+/// Build the `tools/call mark_all_read` JSON-RPC request. The arguments must
+/// stay semantically identical to what [`mark_all_read_direct_with_pool`]
+/// passes to `mark_messages_read_bulk` — the daemon and direct paths must
+/// agree (the GH#269 lesson for check-inbox).
+fn build_mark_all_read_jsonrpc_request(
+    config: &CheckInboxRpcConfig,
+    older_than_days: Option<i64>,
+    limit: usize,
+) -> serde_json::Value {
+    let mut arguments = serde_json::json!({
+        "project_key": config.project_key,
+        "agent_name": config.agent_name,
+        "limit": limit,
+    });
+    if let Some(days) = older_than_days {
+        arguments["older_than_days"] = serde_json::Value::from(days);
+    }
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "mark-all-read",
+        "method": "tools/call",
+        "params": {
+            "name": "mark_all_read",
+            "arguments": arguments,
+        }
+    })
+}
+
+/// Invoke the daemon's `mark_all_read` tool, trying each candidate server URL.
+async fn mark_all_read_via_jsonrpc(
+    config: &CheckInboxRpcConfig,
+    server_urls: &[String],
+    older_than_days: Option<i64>,
+    limit: usize,
+) -> CliResult<serde_json::Value> {
+    let mut urls = Vec::with_capacity(config.server_urls.len() + server_urls.len() + 1);
+    urls.push(config.server_url.clone());
+    for url in server_urls.iter().chain(config.server_urls.iter()) {
+        if !urls.iter().any(|existing| existing == url) {
+            urls.push(url.clone());
+        }
+    }
+
+    let request = build_mark_all_read_jsonrpc_request(config, older_than_days, limit);
+    let mut last_error: Option<CliError> = None;
+    for server_url in urls {
+        let payload = match post_jsonrpc_request(
+            &server_url,
+            config.bearer_token.as_deref(),
+            &request,
+            config.timeout_seconds,
+        )
+        .await
+        {
+            Ok(payload) => payload,
+            Err(error) => {
+                last_error = Some(error);
+                continue;
+            }
+        };
+        if let Some(error) = parse_jsonrpc_error(&payload) {
+            // A tool-level refusal (bad limit, unknown project/agent) is
+            // authoritative — surface it instead of retrying other URLs.
+            return Err(CliError::Other(error));
+        }
+        let Some(result) = payload.get("result").cloned() else {
+            last_error = Some(CliError::Other(
+                "missing JSON-RPC result payload".to_string(),
+            ));
+            continue;
+        };
+        match coerce_tool_result_json(result) {
+            Some(value) if value.get("marked_count").is_some() => return Ok(value),
+            Some(other) => {
+                last_error = Some(CliError::Other(format!(
+                    "unexpected mark_all_read response shape: {other}"
+                )));
+            }
+            None => {
+                last_error = Some(CliError::Other(
+                    "unexpected mark_all_read response shape".to_string(),
+                ));
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        CliError::Other("no server URLs configured for mark-all-read HTTP mode".to_string())
+    }))
+}
+
+/// Direct-SQLite fallback for mark-all-read (no daemon listening).
+fn mark_all_read_direct(
+    project_key: &str,
+    agent_name: &str,
+    older_than_days: Option<i64>,
+    limit: usize,
+) -> CliResult<serde_json::Value> {
+    let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .map_err(|e| CliError::Other(format!("runtime error: {e}")))?;
+    rt.block_on(async {
+        let ctx = context::AsyncCliContext::open()?;
+        let cx = asupersync::Cx::for_request();
+        mark_all_read_direct_with_pool(
+            &cx,
+            &ctx.pool,
+            project_key,
+            agent_name,
+            older_than_days,
+            limit,
+        )
+        .await
+    })
+}
+
+/// Core of the direct mark-all-read path: resolve project + agent WITHOUT
+/// auto-creating either (an administrative sweep must never mint a project
+/// from a typo'd key) and run the same `mark_messages_read_bulk` query the
+/// `mark_all_read` MCP tool uses, with the same 1000-message clamp. Split
+/// from the runtime wrapper so tests can drive it against a seeded pool.
+async fn mark_all_read_direct_with_pool(
+    cx: &asupersync::Cx,
+    pool: &mcp_agent_mail_db::DbPool,
+    project_key: &str,
+    agent_name: &str,
+    older_than_days: Option<i64>,
+    limit: usize,
+) -> CliResult<serde_json::Value> {
+    let by_slug = match mcp_agent_mail_db::queries::get_project_by_slug(cx, pool, project_key).await
+    {
+        asupersync::Outcome::Ok(row) => Some(row),
+        asupersync::Outcome::Err(mcp_agent_mail_db::DbError::NotFound { .. }) => None,
+        other => Some(outcome_to_result(other)?),
+    };
+    let project = match by_slug {
+        Some(row) => row,
+        None => {
+            match mcp_agent_mail_db::queries::get_project_by_human_key(cx, pool, project_key).await
+            {
+                asupersync::Outcome::Ok(row) => row,
+                asupersync::Outcome::Err(mcp_agent_mail_db::DbError::NotFound { .. }) => {
+                    return Err(CliError::InvalidArgument(format!(
+                        "project not found: {project_key}"
+                    )));
+                }
+                other => outcome_to_result(other)?,
+            }
+        }
+    };
+    let project_id = project.id.unwrap_or(0);
+
+    let agent = match mcp_agent_mail_db::queries::get_agent(cx, pool, project_id, agent_name).await
+    {
+        asupersync::Outcome::Ok(row) => row,
+        asupersync::Outcome::Err(mcp_agent_mail_db::DbError::NotFound { .. }) => {
+            return Err(CliError::InvalidArgument(format!(
+                "agent not found in project {}: {agent_name}",
+                project.slug
+            )));
+        }
+        other => outcome_to_result(other)?,
+    };
+    let agent_id = agent.id.unwrap_or(0);
+
+    // Mirror the MCP tool's interpretation exactly (daemon/direct parity).
+    let effective_limit = limit.clamp(1, MARK_ALL_READ_CLI_MAX_LIMIT);
+    let older_than_us = older_than_days.map(|days| {
+        mcp_agent_mail_db::now_micros()
+            .saturating_sub(days.saturating_mul(86_400).saturating_mul(1_000_000))
+    });
+
+    let outcome = outcome_to_result(
+        mcp_agent_mail_db::queries::mark_messages_read_bulk(
+            cx,
+            pool,
+            project_id,
+            agent_id,
+            older_than_us,
+            effective_limit,
+        )
+        .await,
+    )?;
+
+    Ok(serde_json::json!({
+        "agent": agent_name,
+        "marked_count": outcome.marked,
+        "more": outcome.more,
+        "limit": effective_limit,
+        "older_than_days": older_than_days,
+    }))
+}
+
+/// Hard cap on messages per mark-all-read call — must match the
+/// `mark_all_read` MCP tool's `MARK_ALL_READ_MAX_LIMIT`.
+const MARK_ALL_READ_CLI_MAX_LIMIT: usize = mcp_agent_mail_tools::MARK_ALL_READ_MAX_LIMIT;
+
+fn render_mark_all_read_payload(payload: &serde_json::Value, fmt: output::CliOutputFormat) {
+    let marked = payload
+        .get("marked_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let more = payload
+        .get("more")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let agent = payload
+        .get("agent")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    output::emit_output(payload, fmt, || {
+        if marked == 0 {
+            output::success(&format!("No unread messages matched for {agent}."));
+        } else if more {
+            output::success(&format!(
+                "Marked {marked} message(s) read for {agent}; more remain — run again to continue."
+            ));
+        } else {
+            output::success(&format!("Marked {marked} message(s) read for {agent}."));
+        }
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_inbox_events(
     agent: Option<String>,
@@ -9444,7 +9858,15 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
             json,
             allow_live_owner,
             take_ownership,
-        } => handle_doctor_reconstruct(dry_run, yes, json, allow_live_owner, take_ownership),
+            reseed_receipt_chain,
+        } => handle_doctor_reconstruct(
+            dry_run,
+            yes,
+            json,
+            allow_live_owner,
+            take_ownership,
+            reseed_receipt_chain,
+        ),
         DoctorCommand::Drain { format, json } => handle_doctor_drain(format, json),
         DoctorCommand::ArchiveScan { format, json } => handle_doctor_archive_scan(format, json),
         DoctorCommand::ArchiveVerify { format, json } => handle_doctor_archive_verify(format, json),
@@ -10279,7 +10701,19 @@ fn handle_list_projects_with_database_url(
                 let id: i64 = row.get_named("id").unwrap_or(0);
                 let agents = conn
                     .query_sync(
-                        "SELECT name, program, model FROM agents WHERE project_id = ?",
+                        "SELECT a.name, a.program, a.model \
+                         FROM agents a \
+                         WHERE a.project_id = ? \
+                           AND a.retired_at IS NULL \
+                           AND NOT EXISTS ( \
+                               SELECT 1 FROM agent_deregistrations d WHERE d.agent_id = a.id \
+                           ) \
+                           AND a.id = ( \
+                               SELECT MIN(canonical.id) FROM agents canonical \
+                               WHERE canonical.project_id = a.project_id \
+                                 AND canonical.name = a.name COLLATE NOCASE \
+                           ) \
+                         ORDER BY a.last_active_ts DESC, a.id DESC",
                         &[sqlmodel_core::Value::BigInt(id)],
                     )
                     .unwrap_or_default();
@@ -14464,19 +14898,6 @@ impl CanonicalSnapshotSource {
         })
     }
 
-    fn live_snapshot(reported_path: PathBuf, source_path: &Path, context: &str) -> CliResult<Self> {
-        let snapshot_dir = canonical_snapshot_tempdir("canonical-mailbox-live-snapshot-", context)?;
-        let actual_path = snapshot_dir.path().join("mailbox.sqlite3");
-        mcp_agent_mail_share::create_sqlite_snapshot(source_path, &actual_path, false)
-            .map_err(|e| CliError::Other(format!("{context} live sqlite snapshot failed: {e}")))?;
-        Ok(Self {
-            actual_path,
-            reported_path,
-            kind: CanonicalSnapshotSourceKind::LiveSnapshot,
-            _snapshot_dir: Some(snapshot_dir),
-        })
-    }
-
     fn live_full_sqlite_snapshot(
         reported_path: PathBuf,
         source_path: &Path,
@@ -14558,7 +14979,11 @@ impl CanonicalSnapshotSource {
         }
         let reported_path = self.reported_path;
         let actual_path = self.actual_path;
-        Self::live_snapshot(reported_path, &actual_path, context)
+        // Async CLI readers need the complete canonical schema (including
+        // search-only columns such as `messages.topic`). The share snapshot
+        // intentionally projects a narrower, scrubbed export schema, so it
+        // must not double as the private query snapshot.
+        Self::live_full_sqlite_snapshot(reported_path, &actual_path, context)
     }
 }
 
@@ -14922,7 +15347,8 @@ fn open_db_async_canonical_read_with_database_url(
     pool_cfg.database_url = format!("sqlite:///{}", source.actual_path().display());
     pool_cfg.storage_root = Some(storage_root);
     let pool = mcp_agent_mail_db::create_pool(&pool_cfg)
-        .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?;
+        .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?
+        .with_ephemeral_search_index();
     Ok(CanonicalReadPool {
         pool,
         _source: source,
@@ -14946,7 +15372,8 @@ fn open_db_sync_async_canonical_read_with_database_url(
     pool_cfg.database_url = format!("sqlite:///{}", source.actual_path().display());
     pool_cfg.storage_root = Some(storage_root);
     let pool = mcp_agent_mail_db::create_pool(&pool_cfg)
-        .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?;
+        .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?
+        .with_ephemeral_search_index();
     Ok(CanonicalReadDbPool {
         conn,
         pool,
@@ -14978,7 +15405,8 @@ fn open_db_sync_async_canonical_read_best_effort_with_database_url(
     pool_cfg.run_migrations = false;
     pool_cfg.warmup_connections = 0;
     let pool = mcp_agent_mail_db::create_pool_without_startup_init(&pool_cfg)
-        .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?;
+        .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?
+        .with_ephemeral_search_index();
     Ok(CanonicalReadDbPool {
         conn,
         pool,
@@ -15027,7 +15455,8 @@ fn open_atc_simulate_read_pool_with_database_url(
     pool_cfg.run_migrations = false;
     pool_cfg.warmup_connections = 0;
     let pool = mcp_agent_mail_db::create_pool_without_startup_init(&pool_cfg)
-        .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?;
+        .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?
+        .with_ephemeral_search_index();
     Ok(CanonicalReadDbPool {
         conn,
         pool,
@@ -35228,6 +35657,7 @@ async fn send_mail_envelope_via_server_or_local(
             &envelope.importance,
             envelope.ack_required,
             envelope.thread_id.as_deref(),
+            envelope.topic.as_deref(),
             sender_token,
         ),
     )
@@ -35271,6 +35701,7 @@ async fn send_mail_envelope_via_server_or_local(
         &envelope.importance,
         envelope.ack_required,
         envelope.thread_id.as_deref(),
+        envelope.topic.as_deref(),
         sender_token,
     ));
     let payload = match asupersync::time::timeout(
@@ -35351,6 +35782,27 @@ fn resolve_unconsumed_pending_send_path(base_path: &Path) -> CliResult<PathBuf> 
     )))
 }
 
+/// Extract a legacy tool-error envelope (`{"error": {"type": ..., "message":
+/// ...}}`) embedded in a failure string, returning `(type, message)`.
+///
+/// Daemon-proxied tool rejections carry the whole envelope as JSON text,
+/// including a `data` payload full of recipient suggestions, agent names, and
+/// task descriptions. Substring heuristics must never run over that payload: a
+/// suggested recipient like `TealWalrus` next to the word `Invalid` satisfies
+/// the WAL-sidecar-corruption pattern (GH#285).
+fn extract_embedded_tool_error(message: &str) -> Option<(String, String)> {
+    let start = message.find('{')?;
+    let value: serde_json::Value = serde_json::from_str(message[start..].trim()).ok()?;
+    let error = value.get("error")?;
+    let error_type = error.get("type")?.as_str()?.to_string();
+    let error_message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Some((error_type, error_message))
+}
+
 fn pending_send_failure_from_error(error: &CliError) -> Option<PendingSendFailure> {
     match error {
         CliError::InvalidArgument(_) | CliError::Usage(_) | CliError::ExitCode(_) => return None,
@@ -35373,16 +35825,32 @@ fn pending_send_failure_from_error(error: &CliError) -> Option<PendingSendFailur
         return None;
     }
 
-    let classification = mcp_agent_mail_db::classify_db_error_message(&message);
+    // GH#285: a definitive server-side refusal (INVALID_ARGUMENT and friends)
+    // is not an outage. Replaying it can only fail the same way, so it must
+    // never become a durable UNSENT artifact — and it must never be classified
+    // as a database emergency. When an envelope is present, classify on the
+    // tool's own message text, not the raw JSON blob.
+    let embedded = extract_embedded_tool_error(&message);
+    if let Some((error_type, _)) = &embedded
+        && mcp_agent_mail_tools::tool_error_is_client_refusal(error_type)
+    {
+        return None;
+    }
+    let classify_target = embedded
+        .as_ref()
+        .map_or(message.as_str(), |(_, tool_message)| tool_message.as_str());
+    let target_lower = classify_target.to_ascii_lowercase();
+
+    let classification = mcp_agent_mail_db::classify_db_error_message(classify_target);
     let queueable = match classification.class {
         mcp_agent_mail_db::DbErrorClass::ConnectionOrConfigError => {
-            lower.contains("database")
-                || lower.contains("sqlite")
-                || lower.contains("mailbox")
-                || lower.contains("storage")
-                || lower.contains("wal")
-                || lower.contains("shm")
-                || lower.contains("disk")
+            target_lower.contains("database")
+                || target_lower.contains("sqlite")
+                || target_lower.contains("mailbox")
+                || target_lower.contains("storage")
+                || target_lower.contains("wal")
+                || target_lower.contains("shm")
+                || target_lower.contains("disk")
         }
         mcp_agent_mail_db::DbErrorClass::EngineProbeLimitation => false,
         _ => true,
@@ -35683,6 +36151,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             importance,
             ack_required,
             thread_id,
+            topic,
             sender_token,
             sender_token_file,
             format,
@@ -35715,6 +36184,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 importance,
                 ack_required,
                 thread_id,
+                topic,
             };
             let data = send_mail_envelope_via_server_or_local(
                 &server_config,
@@ -36497,6 +36967,7 @@ fn build_server_send_message_arguments(
     importance: &str,
     ack_required: bool,
     thread_id: Option<&str>,
+    topic: Option<&str>,
     sender_token: Option<&str>,
 ) -> serde_json::Value {
     let mut arguments = serde_json::Map::from_iter([
@@ -36513,6 +36984,9 @@ fn build_server_send_message_arguments(
     }
     if let Some(thread_id) = thread_id {
         arguments.insert("thread_id".to_string(), serde_json::json!(thread_id));
+    }
+    if let Some(topic) = topic {
+        arguments.insert("topic".to_string(), serde_json::json!(topic));
     }
     if let Some(sender_token) = sender_token.filter(|t| !t.is_empty()) {
         arguments.insert("sender_token".to_string(), serde_json::json!(sender_token));
@@ -37165,21 +37639,26 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             let cx = asupersync::Cx::for_request();
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
 
-            let agents =
-                match mcp_agent_mail_db::queries::list_agents(&cx, &ctx.pool, proj.id.unwrap_or(0))
-                    .await
-                {
-                    asupersync::Outcome::Ok(rows) => rows,
-                    asupersync::Outcome::Err(e) => {
-                        return Err(CliError::Other(format!("list_agents failed: {e}")));
-                    }
-                    asupersync::Outcome::Cancelled(_) => {
-                        return Err(CliError::Other("request cancelled".into()));
-                    }
-                    asupersync::Outcome::Panicked(p) => {
-                        return Err(CliError::Other(format!("internal panic: {}", p.message())));
-                    }
-                };
+            let agents = match mcp_agent_mail_db::queries::list_active_agents_bounded(
+                &cx,
+                &ctx.pool,
+                proj.id.unwrap_or(0),
+                None,
+                None,
+            )
+            .await
+            {
+                asupersync::Outcome::Ok(rows) => rows,
+                asupersync::Outcome::Err(e) => {
+                    return Err(CliError::Other(format!("list_agents failed: {e}")));
+                }
+                asupersync::Outcome::Cancelled(_) => {
+                    return Err(CliError::Other("request cancelled".into()));
+                }
+                asupersync::Outcome::Panicked(p) => {
+                    return Err(CliError::Other(format!("internal panic: {}", p.message())));
+                }
+            };
 
             let data: Vec<serde_json::Value> = agents.iter().map(agent_row_to_json).collect();
             render_agent_list_payload(&serde_json::Value::Array(data), fmt);
@@ -37397,7 +37876,206 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
                 Err(e) => Err(CliError::Other(format!("agent detection failed: {e}"))),
             }
         }
+
+        AgentsCommand::Reap {
+            stale_days,
+            project_key,
+            dry_run,
+            format,
+            json,
+        } => handle_agents_reap(stale_days, project_key.as_deref(), dry_run, format, json).await,
     }
+}
+
+/// `am agents reap --stale-days N` (GH#275): soft-retire long-idle agent
+/// registrations from an operator/cron path, with no live agent identity or
+/// registration token required.
+///
+/// Selection matches the issue's contract exactly: `last_active_ts < cutoff
+/// AND retired_at IS NULL AND reaper_exempt = 0`. The mutation is the same
+/// soft retire the `retire_agent` MCP tool performs
+/// (`queries::set_agent_retired_at(.., Some(now))`), so `unretire_agent`
+/// remains a path back and re-running the sweep is a no-op for already
+/// retired rows. This deliberately skips the server-tool path: the whole
+/// point is retiring agents from projects whose sessions are all dead.
+async fn handle_agents_reap(
+    stale_days: u32,
+    project_key: Option<&str>,
+    dry_run: bool,
+    format: Option<output::CliOutputFormat>,
+    json: bool,
+) -> CliResult<()> {
+    let fmt = output::CliOutputFormat::resolve(format, json);
+    let ctx = context::AsyncCliContext::open()?;
+    let cx = asupersync::Cx::for_request();
+    let payload = agents_reap_payload(&cx, &ctx.pool, stale_days, project_key, dry_run).await?;
+    render_agents_reap_payload(&payload, fmt, dry_run, stale_days);
+    Ok(())
+}
+
+/// Core of `am agents reap`: select and (unless `dry_run`) soft-retire stale
+/// agents, returning the JSON payload. Split from the rendering wrapper so
+/// tests can drive it against a seeded pool.
+async fn agents_reap_payload(
+    cx: &asupersync::Cx,
+    pool: &mcp_agent_mail_db::DbPool,
+    stale_days: u32,
+    project_key: Option<&str>,
+    dry_run: bool,
+) -> CliResult<serde_json::Value> {
+    if stale_days == 0 {
+        return Err(CliError::InvalidArgument(
+            "--stale-days must be at least 1".to_string(),
+        ));
+    }
+
+    let now_us = mcp_agent_mail_db::now_micros();
+    let cutoff_us =
+        now_us.saturating_sub(i64::from(stale_days).saturating_mul(24 * 60 * 60 * 1_000_000));
+
+    // Resolve the optional project scope WITHOUT auto-creating rows (an
+    // administrative sweep must never mint a project from a typo'd key).
+    let projects: Vec<mcp_agent_mail_db::ProjectRow> = if let Some(key) = project_key {
+        let by_slug = match mcp_agent_mail_db::queries::get_project_by_slug(cx, pool, key).await {
+            asupersync::Outcome::Ok(row) => Some(row),
+            asupersync::Outcome::Err(mcp_agent_mail_db::DbError::NotFound { .. }) => None,
+            other => Some(outcome_to_result(other)?),
+        };
+        let project = match by_slug {
+            Some(row) => row,
+            None => match mcp_agent_mail_db::queries::get_project_by_human_key(cx, pool, key).await
+            {
+                asupersync::Outcome::Ok(row) => row,
+                asupersync::Outcome::Err(mcp_agent_mail_db::DbError::NotFound { .. }) => {
+                    return Err(CliError::InvalidArgument(format!(
+                        "project not found: {key}"
+                    )));
+                }
+                other => outcome_to_result(other)?,
+            },
+        };
+        vec![project]
+    } else {
+        outcome_to_result(mcp_agent_mail_db::queries::list_projects(cx, pool).await)?
+    };
+
+    #[derive(serde::Serialize)]
+    struct ReapCandidate {
+        agent_id: i64,
+        agent_name: String,
+        project_slug: String,
+        last_active_ts: String,
+        idle_days: i64,
+        program: String,
+        model: String,
+    }
+
+    let mut candidates: Vec<ReapCandidate> = Vec::new();
+    let mut candidate_ids: Vec<i64> = Vec::new();
+    for project in &projects {
+        let project_id = project.id.unwrap_or(0);
+        let agents =
+            outcome_to_result(mcp_agent_mail_db::queries::list_agents(cx, pool, project_id).await)?;
+        for agent in agents {
+            let stale = agent.last_active_ts < cutoff_us;
+            let eligible = stale && agent.retired_at.is_none() && agent.reaper_exempt == 0;
+            if !eligible {
+                continue;
+            }
+            let Some(agent_id) = agent.id else { continue };
+            candidate_ids.push(agent_id);
+            candidates.push(ReapCandidate {
+                agent_id,
+                agent_name: agent.name,
+                project_slug: project.slug.clone(),
+                last_active_ts: mcp_agent_mail_db::micros_to_iso(agent.last_active_ts),
+                idle_days: (now_us.saturating_sub(agent.last_active_ts)) / 86_400_000_000,
+                program: agent.program,
+                model: agent.model,
+            });
+        }
+    }
+
+    let mut reaped = 0usize;
+    if !dry_run {
+        for agent_id in &candidate_ids {
+            outcome_to_result(
+                mcp_agent_mail_db::queries::set_agent_retired_at(cx, pool, *agent_id, Some(now_us))
+                    .await,
+            )?;
+            reaped += 1;
+        }
+    }
+
+    Ok(serde_json::json!({
+        "mode": "agents_reap",
+        "dry_run": dry_run,
+        "stale_days": stale_days,
+        "cutoff": mcp_agent_mail_db::micros_to_iso(cutoff_us),
+        "project": project_key,
+        "candidate_count": candidates.len(),
+        "reaped_count": reaped,
+        "candidates": candidates,
+    }))
+}
+
+fn render_agents_reap_payload(
+    payload: &serde_json::Value,
+    fmt: output::CliOutputFormat,
+    dry_run: bool,
+    stale_days: u32,
+) {
+    let candidates = payload
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let reaped = payload
+        .get("reaped_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    output::emit_output(payload, fmt, || {
+        if candidates.is_empty() {
+            output::success(&format!(
+                "No agents idle for more than {stale_days} day(s); nothing to reap."
+            ));
+            return;
+        }
+        let mut table = output::CliTable::new(vec![
+            "AGENT",
+            "PROJECT",
+            "PROGRAM",
+            "IDLE_DAYS",
+            "LAST_ACTIVE",
+        ]);
+        let field = |candidate: &serde_json::Value, key: &str| {
+            candidate
+                .get(key)
+                .map(|value| match value {
+                    serde_json::Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                })
+                .unwrap_or_default()
+        };
+        for candidate in &candidates {
+            table.add_row(vec![
+                field(candidate, "agent_name"),
+                field(candidate, "project_slug"),
+                field(candidate, "program"),
+                field(candidate, "idle_days"),
+                field(candidate, "last_active_ts"),
+            ]);
+        }
+        table.render();
+        if dry_run {
+            output::success(&format!(
+                "Dry run: {} candidate(s); no agents were retired.",
+                candidates.len()
+            ));
+        } else {
+            output::success(&format!("Soft-retired {reaped} agent(s)."));
+        }
+    });
 }
 
 /// Resolve a project key to a `ProjectRow` via the async DB layer.
@@ -37471,6 +38149,7 @@ fn agent_row_to_json(a: &mcp_agent_mail_db::AgentRow) -> serde_json::Value {
         "project_id": a.project_id,
         "attachments_policy": a.attachments_policy,
         "contact_policy": a.contact_policy,
+        "retired_at": a.retired_at.map(mcp_agent_mail_db::micros_to_iso),
     })
 }
 
@@ -38357,6 +39036,7 @@ fn message_row_to_json(m: &mcp_agent_mail_db::MessageRow, sender_name: &str) -> 
         "importance": m.importance,
         "ack_required": m.ack_required != 0,
         "thread_id": m.thread_id,
+        "topic": m.topic,
         "created_ts": mcp_agent_mail_db::micros_to_iso(m.created_ts),
         "from": sender_name,
     })
@@ -38556,11 +39236,13 @@ mod mail_server_cli_bridge_tests {
             true,
             None,
             None,
+            None,
         );
 
         let object = args.as_object().expect("object arguments");
         assert!(!object.contains_key("cc"));
         assert!(!object.contains_key("thread_id"));
+        assert!(!object.contains_key("topic"));
         assert!(!object.contains_key("sender_token"));
     }
 
@@ -38576,6 +39258,7 @@ mod mail_server_cli_bridge_tests {
             None,
             "high",
             true,
+            None,
             None,
             Some("secret-tok"),
         );
@@ -38596,6 +39279,7 @@ mod mail_server_cli_bridge_tests {
             None,
             "high",
             true,
+            None,
             None,
             Some(""),
         );
@@ -38625,6 +39309,7 @@ mod mail_server_cli_bridge_tests {
             importance: "normal".to_string(),
             ack_required: false,
             thread_id: Some("br-test".to_string()),
+            topic: Some("br-test.1".to_string()),
         }
     }
 
@@ -38695,6 +39380,58 @@ mod mail_server_cli_bridge_tests {
                 .expect("database lock should queue");
         assert_eq!(failure.class, "busy_retryable");
         assert!(failure.safe_to_retry);
+    }
+
+    #[test]
+    fn queued_send_failure_filter_skips_server_client_refusal_envelopes() {
+        // GH#285: a daemon-proxied INVALID_ARGUMENT rejection arrives as the
+        // full legacy envelope text. Its `data` payload can contain agent
+        // names / task descriptions with substrings ("TealWalrus", "wal
+        // sidecar work") that satisfy the corruption heuristics. It must not
+        // queue, and it must not classify as wal_sidecar_corruption.
+        let envelope = serde_json::json!({
+            "error": {
+                "type": "INVALID_ARGUMENT",
+                "message": "Invalid agent name 'IksqPinProbeUnknownTo'. Must be adjective+noun format",
+                "recoverable": false,
+                "data": {
+                    "suggestions": {"IksqPinProbeUnknownTo": ["TealWalrus"]},
+                    "suggested_tool_calls": [{
+                        "tool": "register_agent",
+                        "arguments": {"task_description": "fix wal sidecar replay"}
+                    }]
+                }
+            }
+        });
+        let error = CliError::Other(format!("send_message via server failed: {envelope}"));
+        assert!(pending_send_failure_from_error(&error).is_none());
+
+        // Same shape for the not-found family.
+        let not_found = serde_json::json!({
+            "error": {
+                "type": "AGENT_NOT_FOUND",
+                "message": "Agent 'GreenWall' not registered",
+                "recoverable": true,
+                "data": {}
+            }
+        });
+        let error = CliError::Other(format!("send_message via server failed: {not_found}"));
+        assert!(pending_send_failure_from_error(&error).is_none());
+
+        // A genuine server-fault envelope still queues, classified on the
+        // tool's own message text.
+        let busy = serde_json::json!({
+            "error": {
+                "type": "RESOURCE_BUSY",
+                "message": "database is locked",
+                "recoverable": true,
+                "data": {}
+            }
+        });
+        let error = CliError::Other(format!("send_message via server failed: {busy}"));
+        let failure = pending_send_failure_from_error(&error)
+            .expect("server-fault envelope should still queue");
+        assert_eq!(failure.class, "busy_retryable");
     }
 
     #[test]
@@ -38931,6 +39668,7 @@ mod mail_server_cli_bridge_tests {
             "normal",
             false,
             Some("br-123"),
+            Some("br-123.1"),
             None,
         );
 
@@ -38942,6 +39680,10 @@ mod mail_server_cli_bridge_tests {
         assert_eq!(
             object.get("thread_id").and_then(serde_json::Value::as_str),
             Some("br-123")
+        );
+        assert_eq!(
+            object.get("topic").and_then(serde_json::Value::as_str),
+            Some("br-123.1")
         );
     }
 
@@ -43268,6 +44010,10 @@ http_headers = { Authorization = "Bearer secret" }
         // GH#207: check-inbox is a non-consuming peek — it must always ask
         // the daemon's fetch_inbox NOT to mark the returned messages read.
         assert_eq!(payload["params"]["arguments"]["mark_read"], false);
+        // GH#269: check-inbox reports unread_count as the number of returned
+        // rows, so the daemon must be asked for unread rows only — otherwise
+        // read messages inflate the count relative to the direct-SQLite path.
+        assert_eq!(payload["params"]["arguments"]["unread_only"], true);
     }
 
     #[test]
@@ -43496,6 +44242,506 @@ http_headers = { Authorization = "Bearer secret" }
         assert_eq!(result.urgent_or_high_count, 1);
         assert_eq!(result.messages[0].subject, "hello");
         assert_eq!(result.messages[0].from, "Sender");
+    }
+
+    /// GH#269: the daemon (JSON-RPC) and direct-SQLite check-inbox paths must
+    /// agree on `unread_count` when the inbox holds a mix of read and unread
+    /// messages. The daemon path counts whatever rows `fetch_inbox` returns,
+    /// so the request built by `build_fetch_inbox_jsonrpc_request` must carry
+    /// `unread_only: true`; this test drives the daemon-side inbox query with
+    /// the filter flags actually present in that request payload (applying
+    /// the server's defaults for absent flags), so dropping the flag from the
+    /// builder makes the counts diverge and the test fail.
+    #[test]
+    fn check_inbox_daemon_and_direct_paths_agree_on_unread_count() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("check-inbox-agreement.sqlite3");
+        let db_path_str = db_path.to_string_lossy().into_owned();
+        let __storage_root_str = dir.path().display().to_string();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("STORAGE_ROOT", &__storage_root_str)],
+            || {
+                let seed_conn =
+                    mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open db");
+                for stmt in [
+                    "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL)",
+                    "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL)",
+                    "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, thread_id TEXT, subject TEXT NOT NULL, body_md TEXT NOT NULL, importance TEXT NOT NULL, ack_required INTEGER NOT NULL, created_ts INTEGER NOT NULL, topic TEXT, recipients_json TEXT NOT NULL DEFAULT '{}', attachments TEXT NOT NULL DEFAULT '[]')",
+                    "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL, read_ts DATETIME, ack_ts DATETIME, PRIMARY KEY (message_id, agent_id, kind))",
+                    "INSERT INTO projects (id, slug, human_key) VALUES (1, 'p', '/tmp/p')",
+                    "INSERT INTO agents (id, project_id, name) VALUES (1, 1, 'Sender')",
+                    "INSERT INTO agents (id, project_id, name) VALUES (2, 1, 'Receiver')",
+                    r#"INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) VALUES (1, 1, 1, 'br-1', 'unread message', 'body', 'normal', 0, 1743426000000000, '{"to":["Receiver"]}', '[]')"#,
+                    r#"INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) VALUES (2, 1, 1, 'br-2', 'already read', 'body', 'normal', 0, 1743426001000000, '{"to":["Receiver"]}', '[]')"#,
+                    "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES (1, 2, 'to', NULL, NULL)",
+                    "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES (2, 2, 'to', 1743426002000000, NULL)",
+                ] {
+                    seed_conn.execute_raw(stmt).expect("seed inbox statement");
+                }
+            },
+        );
+
+        // Direct-SQLite path (HOME/XDG isolated so no real archive mailbox
+        // can shadow the seeded live database).
+        let fake_home = dir.path().join("home");
+        let fake_data_home = dir.path().join("xdg-data");
+        std::fs::create_dir_all(&fake_home).expect("create fake home");
+        std::fs::create_dir_all(&fake_data_home).expect("create fake xdg data");
+        let fake_home_text = fake_home.to_string_lossy().into_owned();
+        let fake_data_home_text = fake_data_home.to_string_lossy().into_owned();
+        let database_url = format!("sqlite:///{}", db_path_str.trim_start_matches('/'));
+        let direct = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("HOME", fake_home_text.as_str()),
+                ("XDG_DATA_HOME", fake_data_home_text.as_str()),
+            ],
+            || {
+                check_inbox_direct(&CheckInboxDirectConfig {
+                    project_key: "/tmp/p".to_string(),
+                    agent_name: "Receiver".to_string(),
+                    limit: 10,
+                })
+            },
+        )
+        .expect("direct check-inbox");
+        assert_eq!(direct.unread_count, 1, "direct path counts unread rows");
+
+        // Daemon path: run the same inbox query the daemon's fetch_inbox
+        // runs, honoring exactly the filter flags present in the JSON-RPC
+        // request (absent flags fall back to fetch_inbox's defaults).
+        let cfg = CheckInboxRpcConfig {
+            server_url: "http://127.0.0.1:8765/api/".to_string(),
+            server_urls: vec!["http://127.0.0.1:8765/api/".to_string()],
+            bearer_token: None,
+            project_key: "/tmp/p".to_string(),
+            agent_name: "Receiver".to_string(),
+            limit: 10,
+            include_bodies: false,
+            timeout_seconds: 3,
+        };
+        let request = build_fetch_inbox_jsonrpc_request(&cfg);
+        let args = &request["params"]["arguments"];
+        let urgent_only = args["urgent_only"].as_bool().unwrap_or(false);
+        let unread_only = args["unread_only"].as_bool().unwrap_or(false);
+        let ack_required_only = args["ack_overdue_only"].as_bool().unwrap_or(false);
+        let conn = mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("reopen db");
+        let daemon_rows = mcp_agent_mail_db::sync::fetch_inbox_metadata_rows_from_conn(
+            &conn,
+            1,
+            2,
+            urgent_only,
+            unread_only,
+            ack_required_only,
+            None,
+            10,
+        )
+        .expect("daemon-side inbox query");
+
+        assert_eq!(
+            daemon_rows.len(),
+            direct.unread_count,
+            "daemon and direct check-inbox paths must agree on unread_count"
+        );
+        assert_eq!(daemon_rows[0].message.subject, "unread message");
+    }
+
+    #[test]
+    fn clap_parses_mark_all_read_defaults_and_flags() {
+        let cli = Cli::try_parse_from(["am", "mark-all-read", "--agent", "BlueLake"])
+            .expect("parse mark-all-read defaults");
+        match cli.command.expect("expected command") {
+            Commands::MarkAllRead {
+                agent,
+                project,
+                older_than_days,
+                limit,
+                direct,
+                json,
+                host,
+                port,
+                ..
+            } => {
+                assert_eq!(agent.as_deref(), Some("BlueLake"));
+                assert!(project.is_none());
+                assert!(older_than_days.is_none());
+                assert_eq!(limit, 500);
+                assert!(!direct);
+                assert!(!json);
+                assert_eq!(host, "127.0.0.1");
+                assert_eq!(port, 8765);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "am",
+            "mark-all-read",
+            "--agent",
+            "BlueLake",
+            "--project",
+            "/tmp/proj",
+            "--older-than-days",
+            "7",
+            "--limit",
+            "50",
+            "--direct",
+            "--json",
+        ])
+        .expect("parse mark-all-read with flags");
+        match cli.command.expect("expected command") {
+            Commands::MarkAllRead {
+                project,
+                older_than_days,
+                limit,
+                direct,
+                json,
+                ..
+            } => {
+                assert_eq!(project.as_deref(), Some("/tmp/proj"));
+                assert_eq!(older_than_days, Some(7));
+                assert_eq!(limit, 50);
+                assert!(direct);
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    /// GH#273: mark-all-read is a mailbox WRITE and must stay write-classified
+    /// so the mailbox-ownership guard fires (#126).
+    #[test]
+    fn mark_all_read_is_write_classified() {
+        let cli = Cli::try_parse_from(["am", "mark-all-read", "--agent", "BlueLake"])
+            .expect("parse mark-all-read");
+        let command = cli.command.expect("expected command");
+        assert!(
+            !command_is_read_only(&command),
+            "mark-all-read mutates read state and must not bypass the ownership guard"
+        );
+    }
+
+    /// GH#273: the JSON-RPC request the CLI sends to the daemon must name the
+    /// mark_all_read tool and carry the exact filter arguments — a dropped
+    /// filter would make the daemon path mark different rows than the direct
+    /// path (the GH#269 failure mode for check-inbox).
+    #[test]
+    fn mark_all_read_request_carries_tool_name_and_filters() {
+        let cfg = CheckInboxRpcConfig {
+            server_url: "http://127.0.0.1:8765/api/".to_string(),
+            server_urls: vec!["http://127.0.0.1:8765/api/".to_string()],
+            bearer_token: None,
+            project_key: "/tmp/p".to_string(),
+            agent_name: "Receiver".to_string(),
+            limit: 10,
+            include_bodies: false,
+            timeout_seconds: 3,
+        };
+        let request = build_mark_all_read_jsonrpc_request(&cfg, Some(30), 250);
+        assert_eq!(request["method"], "tools/call");
+        assert_eq!(request["params"]["name"], "mark_all_read");
+        let args = &request["params"]["arguments"];
+        assert_eq!(args["project_key"], "/tmp/p");
+        assert_eq!(args["agent_name"], "Receiver");
+        assert_eq!(args["limit"], 250);
+        assert_eq!(args["older_than_days"], 30);
+
+        let request = build_mark_all_read_jsonrpc_request(&cfg, None, 500);
+        assert!(
+            request["params"]["arguments"]
+                .get("older_than_days")
+                .is_none(),
+            "absent filter must be omitted so the tool default (no age filter) applies"
+        );
+    }
+
+    /// GH#273 agreement test (the GH#269 lesson applied to the new verb): the
+    /// daemon path and the direct-SQLite path must mark the same rows. Two
+    /// projects are seeded with identical inboxes; the direct path runs
+    /// `mark_all_read_direct_with_pool` against one, while the daemon side is
+    /// emulated by applying exactly the arguments present in the built
+    /// JSON-RPC request (with the tool's clamping rules) to the other. Both
+    /// must mark the same count and leave the same messages unread.
+    #[test]
+    fn mark_all_read_daemon_and_direct_paths_agree() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("mark-all-read-agreement.sqlite3");
+        let pool_cfg = mcp_agent_mail_db::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: true,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = mcp_agent_mail_db::create_pool(&pool_cfg).expect("create pool");
+        let cx = asupersync::Cx::for_testing();
+
+        rt.block_on(async {
+            let mut project_ids = Vec::new();
+            let mut recipient_ids = Vec::new();
+            for suffix in ["direct", "daemon"] {
+                let human_key = format!("/tmp/mark-all-read-agreement-{suffix}");
+                let project =
+                    mcp_agent_mail_db::queries::ensure_project(&cx, &pool, &human_key)
+                        .await
+                        .into_result()
+                        .expect("ensure project");
+                let project_id = project.id.expect("project id");
+                let sender = mcp_agent_mail_db::queries::register_agent(
+                    &cx, &pool, project_id, "BlueLake", "codex-cli", "gpt-5", None, None, None,
+                )
+                .await
+                .into_result()
+                .expect("register sender");
+                let recipient = mcp_agent_mail_db::queries::register_agent(
+                    &cx, &pool, project_id, "GreenStone", "codex-cli", "gpt-5", None, None, None,
+                )
+                .await
+                .into_result()
+                .expect("register recipient");
+                project_ids.push(project_id);
+                recipient_ids.push(recipient.id.expect("recipient id"));
+
+                let day_us: i64 = 86_400 * 1_000_000;
+                let now = mcp_agent_mail_db::now_micros();
+                let old_ts = now - 35 * day_us;
+                let seed_conn =
+                    mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+                        .expect("open seed conn");
+                // Two aged messages (eligible under older_than_days=30) and
+                // one fresh message (must stay unread on both paths).
+                let base = project_id * 1000;
+                for (offset, created_ts, subject) in [
+                    (1, old_ts, "aged-one"),
+                    (2, old_ts + 1, "aged-two"),
+                    (3, now, "fresh"),
+                ] {
+                    let message_id = base + offset;
+                    seed_conn
+                        .execute_raw(&format!(
+                            "INSERT INTO messages \
+                             (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
+                             VALUES ({message_id}, {project_id}, {}, 'agree', '{subject}', 'b', 'normal', 0, {created_ts}, '[]')",
+                            sender.id.expect("sender id"),
+                        ))
+                        .expect("insert message");
+                    seed_conn
+                        .execute_raw(&format!(
+                            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) \
+                             VALUES ({message_id}, {}, 'to', NULL, NULL)",
+                            recipient_ids.last().copied().expect("recipient id"),
+                        ))
+                        .expect("insert recipient");
+                }
+                drop(seed_conn);
+            }
+
+            // Direct path against project 0.
+            let direct_payload = mark_all_read_direct_with_pool(
+                &cx,
+                &pool,
+                "/tmp/mark-all-read-agreement-direct",
+                "GreenStone",
+                Some(30),
+                500,
+            )
+            .await
+            .expect("direct mark-all-read");
+            assert_eq!(direct_payload["marked_count"], 2);
+            assert_eq!(direct_payload["more"], false);
+
+            // Daemon side: apply exactly the arguments carried by the built
+            // JSON-RPC request, interpreted with the tool's clamping rules.
+            let cfg = CheckInboxRpcConfig {
+                server_url: "http://127.0.0.1:8765/api/".to_string(),
+                server_urls: vec!["http://127.0.0.1:8765/api/".to_string()],
+                bearer_token: None,
+                project_key: "/tmp/mark-all-read-agreement-daemon".to_string(),
+                agent_name: "GreenStone".to_string(),
+                limit: 10,
+                include_bodies: false,
+                timeout_seconds: 3,
+            };
+            let request = build_mark_all_read_jsonrpc_request(&cfg, Some(30), 500);
+            let args = &request["params"]["arguments"];
+            let req_limit = usize::try_from(args["limit"].as_u64().unwrap_or(0)).unwrap_or(0);
+            let req_older_than_days = args.get("older_than_days").and_then(serde_json::Value::as_i64);
+            let effective_limit = req_limit.clamp(1, MARK_ALL_READ_CLI_MAX_LIMIT);
+            let older_than_us = req_older_than_days.map(|days| {
+                mcp_agent_mail_db::now_micros()
+                    .saturating_sub(days.saturating_mul(86_400).saturating_mul(1_000_000))
+            });
+            let daemon_outcome = mcp_agent_mail_db::queries::mark_messages_read_bulk(
+                &cx,
+                &pool,
+                project_ids[1],
+                recipient_ids[1],
+                older_than_us,
+                effective_limit,
+            )
+            .await
+            .into_result()
+            .expect("daemon-side bulk mark");
+
+            assert_eq!(
+                daemon_outcome.marked,
+                direct_payload["marked_count"].as_u64().unwrap(),
+                "daemon and direct mark-all-read paths must mark the same number of rows"
+            );
+            assert_eq!(daemon_outcome.more, direct_payload["more"].as_bool().unwrap());
+
+            // Both projects must be left with exactly the fresh message unread.
+            let check_conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+                .expect("open check conn");
+            for (project_id, recipient_id) in project_ids.iter().zip(recipient_ids.iter()) {
+                let rows = check_conn
+                    .query_sync(
+                        &format!(
+                            "SELECT m.subject AS subject FROM message_recipients r \
+                             JOIN messages m ON m.id = r.message_id \
+                             WHERE r.agent_id = {recipient_id} AND r.read_ts IS NULL \
+                             AND m.project_id = {project_id}"
+                        ),
+                        &[],
+                    )
+                    .expect("query unread leftovers");
+                let subjects: Vec<String> = rows
+                    .iter()
+                    .filter_map(|r| r.get_named::<String>("subject").ok())
+                    .collect();
+                assert_eq!(
+                    subjects,
+                    vec!["fresh".to_string()],
+                    "both paths must leave exactly the fresh message unread"
+                );
+            }
+        });
+    }
+
+    /// GH#275 acceptance check: `am agents reap --stale-days 30 --dry-run`
+    /// lists only agents idle > 30d without mutating anything;
+    /// `am agents reap --stale-days 30` retires exactly that set and a
+    /// re-run is a no-op. Agents active within the window, already retired,
+    /// or marked `reaper_exempt` must never be reaped.
+    #[test]
+    fn agents_reap_dry_run_then_retire_is_idempotent_and_respects_exemptions() {
+        use asupersync::runtime::RuntimeBuilder;
+        use mcp_agent_mail_db::sqlmodel_core::Value;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("agents-reap.sqlite3");
+        let db_path_str = db_path.display().to_string();
+        init_schema_sqlite_canonical(&db_path_str).expect("init canonical schema");
+
+        let now_us = mcp_agent_mail_db::now_micros();
+        let idle_40d = now_us - 40 * 86_400_000_000;
+        let idle_1d = now_us - 86_400_000_000;
+
+        let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(&db_path_str).expect("open db");
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'reap-proj', '/tmp/reap-proj', ?)",
+            &[Value::BigInt(now_us)],
+        )
+        .expect("seed project");
+        let agent_insert = "INSERT INTO agents (\
+                id, project_id, name, program, model, task_description, \
+                inception_ts, last_active_ts, attachments_policy, contact_policy, \
+                reaper_exempt, retired_at\
+            ) VALUES (?, 1, ?, 'test', 'test', '', ?, ?, 'auto', 'auto', ?, ?)";
+        for (id, name, last_active, exempt, retired_at) in [
+            (1i64, "StaleAgent", idle_40d, 0i64, Value::Null),
+            (2, "FreshAgent", idle_1d, 0, Value::Null),
+            (3, "ExemptStaleAgent", idle_40d, 1, Value::Null),
+            (4, "AlreadyRetired", idle_40d, 0, Value::BigInt(idle_1d)),
+        ] {
+            conn.execute_sync(
+                agent_insert,
+                &[
+                    Value::BigInt(id),
+                    Value::Text(name.to_string()),
+                    Value::BigInt(idle_40d),
+                    Value::BigInt(last_active),
+                    Value::BigInt(exempt),
+                    retired_at,
+                ],
+            )
+            .expect("seed agent");
+        }
+        drop(conn);
+
+        let cfg = mcp_agent_mail_db::DbPoolConfig {
+            database_url: format!("sqlite:///{db_path_str}"),
+            ..Default::default()
+        };
+        let pool = mcp_agent_mail_db::get_or_create_pool(&cfg).expect("pool");
+        let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        rt.block_on(async {
+            // Leg 1: dry run lists exactly the one eligible stale agent and
+            // mutates nothing.
+            let dry = agents_reap_payload(&cx, &pool, 30, None, true)
+                .await
+                .expect("dry run");
+            assert_eq!(dry["dry_run"], true);
+            assert_eq!(dry["candidate_count"], 1);
+            assert_eq!(dry["reaped_count"], 0);
+            assert_eq!(dry["candidates"][0]["agent_name"], "StaleAgent");
+            assert_eq!(dry["candidates"][0]["project_slug"], "reap-proj");
+
+            // Leg 2: the real run retires exactly that set.
+            let real = agents_reap_payload(&cx, &pool, 30, None, false)
+                .await
+                .expect("reap run");
+            assert_eq!(real["candidate_count"], 1);
+            assert_eq!(real["reaped_count"], 1);
+            assert_eq!(real["candidates"][0]["agent_name"], "StaleAgent");
+
+            // Leg 3: a re-run is a no-op.
+            let rerun = agents_reap_payload(&cx, &pool, 30, None, false)
+                .await
+                .expect("rerun");
+            assert_eq!(rerun["candidate_count"], 0);
+            assert_eq!(rerun["reaped_count"], 0);
+
+            // Project scoping resolves by slug; an unknown project errors
+            // instead of auto-creating a row.
+            let scoped = agents_reap_payload(&cx, &pool, 30, Some("reap-proj"), true)
+                .await
+                .expect("scoped dry run");
+            assert_eq!(scoped["candidate_count"], 0);
+            assert!(
+                agents_reap_payload(&cx, &pool, 30, Some("no-such-project"), true)
+                    .await
+                    .is_err(),
+                "unknown project must error, not be created"
+            );
+
+            // Verify final DB state: only StaleAgent gained retired_at.
+            let mut agents =
+                outcome_to_result(mcp_agent_mail_db::queries::list_agents(&cx, &pool, 1).await)
+                    .expect("list agents for verification");
+            agents.sort_by_key(|agent| agent.id);
+            let retired: Vec<(String, bool)> = agents
+                .into_iter()
+                .map(|agent| (agent.name, agent.retired_at.is_some()))
+                .collect();
+            assert_eq!(
+                retired,
+                vec![
+                    ("StaleAgent".to_string(), true),
+                    ("FreshAgent".to_string(), false),
+                    ("ExemptStaleAgent".to_string(), false),
+                    ("AlreadyRetired".to_string(), true),
+                ]
+            );
+        });
     }
 
     #[test]
@@ -51754,6 +53000,7 @@ http_headers = { Authorization = "Bearer secret" }
                         json,
                         allow_live_owner,
                         take_ownership,
+                        reseed_receipt_chain,
                     },
             } => {
                 assert!(!dry_run);
@@ -51766,6 +53013,10 @@ http_headers = { Authorization = "Bearer secret" }
                 assert!(
                     !take_ownership,
                     "--take-ownership must default off for reconstruct"
+                );
+                assert!(
+                    !reseed_receipt_chain,
+                    "--reseed-receipt-chain must default off for reconstruct"
                 );
             }
             _ => panic!("expected Doctor Reconstruct"),
@@ -51783,6 +53034,7 @@ http_headers = { Authorization = "Bearer secret" }
             "--json",
             "--allow-live-owner",
             "--take-ownership",
+            "--reseed-receipt-chain",
         ])
         .unwrap();
         match cli.command.unwrap() {
@@ -51794,6 +53046,7 @@ http_headers = { Authorization = "Bearer secret" }
                         json,
                         allow_live_owner,
                         take_ownership,
+                        reseed_receipt_chain,
                     },
             } => {
                 assert!(dry_run);
@@ -51801,6 +53054,7 @@ http_headers = { Authorization = "Bearer secret" }
                 assert!(json);
                 assert!(allow_live_owner);
                 assert!(take_ownership);
+                assert!(reseed_receipt_chain);
             }
             _ => panic!("expected Doctor Reconstruct"),
         }
@@ -59121,7 +60375,7 @@ startup_timeout_sec = 42
                 ("DATABASE_URL", database_url.as_str()),
                 ("STORAGE_ROOT", storage_root_text.as_str()),
             ],
-            || handle_doctor_reconstruct(true, true, false, true, false),
+            || handle_doctor_reconstruct(true, true, false, true, false, false),
         );
         let output = capture.drain_to_string();
 
@@ -60936,6 +62190,35 @@ startup_timeout_sec = 42
                 action: MailCommand::Status { project_path },
             } => assert_eq!(project_path, PathBuf::from("/tmp/proj")),
             other => panic!("expected Mail Status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_mail_send_topic() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "mail",
+            "send",
+            "--project",
+            "/tmp/proj",
+            "--from",
+            "BlueLake",
+            "--to",
+            "RedFox",
+            "--subject",
+            "Release",
+            "--body",
+            "Ready",
+            "--topic",
+            "release.v31",
+        ])
+        .expect("mail send should accept --topic");
+
+        match cli.command.expect("expected command") {
+            Commands::Mail {
+                action: MailCommand::Send { topic, .. },
+            } => assert_eq!(topic.as_deref(), Some("release.v31")),
+            other => panic!("expected Mail Send, got {other:?}"),
         }
     }
 
@@ -69855,6 +71138,47 @@ startup_timeout_sec = 42
 
     #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
     #[test]
+    fn gh297_async_read_pool_snapshot_preserves_message_topic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("gh297-topic-source.sqlite3");
+        let writer = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open GH#297 source");
+        writer
+            .execute_raw(
+                "CREATE TABLE messages (\
+                    id INTEGER PRIMARY KEY, \
+                    topic TEXT COLLATE NOCASE\
+                ); \
+                INSERT INTO messages (id, topic) VALUES (1, 'search-snapshot');",
+            )
+            .expect("seed GH#297 topic");
+        drop(writer);
+
+        let snapshot = CanonicalSnapshotSource::live(db_path.clone())
+            .materialize_for_async_read_pool("GH#297 robot search")
+            .expect("materialize full async-read snapshot");
+        assert_eq!(snapshot.reported_path(), db_path);
+        assert_ne!(snapshot.actual_path(), snapshot.reported_path());
+        assert_eq!(snapshot.kind, CanonicalSnapshotSourceKind::LiveSnapshot);
+
+        let snapshot_conn = mcp_agent_mail_db::CanonicalDbConn::open_file(
+            snapshot.actual_path().display().to_string(),
+        )
+        .expect("open GH#297 snapshot");
+        let row = snapshot_conn
+            .query_sync("SELECT topic FROM messages WHERE id = 1", &[])
+            .expect("query topic from async-read snapshot")
+            .into_iter()
+            .next()
+            .expect("topic row");
+        assert_eq!(
+            row.get_named::<String>("topic").expect("topic column"),
+            "search-snapshot"
+        );
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), any(unix, windows)))]
+    #[test]
     fn guarded_live_vacuum_snapshot_preserves_source_family_and_reads_wal_rows() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("guarded-vacuum-source.sqlite3");
@@ -77850,7 +79174,16 @@ fn handle_doctor_reconstruct(
     json: bool,
     allow_live_owner: bool,
     take_ownership: bool,
+    reseed_receipt_chain: bool,
 ) -> CliResult<()> {
+    if reseed_receipt_chain && !dry_run && !yes {
+        return Err(CliError::InvalidArgument(
+            "--reseed-receipt-chain discards the broken receipt chain's promotion lineage \
+             (the directory is renamed aside, never deleted); pass --yes to confirm, or \
+             --dry-run to preview the chain verdict"
+                .to_string(),
+        ));
+    }
     let config = Config::from_env();
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     // br-bvq1x.4.4 (D4): reconstruct replaces the live DB; refuse while a live
@@ -77864,7 +79197,14 @@ fn handle_doctor_reconstruct(
         allow_live_owner,
         take_ownership,
     )?;
-    handle_doctor_reconstruct_locked(&cfg.database_url, &config.storage_root, dry_run, yes, json)
+    handle_doctor_reconstruct_locked_full(
+        &cfg.database_url,
+        &config.storage_root,
+        dry_run,
+        yes,
+        json,
+        reseed_receipt_chain,
+    )
 }
 
 fn doctor_reconstruct_db_path_from_config(
@@ -77896,6 +79236,17 @@ fn handle_doctor_reconstruct_locked(
     yes: bool,
     json: bool,
 ) -> CliResult<()> {
+    handle_doctor_reconstruct_locked_full(database_url, storage_root, dry_run, yes, json, false)
+}
+
+fn handle_doctor_reconstruct_locked_full(
+    database_url: &str,
+    storage_root: &Path,
+    dry_run: bool,
+    yes: bool,
+    json: bool,
+    reseed_receipt_chain: bool,
+) -> CliResult<()> {
     let db_path = doctor_reconstruct_db_path_from_database_url(database_url)?;
     handle_doctor_reconstruct_locked_with_path(
         Some(&db_path),
@@ -77903,6 +79254,7 @@ fn handle_doctor_reconstruct_locked(
         dry_run,
         yes,
         json,
+        reseed_receipt_chain,
     )
 }
 
@@ -77912,6 +79264,7 @@ fn handle_doctor_reconstruct_locked_with_path(
     dry_run: bool,
     yes: bool,
     json: bool,
+    reseed_receipt_chain: bool,
 ) -> CliResult<()> {
     let config = Config::from_env();
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
@@ -77926,6 +79279,32 @@ fn handle_doctor_reconstruct_locked_with_path(
         acquire_doctor_mailbox_activity_lock_for_storage_root(&storage_root, dry_run)?;
     let _mailbox_sqlite_lock =
         acquire_doctor_mailbox_activity_lock_for_sqlite_path(&db_path, dry_run)?;
+    if reseed_receipt_chain {
+        if dry_run {
+            match mcp_agent_mail_db::forensics::broken_recovery_receipt_chain_error(
+                &storage_root,
+                &db_path,
+            ) {
+                Ok(chain_error) => output::info(&format!(
+                    "--reseed-receipt-chain would quarantine the receipt chain (broken: {chain_error})"
+                )),
+                Err(refusal) => {
+                    output::info(&format!("--reseed-receipt-chain would refuse: {refusal}"));
+                }
+            }
+        } else {
+            let outcome = mcp_agent_mail_db::forensics::quarantine_broken_recovery_receipt_chain(
+                &storage_root,
+                &db_path,
+            )
+            .map_err(|error| CliError::Other(format!("--reseed-receipt-chain refused: {error}")))?;
+            output::warn(&format!(
+                "Broken receipt chain quarantined at {} (was: {}); promotion will seed a fresh root",
+                outcome.quarantined_dir.display(),
+                outcome.chain_error
+            ));
+        }
+    }
     handle_doctor_reconstruct_with(Some(&db_path), Some(&storage_root), dry_run, yes, json)
 }
 
@@ -80417,6 +81796,10 @@ fn build_fetch_inbox_jsonrpc_request(config: &CheckInboxRpcConfig) -> serde_json
                 "agent_name": config.agent_name,
                 "limit": config.limit,
                 "include_bodies": config.include_bodies,
+                // check-inbox reports an unread count, so the daemon must
+                // return only unread rows — the direct-SQLite path filters
+                // `read_ts IS NULL` and both paths must agree (GH#269).
+                "unread_only": true,
                 // check-inbox is a monitoring peek for hooks and editors; it
                 // must never consume unread state (GH#207).
                 "mark_read": false,
@@ -82235,6 +83618,7 @@ async fn call_send_message_tool_locally(
     importance: &str,
     ack_required: bool,
     thread_id: Option<&str>,
+    topic: Option<&str>,
     sender_token: Option<&str>,
 ) -> CliResult<serde_json::Value> {
     let ctx = McpContext::new(asupersync::Cx::for_request(), 1);
@@ -82252,7 +83636,7 @@ async fn call_send_message_tool_locally(
         Some(importance.to_string()),
         Some(ack_required),
         thread_id.map(str::to_string),
-        None,
+        topic.map(str::to_string),
         None,
         None,
         sender_token.filter(|t| !t.is_empty()).map(str::to_string),

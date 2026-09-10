@@ -90,6 +90,7 @@ pub mod write_barrier;
 
 #[cfg(not(feature = "tantivy-engine"))]
 pub mod search_v3 {
+    use sqlmodel_core::Connection;
     use std::path::Path;
     use std::sync::Arc;
 
@@ -149,13 +150,45 @@ pub mod search_v3 {
         None
     }
 
+    pub(crate) fn bridge_matches_database(_path: &str, _generation: Option<&str>) -> bool {
+        false
+    }
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct MessageWatermark {
+        pub sequence: u64,
+        pub max_id: u64,
+        pub content_revision: Option<u64>,
+        pub rewrite_revision: Option<u64>,
+    }
+
+    pub fn fetch_db_message_watermark(conn: &crate::DbConn) -> Result<MessageWatermark, String> {
+        let rows = conn
+            .query_sync(
+                "SELECT revision, rewrite_revision FROM search_content_revision WHERE singleton = 0",
+                &[],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(MessageWatermark {
+            content_revision: rows
+                .first()
+                .and_then(|row| row.get_as::<i64>(0).ok())
+                .and_then(|revision| u64::try_from(revision).ok()),
+            rewrite_revision: rows
+                .first()
+                .and_then(|row| row.get_as::<i64>(1).ok())
+                .and_then(|revision| u64::try_from(revision).ok()),
+            ..Default::default()
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn reset_bridge_for_tests() {}
 
     /// Tantivy is disabled, so lexical indexing is skipped deterministically.
     /// The search cache must still be invalidated on ingestion (GH#227): the
     /// SQL search paths cache result sets in the same process-wide cache.
-    pub fn index_message(_msg: &IndexableMessage) -> Result<bool, String> {
+    pub(crate) fn index_message(_msg: &IndexableMessage) -> Result<bool, String> {
         crate::search_service::invalidate_search_cache(
             crate::search_cache::InvalidationTrigger::IndexUpdate,
         );
@@ -164,7 +197,8 @@ pub mod search_v3 {
 
     /// Tantivy is disabled, so batch lexical indexing is skipped deterministically.
     /// See `index_message` for why the cache is still invalidated (GH#227).
-    pub fn index_messages_batch(messages: &[IndexableMessage]) -> Result<usize, String> {
+    #[cfg(test)]
+    pub(crate) fn index_messages_batch(messages: &[IndexableMessage]) -> Result<usize, String> {
         if !messages.is_empty() {
             crate::search_service::invalidate_search_cache(
                 crate::search_cache::InvalidationTrigger::IndexUpdate,
@@ -180,7 +214,7 @@ pub mod search_v3 {
     }
 
     /// Tantivy is disabled, so lexical backfill is a deterministic no-op.
-    pub fn backfill_from_db(_db_url: &str) -> Result<(usize, usize), String> {
+    pub(crate) fn backfill_from_db(_db_url: &str) -> Result<(usize, usize), String> {
         Ok((0, 0))
     }
 }

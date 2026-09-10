@@ -9,6 +9,9 @@ const README_RELATIVE: &str = "README.md";
 const PYTHON_FIXTURE_RELATIVE: &str = "tests/conformance/fixtures/python_reference.json";
 const TOOL_FILTER_FIXTURE_RELATIVE: &str = "tests/conformance/fixtures/tool_filter/cases.json";
 const RUST_NATIVE_FIXTURE_DIR_RELATIVE: &str = "tests/conformance/fixtures/rust_native";
+const SUPPLEMENTAL_COMPATIBILITY_FIXTURE: &str =
+    "crates/mcp-agent-mail-conformance/tests/conformance.rs";
+const SUPPLEMENTAL_COMPATIBILITY_TOOLS: &[&str] = &["fetch_topic"];
 
 #[derive(Debug, Deserialize)]
 struct ToolFilterFixtures {
@@ -260,7 +263,7 @@ fn audit_doc_matches_live_inventory() {
         .collect();
     assert_eq!(
         runtime_tools.len(),
-        40,
+        44,
         "tool count drifted from audit baseline"
     );
 
@@ -272,6 +275,13 @@ fn audit_doc_matches_live_inventory() {
                 has_fixture: "yes".to_string(),
                 classification: "python-parity".to_string(),
                 fixture_file: "crates/mcp-agent-mail-conformance/tests/conformance/fixtures/python_reference.json".to_string(),
+            }
+        } else if SUPPLEMENTAL_COMPATIBILITY_TOOLS.contains(&tool.as_str()) {
+            AuditRow {
+                name: tool.clone(),
+                has_fixture: "yes".to_string(),
+                classification: "supported-compatibility".to_string(),
+                fixture_file: SUPPLEMENTAL_COMPATIBILITY_FIXTURE.to_string(),
             }
         } else if rust_native_tools.contains(tool) {
             AuditRow {
@@ -411,9 +421,9 @@ fn crate_readme_current_coverage_matches_audit_summary() {
     let readme = read_file(crate_root().join(README_RELATIVE));
     for needle in [
         "# mcp-agent-mail-conformance",
-        "## Current coverage (as of 2026-04-18)",
-        "39 tools",
-        "34 tools have Python behavior fixtures",
+        "## Current coverage (as of 2026-08-27)",
+        "44 tools",
+        "37 tools have Python behavior fixtures",
         "resolve_pane_identity",
         "cleanup_pane_identities",
         "list_agents",

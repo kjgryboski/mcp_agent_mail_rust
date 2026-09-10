@@ -10,6 +10,64 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ## [Unreleased]
 
+## [v0.3.32](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.32) — 2026-09-01 **[Release]**
+
+Recovery-operability release: the promotion guards learned to explain
+themselves and to offer supported ways out, closing the operator dead-ends
+reported in GH#271, GH#283, GH#284, and GH#285. The reservation stable-key
+promotion fix was verified live: it promoted a real 2.7 GB cross-linked
+production mailbox (16 projects / 658 agents / 40,386 messages, 0 parse
+errors) that v0.3.31 refused.
+
+### Added
+
+- **`am doctor reconstruct --reseed-receipt-chain` (GH#283).** A structurally
+  broken recovery-receipt chain (zero or multiple roots, broken link, fork,
+  cycle, invalid self-hash) used to deterministically refuse every future
+  promotion — including a fully valid archive candidate — with no supported
+  way out, forcing operators into manual DB swaps that bypass every guard.
+  The new flag (requires `--yes`; `--dry-run` previews the chain verdict
+  read-only) quarantines the entire receipts directory by rename — never
+  deletion — and lets the next promotion seed a fresh root. Refused when the
+  chain verifies cleanly or an unfinalized promotion intent exists.
+
+### Fixed
+
+- **CLI no longer queues durable UNSENT artifacts for definitive server
+  refusals (GH#285).** A daemon-proxied tool rejection arrives as the full
+  legacy error envelope; the queueing classifier ran substring heuristics
+  over that raw JSON, where a suggested recipient name or task description
+  could satisfy the WAL-sidecar-corruption pattern — so an
+  `INVALID_ARGUMENT` (bad recipient name) was recorded as
+  `wal_sidecar_corruption` / `blocks_edits: true` and queued as an UNSENT
+  artifact that could never replay successfully. Client-refusal codes
+  (`INVALID_*`, `*_NOT_FOUND`, policy/cursor/token refusals) now never
+  queue, and server-fault envelopes classify on the tool's own message text
+  instead of the envelope payload.
+- **Reconstruct promotion refusals now name the colliding reservations
+  (GH#271).** "reservations produced N rows but only M unique stable keys"
+  now appends the colliding stable keys (project, agent, path, lifecycle
+  fields; up to 5 samples) so operators no longer have to inspect the
+  refused candidate database by hand.
+- **A corrupt source that cannot even be opened no longer vetoes promotion
+  of a healthy archive candidate (GH#283 outage family).** The promotion
+  gate's full-integrity probe ran against the settled private staging copy
+  through a read-only canonical open; when the damaged main-file header
+  still demanded WAL recovery, every probe form failed with "unable to open
+  database file" and promotion refused because the source could not be
+  classified at all. The probe now opens the private throwaway copy
+  writable, letting canonical SQLite run recovery and return a real
+  corrupt/healthy verdict (the authority path stays byte-untouched).
+- **Robot snapshot caches now survive real poller cadences (GH#274).** The
+  status/inbox/reservations/overview/agents caches required both a matching
+  generation fingerprint AND an age under 500ms, so every poll on a
+  seconds-to-minutes cadence paid the full multi-query rebuild even when
+  the fingerprint proved nothing had changed. Generation-verified entries
+  now live 30s by default (`AM_ROBOT_SNAPSHOT_TTL_MS` overrides); counts
+  stay exact because the fingerprint is recomputed on every call.
+
+## [v0.3.31](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.31) — 2026-08-31 **[Release]**
+
 Durability-diagnostics release: the database layer learned to explain itself.
 A dedicated corruption-forensics engine, connection-pool lease tracking, and
 startup WAL preflight replace the previous "it is broken, good luck" failure
@@ -18,7 +76,52 @@ wrong. Also lands first-class Oh My Pi support and verifiable pane-identity
 bindings (GH#252), and unsticks the container image, which had been frozen at
 v0.3.13 and amd64-only since June (GH#256).
 
+This is also the first release under the new installer trust model: releases
+are authenticated by a minisign signature over `SHA256SUMS` made with a
+maintainer-held key, replacing the GitHub-Actions Sigstore identity that no
+new release could satisfy (GH#269 in the Python repo; acfs#365). See the
+Security section below.
+
+### Security
+
+- **Installer trust model: mandatory minisign for v0.3.31 and later.**
+  Releases are no longer built by GitHub Actions, so the installers' previous
+  requirement — a keyless Sigstore bundle certified for the
+  `dist.yml@refs/tags/<tag>` Actions workflow identity — had become
+  unsatisfiable: v0.3.30 shipped without bundles and `install.sh` correctly
+  failed closed on every host. For releases >= v0.3.31, `install.sh` and
+  `install.ps1` instead require (a) the per-archive SHA-256 resolved from the
+  release `SHA256SUMS` manifest AND (b) a valid detached minisign signature
+  (`SHA256SUMS.minisig`) over the exact manifest bytes, verified against the
+  maintainer release key pinned in the script (epoch 2, key id
+  `1BBD79B28BF718D0`, shared with the frankensqlite release line). A missing
+  `minisign` binary, manifest, signature, or checksum entry aborts the
+  install; verification never degrades to checksum-only, and `--no-verify`
+  semantics are unchanged. The Sigstore/cosign path is preserved intact for
+  installing releases older than v0.3.31 — `cosign` is no longer required for
+  current releases (which also sidesteps the unrelated Ubuntu 26.04
+  packaged-cosign breakage). The trust anchor moved from "GitHub's CI
+  identity for this repository" to "a signing key the maintainer controls";
+  the model stays fail-closed. Details in `SECURITY.md`.
+
 ### Added
+
+- **First-class agent lifecycle tools (GH#255).** The MCP surface now exposes
+  `retire_agent`, `unretire_agent`, and `deregister_agent` with registration-token
+  or verified-pane authorization. Retirement is reversible; deregistration is
+  permanent for that identity. Both preserve message, reservation, and archive
+  history, remove the identity from active rosters and new-message routing, and
+  survive archive reconstruction, snapshot/export, legacy import, and restart.
+  Retirement retries preserve the first durable timestamp atomically, including
+  when requests race, until an explicit unretire transition occurs.
+
+- **Durable message topics and project topic search (GH#259).** `send_message`
+  now accepts a validated optional topic, replies inherit their parent's topic,
+  and topic metadata survives SQLite migration, archive writes, reconstruction,
+  snapshots, CLI/robot output, and TUI rendering. `fetch_inbox(topic=...)`
+  performs exact case-insensitive recipient filtering, while the newly registered
+  `fetch_topic` compatibility tool searches the whole project without allowing
+  unrelated newer mail to displace matching rows before the result limit.
 
 - **First-class Oh My Pi (OMP) support.** Agent detection now recognizes the
   `omp` connector and `oh-my-pi` alias, while setup writes OMP's native
@@ -85,6 +188,77 @@ v0.3.13 and amd64-only since June (GH#256).
 
 ### Fixed
 
+- **`am check-inbox` matches the daemon's view of the inbox (GH#269)** and the
+  CLI gains an `am agents reap` verb (GH#275) for reclaiming dead agent
+  identities without hand-editing state.
+
+- **Backpressure health is classified from rolling queue-wait windows
+  (GH#272)** instead of instantaneous samples, so a single slow acquisition
+  can no longer flap the health verdict, and the KPI/metrics surfaces report
+  the same windowed classification.
+
+- **Reservation-scan SQL is computed in Rust and guarded against ledger
+  anti-join regressions (GH#274).** The TUI poller's release-ledger joins no
+  longer depend on SQLite schema variations, the duplicated reservation
+  helpers were de-duplicated, and a regression test pins the anti-join shape.
+
+- **`get_project_by_human_key` falls back to the stable slug (GH#267)** when
+  the human key lookup misses, so renamed projects resolve consistently.
+
+- **macOS builds compile again**: `rustix::fs::RawMode` is `u16` on Apple
+  targets (libc `mode_t`) but `u32` on Linux, and the setup-file permission
+  helper passed a `u32` straight through — Apple-target builds failed with
+  E0308 after the rustix 1.1.x refresh. The permission bits are now narrowed
+  explicitly (always <= `0o7777`, so the cast is lossless).
+
+- **Archive reconstruction no longer lets salvage rows collide with archive
+  identities.** Reconstruction and live WAL readiness were hardened, archive
+  reservation identity now wins over a salvaged local row id, and
+  archive+salvage lease dedup is pinned by test — this disproved the salvage
+  hypothesis for the 881/873 reservation-parity field outage.
+
+- **ATC hydration is bounded and fair for large recent populations (GH#258).**
+  Liveness evaluation drains at most eight scheduled or policy-dirty agents per
+  tick, deduplicates agents represented in both queues, preserves deterministic
+  progress across a 940-agent cold start, and advertises an immediately due
+  follow-up deadline while dirty work remains. This prevents a valid population
+  larger than the 512-effect executor queue from being materialized in one
+  multi-second burst. `am robot health` now also derives `health_level` from its
+  aggregate probe verdict, so failed live-server probes cannot coexist with a
+  misleading green headline; the former capacity-only signal remains available
+  as `capacity_health_level`.
+
+- **ATC no longer writes liveness-mail by default (GH#264).** The executor now
+  defaults to `shadow` (including for missing or unknown configuration), so
+  passive observation remains available but a fresh daemon cannot append
+  ordinary `AirTrafficControl` messages or release reservations. Durable
+  Canary/Live execution now requires an explicit executor-mode opt-in.
+
+- **Linux release artifacts have a pinned portability floor (GH#262).** Both
+  x86_64 and aarch64 GNU builds use pinned `cargo-zigbuild`/Zig tooling with a
+  maximum glibc requirement of 2.28, verified from each packaged binary. Every
+  release also publishes and executes the static x86_64 musl archive on Ubuntu
+  22.04, and the signed release-envelope census fails if any of the six platform
+  archives or their checksums are absent.
+
+- **Legacy-import targets are reopenable by a fresh runtime process (GH#268).**
+  The importer still performs canonical and FrankenSQLite validation before
+  success, and its Linux regression now launches a distinct process to acquire
+  the imported target's namespace gate and read the database. The runtime engine
+  pin includes the namespace-lifecycle fixes needed for import followed by
+  `serve-http` on the same storage volume.
+
+- **Swarm writes now end at a real integrity/restart gate (GH#257).** The
+  100-agent message burst and 30-second mixed read/write workload run a full
+  integrity check with the writer pool live, drop every pooled connection,
+  reopen the same file through a fresh pool, and run full integrity again. This
+  gate also verifies independent durable message and recipient row counts on
+  both sides of the restart, rather than treating a successful API return or
+  integrity pragma alone as proof against lost writes. It is paired with the
+  FrankenSQLite 0.3.11 line containing the pager, allocator, and autoindex
+  hardening that postdates the affected 0.3.4 release; the historical field
+  artifact itself was not reproduced in-tree.
+
 - **The published container image is unstuck (GH#256).** `ghcr.io` had served
   nothing newer than `v0.3.13` since June, and the `latest` index carried a
   single amd64 manifest — arm64 hosts had no image at all. The Dockerfile was
@@ -109,6 +283,19 @@ v0.3.13 and amd64-only since June (GH#256).
 
 ### Changed
 
+- **Rust is now the conformance authority.** The legacy Python behavior fixture
+  remains a supported client/migration contract, but its default runner now
+  requires the recorded object fields and values rather than whole-object byte
+  equality. Additive Rust response fields are accepted; arrays remain exact,
+  missing or changed legacy fields still fail, and Rust-native goldens remain
+  exact. This prevents the frozen `legacy-python@0.3.0` snapshot from vetoing
+  reliability and observability improvements that are backwards-compatible.
+  Documented per-field normalization also excludes the legacy health check's
+  unconditional `status=ok`; Rust-native tests own the fail-closed health
+  contract when durable state is unavailable. Tool and resource prose is now
+  Rust-owned; compatibility checks retain supported inventory and input types,
+  reject new mandatory inputs, and allow optionalization or clearer wording.
+
 - **`send_message.auto_contact_if_blocked` now accepts explicit JSON `null`** (GH#255 Python parity, final delta): fastmcp 0.7.1 publishes nullable `["boolean", "null"]` schemas for `Option<T>` tool parameters and treats explicit `null` as omitted at extraction, so `null` and omission both take the server-default path (`messaging_auto_handshake_on_block`). The same widening applies to every optional tool parameter this server exposes. Dependency: fastmcp family 0.7.0 → 0.7.1; the pinned dispatch contract test flipped from asserting a loud typed rejection to asserting Python-parity acceptance.
 
 - **`Dockerfile.release` is the new path for published images.** It packages
@@ -123,8 +310,8 @@ v0.3.13 and amd64-only since June (GH#256).
 
 - Dependency refresh: 48 crates advanced within their existing semver ranges
   (predominantly the `gix` family behind `vergen-gix`, which is build-time
-  only). The `asupersync = 0.4.9` / `sqlmodel = 0.4.0` / `fsqlite 0.3.8`
-  universe pinned on 2026-08-22 is deliberately unchanged.
+  only). The runtime remains on the `asupersync = 0.4.9` / `sqlmodel = 0.4.0`
+  universe, with FrankenSQLite advanced from 0.3.8 to the exact 0.3.11 release.
 
 
 ## [v0.3.30](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.3.30) — 2026-08-23 **[Release]**

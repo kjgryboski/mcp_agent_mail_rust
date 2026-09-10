@@ -2910,8 +2910,10 @@ pub const TOOL_CLUSTER_MAP: &[(&str, &str)] = &[
     ("send_message", clusters::MESSAGING),
     ("reply_message", clusters::MESSAGING),
     ("fetch_inbox", clusters::MESSAGING),
+    ("fetch_topic", clusters::MESSAGING),
     ("fetch_inbox_events", clusters::MESSAGING),
     ("mark_message_read", clusters::MESSAGING),
+    ("mark_all_read", clusters::MESSAGING),
     ("acknowledge_message", clusters::MESSAGING),
     ("get_message_delivery_receipt", clusters::MESSAGING),
     // Contact
